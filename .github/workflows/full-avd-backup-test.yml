@@ -1,0 +1,142 @@
+name: Full AVD Backup Restore Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Create a full cold AVD backup or restore and verify it
+        required: true
+        default: backup
+        type: choice
+        options:
+          - backup
+          - restore
+
+jobs:
+  full-avd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AVD_NAME: full-avd-api35-pixel6-v1
+      CACHE_KEY: full-avd-api35-pixel6-cold-v1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Restore full AVD backup
+        if: inputs.mode == 'restore'
+        id: avd-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.android/avd/*
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Require full AVD backup
+        if: inputs.mode == 'restore'
+        run: |
+          if [ "${{ steps.avd-restore.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::FULL_AVD_CACHE_MISS"
+            exit 1
+          fi
+          echo "FULL_AVD_CACHE_HIT"
+          du -sh "$HOME/.android/avd" || true
+
+      - name: Create source AVD and seed persistent state
+        if: inputs.mode == 'backup'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: full-avd-api35-pixel6-v1
+          cores: 4
+          ram-size: 8192M
+          force-avd-creation: true
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-window
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: |
+            adb wait-for-device
+            adb shell 'mkdir -p /sdcard/Download'
+            adb shell 'echo FULL_AVD_BACKUP_V1 > /sdcard/Download/full-avd-backup-marker.txt'
+            adb shell settings put system screen_off_timeout 1234567
+            adb shell sync
+            echo "SOURCE_MARKER=$(adb shell cat /sdcard/Download/full-avd-backup-marker.txt | tr -d '\r')"
+            echo "SOURCE_SETTING=$(adb shell settings get system screen_off_timeout | tr -d '\r')"
+            echo "SOURCE_AVD_READY_FOR_COLD_BACKUP"
+
+      - name: Measure full AVD backup size
+        if: inputs.mode == 'backup'
+        run: |
+          set -euo pipefail
+          test -d "$HOME/.android/avd"
+          echo "FULL_AVD_DISK_USAGE_HUMAN=$(du -sh "$HOME/.android/avd" | awk '{print $1}')"
+          echo "FULL_AVD_DISK_USAGE_KIB=$(du -sk "$HOME/.android/avd" | awk '{print $1}')"
+          echo "Largest AVD files:"
+          find "$HOME/.android/avd" -type f -printf '%s %p\n' | sort -nr | head -n 20 | awk '{printf "%.2f MiB %s\n", $1/1048576, $2}'
+          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/full-avd-backup.tar.zst
+          COMPRESSED_BYTES=$(stat -c '%s' /tmp/full-avd-backup.tar.zst)
+          echo "FULL_AVD_ZSTD_BYTES=$COMPRESSED_BYTES"
+          awk -v b="$COMPRESSED_BYTES" 'BEGIN {printf "FULL_AVD_ZSTD_GIB=%.3f\n", b/1073741824}'
+          rm -f /tmp/full-avd-backup.tar.zst
+
+      - name: Save full AVD backup
+        if: inputs.mode == 'backup'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.android/avd/*
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Restore AVD and verify persistent state
+        if: inputs.mode == 'restore'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: full-avd-api35-pixel6-v1
+          cores: 4
+          ram-size: 8192M
+          force-avd-creation: false
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-window
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: |
+            set -e
+            adb wait-for-device
+            MARKER=$(adb shell cat /sdcard/Download/full-avd-backup-marker.txt | tr -d '\r')
+            SETTING=$(adb shell settings get system screen_off_timeout | tr -d '\r')
+            echo "RESTORED_MARKER=$MARKER"
+            echo "RESTORED_SETTING=$SETTING"
+            test "$MARKER" = "FULL_AVD_BACKUP_V1"
+            test "$SETTING" = "1234567"
+            echo "FULL_AVD_RESTORE_OK"
+
+      - name: Report result
+        run: |
+          echo "FULL_AVD_TEST_MODE=${{ inputs.mode }}"
+          echo "FULL_AVD_TEST_COMPLETE"
