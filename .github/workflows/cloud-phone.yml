@@ -37,6 +37,47 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
 
+          cat >/tmp/cloud-phone.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          adb wait-for-device
+          adb shell input keyevent 82 || true
+
+          nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+          nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+          nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared.log 2>&1 &
+
+          echo "Waiting for secure temporary cloud-phone URL..."
+          URL=""
+          for i in $(seq 1 40); do
+            URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+
+          if [ -z "$URL" ]; then
+            echo "::error::Cloudflare tunnel did not start."
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo ""
+          echo "============================================================"
+          echo "ANDROID CLOUD PHONE READY"
+          echo "Open: ${URL}/vnc.html?autoconnect=1&resize=scale"
+          echo "Password: use the repository secret VNC_PASSWORD you created"
+          echo "This runner will stay alive for about 50 minutes."
+          echo "============================================================"
+          echo ""
+
+          for i in $(seq 1 300); do
+            adb get-state >/dev/null 2>&1 || break
+            sleep 10
+          done
+          EOF
+          chmod +x /tmp/cloud-phone.sh
+
       - name: Start Android cloud phone
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -54,39 +95,4 @@ jobs:
             -no-boot-anim
             -camera-back none
             -camera-front none
-          script: |
-            set -e
-            adb wait-for-device
-            adb shell input keyevent 82 || true
-
-            nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-            nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
-            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared.log 2>&1 &
-
-            echo "Waiting for secure temporary cloud-phone URL..."
-            URL=""
-            for i in $(seq 1 40); do
-              URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
-              [ -n "$URL" ] && break
-              sleep 1
-            done
-
-            if [ -z "$URL" ]; then
-              echo "::error::Cloudflare tunnel did not start."
-              cat /tmp/cloudflared.log
-              exit 1
-            fi
-
-            echo ""
-            echo "============================================================"
-            echo "ANDROID CLOUD PHONE READY"
-            echo "Open: ${URL}/vnc.html?autoconnect=1&resize=scale"
-            echo "Password: use the repository secret VNC_PASSWORD you created"
-            echo "This runner will stay alive for about 50 minutes."
-            echo "============================================================"
-            echo ""
-
-            for i in $(seq 1 300); do
-              adb get-state >/dev/null 2>&1 || break
-              sleep 10
-            done
+          script: bash /tmp/cloud-phone.sh
