@@ -31,7 +31,7 @@ jobs:
             exit 1
           fi
           sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc novnc websockify curl libpulse0 unzip
+          sudo apt-get install -y xvfb x11vnc novnc websockify curl libpulse0 unzip xdotool wmctrl
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
           x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass >/dev/null
@@ -41,8 +41,11 @@ jobs:
           cat >/tmp/cloud-phone.sh <<'SCRIPT'
           #!/usr/bin/env bash
           set -u
+
           adb wait-for-device
           adb shell input keyevent 82 || true
+          adb shell settings put secure show_ime_with_hard_keyboard 1 || true
+          adb shell settings put system show_ime_with_hard_keyboard 1 || true
 
           nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
@@ -62,39 +65,46 @@ jobs:
             exit 1
           fi
 
-          echo ""
           echo "============================================================"
           echo "ANDROID CLOUD PHONE READY"
-          echo "Open: ${URL}/vnc.html?autoconnect=1&resize=scale"
+          echo "Open: ${URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
           echo "Password: use repository secret VNC_PASSWORD"
           echo "============================================================"
-          echo ""
 
           echo "Downloading Binance APK from official URL..."
           if curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/binance.apk; then
             echo "APK downloaded: $(stat -c%s /tmp/binance.apk) bytes"
             echo "APK native ABIs:"
-            unzip -Z1 /tmp/binance.apk 2>/dev/null | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u || true
+            unzip -l /tmp/binance.apk 2>/dev/null | sed -n 's#.*lib/\([^/]*\)/.*#\1#p' | sort -u || true
             echo "Installing Binance APK..."
             if adb install -r /tmp/binance.apk; then
               echo "BINANCE_APK_INSTALL_SUCCESS"
-              AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -n1 || true)
-              PKG=""
-              if [ -n "$AAPT" ]; then
-                PKG=$($AAPT dump badging /tmp/binance.apk 2>/dev/null | sed -n "s/package: name='\([^']*\)'.*/\1/p" | head -n1)
-              fi
+              PKG=$(adb shell pm list packages | sed 's/^package://' | grep -Ei '^com\.binance' | head -n1 | tr -d '\r' || true)
               if [ -n "$PKG" ]; then
                 echo "Launching Binance package: $PKG"
                 adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
               fi
             else
-              echo "::warning::BINANCE_APK_INSTALL_FAILED - cloud phone remains online."
-              echo "Emulator ABI: $(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
+              echo "BINANCE_APK_INSTALL_FAILED"
+              echo "Emulator ABI: $(adb shell getprop ro.product.cpu.abi | tr -d '\r')"
+              echo "Emulator ABI list: $(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
             fi
           else
-            echo "::warning::BINANCE_APK_DOWNLOAD_FAILED - cloud phone remains online."
+            echo "BINANCE_APK_DOWNLOAD_FAILED"
           fi
 
+          sleep 3
+          echo "X11 windows before focus:"
+          wmctrl -l || true
+          WIN_ID=$(xdotool search --onlyvisible --name 'Android Emulator' 2>/dev/null | head -n1 || true)
+          if [ -n "$WIN_ID" ]; then
+            xdotool windowactivate --sync "$WIN_ID" || true
+            echo "ANDROID_EMULATOR_FOCUSED"
+          else
+            echo "ANDROID_EMULATOR_FOCUS_WINDOW_NOT_FOUND"
+          fi
+
+          echo "Keyboard mode: interactive; Android soft keyboard allowed with hardware keyboard."
           echo "Cloud phone will remain online for about 50 minutes."
           for i in $(seq 1 300); do
             adb get-state >/dev/null 2>&1 || break
