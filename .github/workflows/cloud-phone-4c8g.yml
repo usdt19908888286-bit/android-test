@@ -47,6 +47,24 @@ jobs:
           adb shell settings put secure show_ime_with_hard_keyboard 1 || true
           adb shell settings put system show_ime_with_hard_keyboard 1 || true
 
+          echo "Available IMEs:"
+          IME_LIST="$(adb shell ime list -s 2>/dev/null | tr -d '\r' || true)"
+          printf '%s\n' "$IME_LIST"
+          IME="$(printf '%s\n' "$IME_LIST" | grep -Ei 'latin|inputmethod|keyboard' | head -n1 || true)"
+          if [ -z "$IME" ]; then
+            IME="$(printf '%s\n' "$IME_LIST" | head -n1 || true)"
+          fi
+          if [ -n "$IME" ]; then
+            adb shell ime enable "$IME" || true
+            adb shell ime set "$IME" || true
+            adb shell settings put secure default_input_method "$IME" || true
+            echo "IME_SELECTED=$IME"
+          else
+            echo "IME_NOT_FOUND"
+          fi
+          echo "CURRENT_IME=$(adb shell settings get secure default_input_method 2>/dev/null | tr -d '\r' || true)"
+          echo "SHOW_IME_WITH_HARD_KEYBOARD=$(adb shell settings get secure show_ime_with_hard_keyboard 2>/dev/null | tr -d '\r' || true)"
+
           nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
           nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared.log 2>&1 &
@@ -104,7 +122,7 @@ jobs:
             echo "ANDROID_EMULATOR_FOCUS_WINDOW_NOT_FOUND"
           fi
 
-          echo "Keyboard mode: interactive; Android soft keyboard allowed with hardware keyboard."
+          echo "Keyboard mode: interactive; system IME forced as default."
           echo "Cloud phone will remain online for about 50 minutes."
           for i in $(seq 1 300); do
             adb get-state >/dev/null 2>&1 || break
