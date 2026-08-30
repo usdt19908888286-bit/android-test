@@ -1,0 +1,29 @@
+name: ARM64 Runner Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - name: Probe ARM64 runner
+        run: |
+          set -eux
+          uname -a
+          uname -m
+          lscpu || true
+          echo '--- memory ---'
+          free -h || true
+          echo '--- kvm ---'
+          ls -l /dev/kvm || true
+          test -c /dev/kvm && echo KVM_PRESENT || echo KVM_MISSING
+          echo '--- Android SDK env ---'
+          env | grep -E 'ANDROID_HOME|ANDROID_SDK_ROOT' || true
+          command -v sdkmanager || true
+          command -v adb || true
+          command -v emulator || true
+          echo '--- QEMU ---'
+          command -v qemu-system-aarch64 || true
+          qemu-system-aarch64 --version || true
