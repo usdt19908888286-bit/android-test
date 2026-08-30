@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Enable KVM
         run: |
@@ -30,6 +30,45 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
+
+      - name: Prepare AVD test scripts
+        run: |
+          cat >/tmp/full-avd-seed.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          adb wait-for-device
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1"
+          adb shell 'echo FULL_AVD_BACKUP_V1 > /data/local/tmp/full-avd-backup-marker.txt'
+          adb shell settings put system screen_off_timeout 1234567
+          adb shell sync
+          echo "SOURCE_MARKER=$(adb shell cat /data/local/tmp/full-avd-backup-marker.txt | tr -d '\r')"
+          echo "SOURCE_SETTING=$(adb shell settings get system screen_off_timeout | tr -d '\r')"
+          echo "SOURCE_AVD_READY_FOR_COLD_BACKUP"
+          SCRIPT
+
+          cat >/tmp/full-avd-verify.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          adb wait-for-device
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1"
+          MARKER=$(adb shell cat /data/local/tmp/full-avd-backup-marker.txt | tr -d '\r')
+          SETTING=$(adb shell settings get system screen_off_timeout | tr -d '\r')
+          echo "RESTORED_MARKER=$MARKER"
+          echo "RESTORED_SETTING=$SETTING"
+          test "$MARKER" = "FULL_AVD_BACKUP_V1"
+          test "$SETTING" = "1234567"
+          echo "FULL_AVD_RESTORE_OK"
+          SCRIPT
+
+          chmod +x /tmp/full-avd-seed.sh /tmp/full-avd-verify.sh
 
       - name: Restore full AVD backup
         if: inputs.mode == 'restore'
@@ -71,15 +110,7 @@ jobs:
             -no-boot-anim
             -camera-back none
             -camera-front none
-          script: |
-            adb wait-for-device
-            adb shell 'mkdir -p /sdcard/Download'
-            adb shell 'echo FULL_AVD_BACKUP_V1 > /sdcard/Download/full-avd-backup-marker.txt'
-            adb shell settings put system screen_off_timeout 1234567
-            adb shell sync
-            echo "SOURCE_MARKER=$(adb shell cat /sdcard/Download/full-avd-backup-marker.txt | tr -d '\r')"
-            echo "SOURCE_SETTING=$(adb shell settings get system screen_off_timeout | tr -d '\r')"
-            echo "SOURCE_AVD_READY_FOR_COLD_BACKUP"
+          script: bash /tmp/full-avd-seed.sh
 
       - name: Measure full AVD backup size
         if: inputs.mode == 'backup'
@@ -125,16 +156,7 @@ jobs:
             -no-boot-anim
             -camera-back none
             -camera-front none
-          script: |
-            set -e
-            adb wait-for-device
-            MARKER=$(adb shell cat /sdcard/Download/full-avd-backup-marker.txt | tr -d '\r')
-            SETTING=$(adb shell settings get system screen_off_timeout | tr -d '\r')
-            echo "RESTORED_MARKER=$MARKER"
-            echo "RESTORED_SETTING=$SETTING"
-            test "$MARKER" = "FULL_AVD_BACKUP_V1"
-            test "$SETTING" = "1234567"
-            echo "FULL_AVD_RESTORE_OK"
+          script: bash /tmp/full-avd-verify.sh
 
       - name: Report result
         run: |
