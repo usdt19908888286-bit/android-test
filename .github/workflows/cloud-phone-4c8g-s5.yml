@@ -5,7 +5,7 @@ on:
 jobs:
   cloud-phone:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 330
     env:
       DISPLAY: :99
       VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -156,8 +156,20 @@ jobs:
           Server(("127.0.0.1", 8118), Handler).serve_forever()
           PY
 
-          nohup python3 /tmp/s5_bridge.py >/tmp/s5_bridge.log 2>&1 &
+          cat >/tmp/s5_bridge_supervisor.sh <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          while true; do
+            python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1
+            echo "SOCKS5_BRIDGE_RESTARTING" >>/tmp/s5_bridge.log
+            sleep 2
+          done
+          SH
+          chmod +x /tmp/s5_bridge_supervisor.sh
+          : >/tmp/s5_bridge.log
+          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &
           S5_BRIDGE_PID=$!
+          echo "$S5_BRIDGE_PID" >/tmp/s5_bridge_supervisor.pid
           sleep 1
           if ! kill -0 "$S5_BRIDGE_PID" 2>/dev/null; then
             echo "::error::SOCKS5 local bridge failed to start."
@@ -185,6 +197,13 @@ jobs:
               print("SOCKS5_UPSTREAM_FAILED")
               raise SystemExit(1)
           PY
+
+          if curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 10 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null; then
+            echo "SOCKS5_BRIDGE_OK"
+          else
+            echo "SOCKS5_BRIDGE_FAILED"
+            exit 1
+          fi
 
           cat >/tmp/adb_input_server.py <<'PY'
           import base64
@@ -278,33 +297,107 @@ jobs:
           #!/usr/bin/env bash
           set -u
 
+          pid_alive() {
+            local file="$1" pid=""
+            [ -f "$file" ] || return 1
+            pid=$(cat "$file" 2>/dev/null || true)
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+          }
+
+          start_x11vnc() {
+            nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+            echo $! >/tmp/x11vnc.pid
+          }
+
+          start_novnc() {
+            nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+            echo $! >/tmp/novnc.pid
+          }
+
+          start_adb_input() {
+            nohup python3 /tmp/adb_input_server.py >/tmp/adb_input.log 2>&1 &
+            echo $! >/tmp/adb_input.pid
+          }
+
+          start_vnc_tunnel() {
+            : >/tmp/cloudflared_vnc.log
+            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared_vnc.log 2>&1 &
+            echo $! >/tmp/cloudflared_vnc.pid
+            VNC_URL=""
+            for _ in $(seq 1 50); do
+              VNC_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_vnc.log | head -n1 || true)
+              [ -n "$VNC_URL" ] && return 0
+              if ! pid_alive /tmp/cloudflared_vnc.pid; then break; fi
+              sleep 1
+            done
+            if pid_alive /tmp/cloudflared_vnc.pid; then kill "$(cat /tmp/cloudflared_vnc.pid)" >/dev/null 2>&1 || true; fi
+            rm -f /tmp/cloudflared_vnc.pid
+            return 1
+          }
+
+          start_adb_tunnel() {
+            : >/tmp/cloudflared_adb.log
+            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >/tmp/cloudflared_adb.log 2>&1 &
+            echo $! >/tmp/cloudflared_adb.pid
+            ADB_URL=""
+            for _ in $(seq 1 50); do
+              ADB_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_adb.log | head -n1 || true)
+              [ -n "$ADB_URL" ] && return 0
+              if ! pid_alive /tmp/cloudflared_adb.pid; then break; fi
+              sleep 1
+            done
+            if pid_alive /tmp/cloudflared_adb.pid; then kill "$(cat /tmp/cloudflared_adb.pid)" >/dev/null 2>&1 || true; fi
+            rm -f /tmp/cloudflared_adb.pid
+            return 1
+          }
+
+          ensure_components() {
+            if ! pid_alive /tmp/x11vnc.pid; then
+              echo "WATCHDOG_RESTART_X11VNC"
+              start_x11vnc
+            fi
+            if ! pid_alive /tmp/novnc.pid; then
+              echo "WATCHDOG_RESTART_NOVNC"
+              start_novnc
+            fi
+            if ! pid_alive /tmp/adb_input.pid; then
+              echo "WATCHDOG_RESTART_ADB_INPUT"
+              start_adb_input
+            fi
+            if ! pid_alive /tmp/cloudflared_vnc.pid; then
+              echo "WATCHDOG_RESTART_VNC_TUNNEL"
+              if start_vnc_tunnel; then echo "VNC_RECONNECTED: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"; else echo "VNC_TUNNEL_RESTART_FAILED"; fi
+            fi
+            if ! pid_alive /tmp/cloudflared_adb.pid; then
+              echo "WATCHDOG_RESTART_ADB_TUNNEL"
+              if start_adb_tunnel; then echo "ADB_INPUT_RECONNECTED: ${ADB_URL}/"; else echo "ADB_TUNNEL_RESTART_FAILED"; fi
+            fi
+          }
+
           adb wait-for-device
           adb shell input keyevent 82 || true
 
-          nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-          nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
-          nohup python3 /tmp/adb_input_server.py >/tmp/adb_input.log 2>&1 &
-          nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared_vnc.log 2>&1 &
-          nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >/tmp/cloudflared_adb.log 2>&1 &
+          start_x11vnc
+          start_novnc
+          start_adb_input
 
           VNC_URL=""
           ADB_URL=""
-          for i in $(seq 1 50); do
-            VNC_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_vnc.log | head -n1 || true)
-            ADB_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_adb.log | head -n1 || true)
-            [ -n "$VNC_URL" ] && [ -n "$ADB_URL" ] && break
-            sleep 1
-          done
-
-          if [ -z "$VNC_URL" ] || [ -z "$ADB_URL" ]; then
-            echo "::error::Remote tunnel startup failed."
-            exit 1
-          fi
+          if ! start_vnc_tunnel; then echo "VNC_TUNNEL_START_PENDING"; fi
+          if ! start_adb_tunnel; then echo "ADB_TUNNEL_START_PENDING"; fi
 
           echo "============================================================"
           echo "ANDROID CLOUD PHONE READY"
-          echo "VNC: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
-          echo "ADB INPUT: ${ADB_URL}/"
+          if [ -n "$VNC_URL" ]; then
+            echo "VNC: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
+          else
+            echo "VNC: pending watchdog reconnect"
+          fi
+          if [ -n "$ADB_URL" ]; then
+            echo "ADB INPUT: ${ADB_URL}/"
+          else
+            echo "ADB INPUT: pending watchdog reconnect"
+          fi
           echo "ADB INPUT username: adb"
           echo "Passwords are stored only in GitHub Secrets."
           echo "ANDROID NETWORK: SOCKS5 bridge enabled"
@@ -333,9 +426,27 @@ jobs:
             echo "ANDROID_EMULATOR_FOCUSED"
           fi
 
-          echo "Cloud phone will remain online for about 50 minutes."
-          for i in $(seq 1 300); do
-            adb get-state >/dev/null 2>&1 || break
+          ADB_FAILURES=0
+          echo "Cloud phone will remain online for up to about 5 hours."
+          for _ in $(seq 1 1800); do
+            ensure_components
+
+            if timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
+              if [ "$ADB_FAILURES" -gt 0 ]; then
+                echo "ADB_RECOVERED"
+              fi
+              ADB_FAILURES=0
+            else
+              ADB_FAILURES=$((ADB_FAILURES + 1))
+              if [ "$ADB_FAILURES" -eq 1 ]; then
+                echo "ADB_TEMP_UNAVAILABLE"
+              fi
+              if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
+                echo "WATCHDOG_RESTART_ADB_SERVER"
+                adb kill-server >/dev/null 2>&1 || true
+                adb start-server >/dev/null 2>&1 || true
+              fi
+            fi
             sleep 10
           done
           SCRIPT
