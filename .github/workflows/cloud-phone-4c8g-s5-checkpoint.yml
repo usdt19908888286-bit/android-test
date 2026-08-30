@@ -1,0 +1,624 @@
+name: Android Cloud Phone 4C8G S5 Checkpoint
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binance-phone-001-checkpoint-v1
+  cancel-in-progress: false
+
+jobs:
+  cloud-phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DISPLAY: :99
+      VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      APK_URL: https://download.binance.com/pack/BNApp64.apk
+      AVD_NAME: binance-api35
+      CHECKPOINT_FILE: .checkpoint-cache/binance-avd-v1.tar.zst.gpg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install checkpoint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd gnupg
+
+      - name: Validate checkpoint encryption key
+        env:
+          CHECKPOINT_KEY: ${{ secrets.CHECKPOINT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CHECKPOINT_KEY:-}" ]; then
+            echo "::error::Missing CHECKPOINT_KEY repository secret."
+            exit 1
+          fi
+          echo "CHECKPOINT_KEY_READY"
+
+      - name: Restore encrypted checkpoint cache
+        id: checkpoint-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CHECKPOINT_FILE }}
+          key: binance-avd-v1-api35-pixel6-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            binance-avd-v1-api35-pixel6-x86_64-
+
+      - name: Decrypt checkpoint for emulator restore
+        env:
+          CHECKPOINT_KEY: ${{ secrets.CHECKPOINT_KEY }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/binance-avd-v1 /tmp/binance-avd-v1.tar.zst
+          mkdir -p /tmp/binance-avd-v1
+          if [ ! -f "$CHECKPOINT_FILE" ]; then
+            echo "CHECKPOINT_COLD_START"
+            exit 0
+          fi
+          printf '%s' "$CHECKPOINT_KEY" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt \
+            --output /tmp/binance-avd-v1.tar.zst "$CHECKPOINT_FILE"
+          tar -I zstd -xf /tmp/binance-avd-v1.tar.zst -C /tmp/binance-avd-v1
+          rm -f /tmp/binance-avd-v1.tar.zst
+          test -f /tmp/binance-avd-v1/userdata-qemu.img
+          test -f /tmp/binance-avd-v1/encryptionkey.img
+          test -f /tmp/binance-avd-v1/config.ini
+          echo "CHECKPOINT_DECRYPTED_MINIMAL_V1"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Prepare remote desktop, SOCKS5 and ADB input
+        env:
+          S5_HOST: ${{ secrets.S5_HOST }}
+          S5_PORT: ${{ secrets.S5_PORT }}
+          S5_USER: ${{ secrets.S5_USER }}
+          S5_PASS: ${{ secrets.S5_PASS }}
+        run: |
+          set -e
+          if [ -z "${VNC_PASSWORD:-}" ]; then
+            echo "::error::Missing VNC_PASSWORD secret."
+            exit 1
+          fi
+          if [ -z "${S5_HOST:-}" ] || [ -z "${S5_PORT:-}" ]; then
+            echo "::error::Missing S5_HOST or S5_PORT repository secret."
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11vnc novnc websockify curl libpulse0 unzip xdotool wmctrl python3-pip
+          python3 -m pip install --quiet --break-system-packages PySocks
+
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass >/dev/null
+
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          cat >/tmp/s5_bridge.py <<'PY'
+          import os
+          import select
+          import socketserver
+          from urllib.parse import urlsplit
+          import socks
+
+          S5_HOST = os.environ["S5_HOST"]
+          S5_PORT = int(os.environ["S5_PORT"])
+          S5_USER = os.environ.get("S5_USER") or None
+          S5_PASS = os.environ.get("S5_PASS") or None
+
+          def open_upstream(host, port):
+              s = socks.socksocket()
+              s.set_proxy(socks.SOCKS5, S5_HOST, S5_PORT, rdns=True,
+                          username=S5_USER, password=S5_PASS)
+              s.settimeout(30)
+              s.connect((host, int(port)))
+              s.settimeout(None)
+              return s
+
+          def relay(a, b):
+              sockets = [a, b]
+              while True:
+                  readable, _, _ = select.select(sockets, [], [], 60)
+                  if not readable:
+                      continue
+                  for src in readable:
+                      dst = b if src is a else a
+                      data = src.recv(65536)
+                      if not data:
+                          return
+                      dst.sendall(data)
+
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  client = self.request
+                  client.settimeout(30)
+                  data = b""
+                  while b"\r\n\r\n" not in data and len(data) < 65536:
+                      chunk = client.recv(4096)
+                      if not chunk:
+                          return
+                      data += chunk
+                  if b"\r\n\r\n" not in data:
+                      return
+
+                  head, rest = data.split(b"\r\n\r\n", 1)
+                  lines = head.split(b"\r\n")
+                  parts = lines[0].decode("latin1").split(" ", 2)
+                  if len(parts) != 3:
+                      return
+                  method, target, version = parts
+
+                  try:
+                      if method.upper() == "CONNECT":
+                          host, port = target.rsplit(":", 1)
+                          host = host.strip("[]")
+                          upstream = open_upstream(host, int(port))
+                          client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                          if rest:
+                              upstream.sendall(rest)
+                          relay(client, upstream)
+                          upstream.close()
+                          return
+
+                      parsed = urlsplit(target)
+                      if parsed.hostname:
+                          host = parsed.hostname
+                          port = parsed.port or 80
+                          path = parsed.path or "/"
+                          if parsed.query:
+                              path += "?" + parsed.query
+                      else:
+                          host_header = ""
+                          for line in lines[1:]:
+                              if line.lower().startswith(b"host:"):
+                                  host_header = line.split(b":", 1)[1].strip().decode("latin1")
+                                  break
+                          if not host_header:
+                              return
+                          if ":" in host_header:
+                              host, port = host_header.rsplit(":", 1)
+                              port = int(port)
+                          else:
+                              host, port = host_header, 80
+                          path = target
+
+                      upstream = open_upstream(host, port)
+                      lines[0] = f"{method} {path} {version}".encode("latin1")
+                      upstream.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + rest)
+                      relay(client, upstream)
+                      upstream.close()
+                  except Exception:
+                      try:
+                          client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                      except Exception:
+                          pass
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+
+          Server(("127.0.0.1", 8118), Handler).serve_forever()
+          PY
+
+          nohup python3 /tmp/s5_bridge.py >/tmp/s5_bridge.log 2>&1 &
+          S5_BRIDGE_PID=$!
+          sleep 1
+          if ! kill -0 "$S5_BRIDGE_PID" 2>/dev/null; then
+            echo "::error::SOCKS5 local bridge failed to start."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+          import socks
+          try:
+              s = socks.socksocket()
+              s.set_proxy(
+                  socks.SOCKS5,
+                  os.environ["S5_HOST"],
+                  int(os.environ["S5_PORT"]),
+                  rdns=True,
+                  username=os.environ.get("S5_USER") or None,
+                  password=os.environ.get("S5_PASS") or None,
+              )
+              s.settimeout(12)
+              s.connect(("www.cloudflare.com", 443))
+              s.close()
+              print("SOCKS5_UPSTREAM_OK")
+          except Exception:
+              print("SOCKS5_UPSTREAM_FAILED")
+              raise SystemExit(1)
+          PY
+
+          cat >/tmp/adb_input_server.py <<'PY'
+          import base64
+          import os
+          import subprocess
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import parse_qs
+
+          USER = "adb"
+          PASSWORD = os.environ["VNC_PASSWORD"]
+          KEYEVENTS = {
+              "enter": "66",
+              "backspace": "67",
+              "tab": "61",
+              "home": "3",
+              "back": "4",
+          }
+
+          PAGE = """<!doctype html>
+          <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+          <title>ADB Input</title>
+          <style>
+          body{font-family:system-ui,sans-serif;max-width:720px;margin:30px auto;padding:0 16px;background:#111;color:#eee}
+          textarea{width:100%;min-height:120px;font-size:18px;padding:10px;box-sizing:border-box}
+          button{font-size:16px;padding:10px 14px;margin:6px 4px 6px 0}
+          .ok{color:#8f8}.note{color:#bbb}
+          </style></head><body>
+          <h2>Android ADB Remote Input</h2>
+          <p class='note'>先在 VNC 里点中 Binance 输入框，再回这里发送。文字直接通过 ADB 注入，不依赖软键盘。</p>
+          <form method='post'>
+          <textarea name='text' placeholder='输入要发送到 Android 当前焦点输入框的文字'></textarea><br>
+          <button name='action' value='text'>发送文字</button>
+          <button name='action' value='enter'>Enter</button>
+          <button name='action' value='backspace'>Backspace</button>
+          <button name='action' value='tab'>Tab</button>
+          <button name='action' value='back'>Android Back</button>
+          <button name='action' value='home'>Android Home</button>
+          <hr>
+          <button name='action' value='finish'>保存 Checkpoint 并结束本次云手机</button>
+          </form>{message}</body></html>"""
+
+          class Handler(BaseHTTPRequestHandler):
+              def authorized(self):
+                  expected = "Basic " + base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
+                  return self.headers.get("Authorization", "") == expected
+
+              def auth(self):
+                  self.send_response(401)
+                  self.send_header("WWW-Authenticate", 'Basic realm="ADB Input"')
+                  self.end_headers()
+
+              def render(self, message=""):
+                  body = PAGE.replace("{message}", message).encode("utf-8")
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if not self.authorized():
+                      return self.auth()
+                  self.render()
+
+              def do_POST(self):
+                  if not self.authorized():
+                      return self.auth()
+                  length = int(self.headers.get("Content-Length", "0"))
+                  form = parse_qs(self.rfile.read(length).decode("utf-8"))
+                  action = form.get("action", [""])[0]
+                  try:
+                      if action == "finish":
+                          with open("/tmp/cloud-phone-finish", "w", encoding="utf-8") as f:
+                              f.write("finish\n")
+                          self.render("<p class='ok'>Checkpoint save requested. This session will close cleanly.</p>")
+                          return
+                      if action == "text":
+                          text = form.get("text", [""])[0]
+                          if len(text) > 2000:
+                              raise ValueError("too long")
+                          encoded = text.replace(" ", "%s")
+                          subprocess.run(["adb", "shell", "input", "text", encoded], check=True, timeout=20)
+                      elif action in KEYEVENTS:
+                          subprocess.run(["adb", "shell", "input", "keyevent", KEYEVENTS[action]], check=True, timeout=20)
+                      else:
+                          raise ValueError("unknown action")
+                      self.render("<p class='ok'>ADB command sent.</p>")
+                  except Exception:
+                      self.render("<p>ADB command failed.</p>")
+
+              def log_message(self, fmt, *args):
+                  pass
+
+          ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+          PY
+
+          cat >/tmp/restore-avd-checkpoint.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          AVD_ROOT="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+          AVD_DIR="$AVD_ROOT/${AVD_NAME}.avd"
+          SRC=/tmp/binance-avd-v1
+
+          if [ ! -f "$SRC/userdata-qemu.img" ]; then
+            echo "CHECKPOINT_NOT_PRESENT_FOR_PRELAUNCH"
+            exit 0
+          fi
+
+          test -d "$AVD_DIR"
+          test -f "$SRC/encryptionkey.img"
+          test -f "$SRC/config.ini"
+          cp --sparse=always -f "$SRC/userdata-qemu.img" "$AVD_DIR/userdata-qemu.img"
+          cp -f "$SRC/encryptionkey.img" "$AVD_DIR/encryptionkey.img"
+          cp -f "$SRC/config.ini" "$AVD_DIR/config.ini"
+          echo "CHECKPOINT_RESTORED_MINIMAL_V1"
+          SCRIPT
+          chmod +x /tmp/restore-avd-checkpoint.sh
+
+          cat >/tmp/cloud-phone.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -u
+
+          rm -f /tmp/cloud-phone-finish
+
+          pid_alive() {
+            local file="$1" pid=""
+            [ -f "$file" ] || return 1
+            pid=$(cat "$file" 2>/dev/null || true)
+            [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+          }
+
+          start_x11vnc() {
+            nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+            echo $! >/tmp/x11vnc.pid
+          }
+
+          start_novnc() {
+            nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+            echo $! >/tmp/novnc.pid
+          }
+
+          start_adb_input() {
+            nohup python3 /tmp/adb_input_server.py >/tmp/adb_input.log 2>&1 &
+            echo $! >/tmp/adb_input.pid
+          }
+
+          start_vnc_tunnel() {
+            : >/tmp/cloudflared_vnc.log
+            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared_vnc.log 2>&1 &
+            echo $! >/tmp/cloudflared_vnc.pid
+            VNC_URL=""
+            for _ in $(seq 1 50); do
+              VNC_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_vnc.log | head -n1 || true)
+              [ -n "$VNC_URL" ] && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          start_adb_tunnel() {
+            : >/tmp/cloudflared_adb.log
+            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >/tmp/cloudflared_adb.log 2>&1 &
+            echo $! >/tmp/cloudflared_adb.pid
+            ADB_URL=""
+            for _ in $(seq 1 50); do
+              ADB_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_adb.log | head -n1 || true)
+              [ -n "$ADB_URL" ] && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          detect_emulator_pid() {
+            ps -eo pid=,args= | awk -v name="$AVD_NAME" '
+              (index($0, "-avd " name) || index($0, "@" name)) && ($0 ~ /emulator|qemu-system/) {print $1; exit}
+            '
+          }
+
+          restart_emulator() {
+            echo "WATCHDOG_RESTART_EMULATOR"
+            nohup "$ANDROID_HOME/emulator/emulator" -avd "$AVD_NAME" \
+              -no-snapshot -no-metrics -gpu swiftshader_indirect -noaudio -no-boot-anim \
+              -camera-back none -camera-front none -http-proxy http://127.0.0.1:8118 \
+              >/tmp/emulator_watchdog.log 2>&1 &
+            EMULATOR_PID=$!
+            timeout 180 adb wait-for-device >/dev/null 2>&1 || true
+          }
+
+          ensure_components() {
+            if ! pid_alive /tmp/x11vnc.pid; then
+              echo "WATCHDOG_RESTART_X11VNC"
+              start_x11vnc
+            fi
+            if ! pid_alive /tmp/novnc.pid; then
+              echo "WATCHDOG_RESTART_NOVNC"
+              start_novnc
+            fi
+            if ! pid_alive /tmp/adb_input.pid; then
+              echo "WATCHDOG_RESTART_ADB_INPUT"
+              start_adb_input
+            fi
+            if ! pid_alive /tmp/cloudflared_vnc.pid; then
+              echo "WATCHDOG_RESTART_VNC_TUNNEL"
+              if start_vnc_tunnel; then
+                echo "VNC_RECONNECTED: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
+              else
+                echo "VNC_TUNNEL_RESTART_FAILED"
+              fi
+            fi
+            if ! pid_alive /tmp/cloudflared_adb.pid; then
+              echo "WATCHDOG_RESTART_ADB_TUNNEL"
+              if start_adb_tunnel; then
+                echo "ADB_INPUT_RECONNECTED: ${ADB_URL}/"
+              else
+                echo "ADB_TUNNEL_RESTART_FAILED"
+              fi
+            fi
+          }
+
+          adb wait-for-device
+          adb shell input keyevent 82 || true
+
+          start_x11vnc
+          start_novnc
+          start_adb_input
+          if ! start_vnc_tunnel || ! start_adb_tunnel; then
+            echo "::error::Remote tunnel startup failed."
+            exit 1
+          fi
+
+          echo "============================================================"
+          echo "ANDROID CLOUD PHONE READY"
+          echo "VNC: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
+          echo "ADB INPUT: ${ADB_URL}/"
+          echo "ADB INPUT username: adb"
+          echo "Passwords are stored only in GitHub Secrets."
+          echo "ANDROID NETWORK: SOCKS5 bridge enabled"
+          echo "Use the ADB Input page finish button to save checkpoint and end cleanly."
+          echo "============================================================"
+
+          PKG=com.binance.dev
+          if adb shell pm path "$PKG" >/dev/null 2>&1; then
+            echo "BINANCE_PRESENT_FROM_RESTORED_USERDATA"
+          else
+            echo "Downloading Binance APK from official URL..."
+            if curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/binance.apk; then
+              echo "APK downloaded."
+              if adb install -r /tmp/binance.apk; then
+                echo "BINANCE_APK_INSTALL_SUCCESS"
+              else
+                echo "BINANCE_APK_INSTALL_FAILED"
+              fi
+            else
+              echo "BINANCE_APK_DOWNLOAD_FAILED"
+            fi
+          fi
+
+          if adb shell pm path "$PKG" >/dev/null 2>&1; then
+            adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+          fi
+
+          sleep 3
+          WIN_ID=$(xdotool search --onlyvisible --name 'Android Emulator' 2>/dev/null | head -n1 || true)
+          if [ -n "$WIN_ID" ]; then
+            xdotool windowactivate --sync "$WIN_ID" || true
+            echo "ANDROID_EMULATOR_FOCUSED"
+          fi
+
+          EMULATOR_PID=$(detect_emulator_pid || true)
+          ADB_FAILURES=0
+          echo "Cloud phone will remain online for up to about 5 hours."
+          for _ in $(seq 1 1800); do
+            if [ -f /tmp/cloud-phone-finish ]; then
+              echo "CHECKPOINT_FINISH_REQUESTED"
+              break
+            fi
+
+            ensure_components
+
+            if adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
+              if [ "$ADB_FAILURES" -gt 0 ]; then
+                echo "ADB_RECOVERED"
+              fi
+              ADB_FAILURES=0
+            else
+              ADB_FAILURES=$((ADB_FAILURES + 1))
+              if [ "$ADB_FAILURES" -eq 1 ]; then
+                echo "ADB_TEMP_UNAVAILABLE"
+              fi
+
+              if [ -z "${EMULATOR_PID:-}" ] || ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+                EMULATOR_PID=$(detect_emulator_pid || true)
+                if [ -z "${EMULATOR_PID:-}" ] && [ "$ADB_FAILURES" -ge 6 ]; then
+                  restart_emulator
+                fi
+              fi
+              if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
+                echo "WATCHDOG_RESTART_ADB_SERVER"
+                adb kill-server >/dev/null 2>&1 || true
+                adb start-server >/dev/null 2>&1 || true
+              fi
+            fi
+            sleep 10
+          done
+
+          adb shell am force-stop com.binance.dev >/dev/null 2>&1 || true
+          adb shell sync >/dev/null 2>&1 || true
+          sleep 2
+          echo "CLOUD_PHONE_SESSION_ENDING_FOR_CHECKPOINT"
+          SCRIPT
+          chmod +x /tmp/cloud-phone.sh
+
+      - name: Start Android cloud phone
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: ${{ env.AVD_NAME }}
+          force-avd-creation: true
+          cores: 4
+          ram-size: 8192M
+          disk-size: 8G
+          emulator-boot-timeout: 900
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+            -http-proxy http://127.0.0.1:8118
+          pre-emulator-launch-script: bash /tmp/restore-avd-checkpoint.sh
+          script: bash /tmp/cloud-phone.sh
+
+      - name: Create encrypted Minimal Checkpoint v1
+        id: checkpoint-pack
+        env:
+          CHECKPOINT_KEY: ${{ secrets.CHECKPOINT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/cloud-phone-finish ]; then
+            echo "CHECKPOINT_SAVE_SKIPPED_NO_MANUAL_FINISH"
+            echo "checkpoint_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AVD_ROOT="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+          AVD_DIR="$AVD_ROOT/${AVD_NAME}.avd"
+
+          # android-emulator-runner stops the emulator after cloud-phone.sh exits.
+          # The script already force-stops Binance and runs adb shell sync while
+          # the device is still alive, so the files below are copied cold.
+          test -d "$AVD_DIR"
+          test -f "$AVD_DIR/userdata-qemu.img"
+          test -f "$AVD_DIR/encryptionkey.img"
+          test -f "$AVD_DIR/config.ini"
+
+          mkdir -p .checkpoint-cache
+          rm -f "$CHECKPOINT_FILE" /tmp/binance-avd-v1.tar.zst
+          tar --sparse -I 'zstd -3 -T0' -cf /tmp/binance-avd-v1.tar.zst \
+            -C "$AVD_DIR" userdata-qemu.img encryptionkey.img config.ini
+
+          printf '%s' "$CHECKPOINT_KEY" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --symmetric --cipher-algo AES256 --compress-algo none \
+            --output "$CHECKPOINT_FILE" /tmp/binance-avd-v1.tar.zst
+          rm -f /tmp/binance-avd-v1.tar.zst
+
+          CHECKPOINT_BYTES=$(stat -c '%s' "$CHECKPOINT_FILE")
+          echo "CHECKPOINT_ENCRYPTED_MINIMAL_V1"
+          echo "CHECKPOINT_ENCRYPTED_BYTES=$CHECKPOINT_BYTES"
+          echo "checkpoint_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save encrypted checkpoint cache
+        if: steps.checkpoint-pack.outputs.checkpoint_ready == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CHECKPOINT_FILE }}
+          key: binance-avd-v1-api35-pixel6-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
