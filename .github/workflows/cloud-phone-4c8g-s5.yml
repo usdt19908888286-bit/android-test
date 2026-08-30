@@ -1,1 +1,363 @@
-circleci-android
+name: Android Cloud Phone 4C8G S5
+on:
+  workflow_dispatch:
+
+jobs:
+  cloud-phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DISPLAY: :99
+      VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      APK_URL: https://download.binance.com/pack/BNApp64.apk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Prepare remote desktop, SOCKS5 and ADB input
+        env:
+          S5_HOST: ${{ secrets.S5_HOST }}
+          S5_PORT: ${{ secrets.S5_PORT }}
+          S5_USER: ${{ secrets.S5_USER }}
+          S5_PASS: ${{ secrets.S5_PASS }}
+        run: |
+          set -e
+          if [ -z "${VNC_PASSWORD:-}" ]; then
+            echo "::error::Missing VNC_PASSWORD secret."
+            exit 1
+          fi
+          if [ -z "${S5_HOST:-}" ] || [ -z "${S5_PORT:-}" ]; then
+            echo "::error::Missing S5_HOST or S5_PORT repository secret."
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11vnc novnc websockify curl libpulse0 unzip xdotool wmctrl python3-pip
+          python3 -m pip install --quiet --break-system-packages PySocks
+
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+          x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass >/dev/null
+
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          cat >/tmp/s5_bridge.py <<'PY'
+          import os
+          import select
+          import socketserver
+          from urllib.parse import urlsplit
+          import socks
+
+          S5_HOST = os.environ["S5_HOST"]
+          S5_PORT = int(os.environ["S5_PORT"])
+          S5_USER = os.environ.get("S5_USER") or None
+          S5_PASS = os.environ.get("S5_PASS") or None
+
+          def open_upstream(host, port):
+              s = socks.socksocket()
+              s.set_proxy(socks.SOCKS5, S5_HOST, S5_PORT, rdns=True,
+                          username=S5_USER, password=S5_PASS)
+              s.settimeout(30)
+              s.connect((host, int(port)))
+              s.settimeout(None)
+              return s
+
+          def relay(a, b):
+              sockets = [a, b]
+              while True:
+                  readable, _, _ = select.select(sockets, [], [], 60)
+                  if not readable:
+                      continue
+                  for src in readable:
+                      dst = b if src is a else a
+                      data = src.recv(65536)
+                      if not data:
+                          return
+                      dst.sendall(data)
+
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  client = self.request
+                  client.settimeout(30)
+                  data = b""
+                  while b"\r\n\r\n" not in data and len(data) < 65536:
+                      chunk = client.recv(4096)
+                      if not chunk:
+                          return
+                      data += chunk
+                  if b"\r\n\r\n" not in data:
+                      return
+
+                  head, rest = data.split(b"\r\n\r\n", 1)
+                  lines = head.split(b"\r\n")
+                  parts = lines[0].decode("latin1").split(" ", 2)
+                  if len(parts) != 3:
+                      return
+                  method, target, version = parts
+
+                  try:
+                      if method.upper() == "CONNECT":
+                          host, port = target.rsplit(":", 1)
+                          host = host.strip("[]")
+                          upstream = open_upstream(host, int(port))
+                          client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                          if rest:
+                              upstream.sendall(rest)
+                          relay(client, upstream)
+                          upstream.close()
+                          return
+
+                      parsed = urlsplit(target)
+                      if parsed.hostname:
+                          host = parsed.hostname
+                          port = parsed.port or 80
+                          path = parsed.path or "/"
+                          if parsed.query:
+                              path += "?" + parsed.query
+                      else:
+                          host_header = ""
+                          for line in lines[1:]:
+                              if line.lower().startswith(b"host:"):
+                                  host_header = line.split(b":", 1)[1].strip().decode("latin1")
+                                  break
+                          if not host_header:
+                              return
+                          if ":" in host_header:
+                              host, port = host_header.rsplit(":", 1)
+                              port = int(port)
+                          else:
+                              host, port = host_header, 80
+                          path = target
+
+                      upstream = open_upstream(host, port)
+                      lines[0] = f"{method} {path} {version}".encode("latin1")
+                      upstream.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + rest)
+                      relay(client, upstream)
+                      upstream.close()
+                  except Exception:
+                      try:
+                          client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                      except Exception:
+                          pass
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+
+          Server(("127.0.0.1", 8118), Handler).serve_forever()
+          PY
+
+          nohup python3 /tmp/s5_bridge.py >/tmp/s5_bridge.log 2>&1 &
+          S5_BRIDGE_PID=$!
+          sleep 1
+          if ! kill -0 "$S5_BRIDGE_PID" 2>/dev/null; then
+            echo "::error::SOCKS5 local bridge failed to start."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+          import socks
+          try:
+              s = socks.socksocket()
+              s.set_proxy(
+                  socks.SOCKS5,
+                  os.environ["S5_HOST"],
+                  int(os.environ["S5_PORT"]),
+                  rdns=True,
+                  username=os.environ.get("S5_USER") or None,
+                  password=os.environ.get("S5_PASS") or None,
+              )
+              s.settimeout(12)
+              s.connect(("www.cloudflare.com", 443))
+              s.close()
+              print("SOCKS5_UPSTREAM_OK")
+          except Exception:
+              print("SOCKS5_UPSTREAM_FAILED")
+              raise SystemExit(1)
+          PY
+
+          cat >/tmp/adb_input_server.py <<'PY'
+          import base64
+          import os
+          import subprocess
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import parse_qs
+
+          USER = "adb"
+          PASSWORD = os.environ["VNC_PASSWORD"]
+          KEYEVENTS = {
+              "enter": "66",
+              "backspace": "67",
+              "tab": "61",
+              "home": "3",
+              "back": "4",
+          }
+
+          PAGE = """<!doctype html>
+          <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+          <title>ADB Input</title>
+          <style>
+          body{font-family:system-ui,sans-serif;max-width:720px;margin:30px auto;padding:0 16px;background:#111;color:#eee}
+          textarea{width:100%;min-height:120px;font-size:18px;padding:10px;box-sizing:border-box}
+          button{font-size:16px;padding:10px 14px;margin:6px 4px 6px 0}
+          .ok{color:#8f8}.note{color:#bbb}
+          </style></head><body>
+          <h2>Android ADB Remote Input</h2>
+          <p class='note'>先在 VNC 里点中 Binance 输入框，再回这里发送。文字直接通过 ADB 注入，不依赖软键盘。</p>
+          <form method='post'>
+          <textarea name='text' placeholder='输入要发送到 Android 当前焦点输入框的文字'></textarea><br>
+          <button name='action' value='text'>发送文字</button>
+          <button name='action' value='enter'>Enter</button>
+          <button name='action' value='backspace'>Backspace</button>
+          <button name='action' value='tab'>Tab</button>
+          <button name='action' value='back'>Android Back</button>
+          <button name='action' value='home'>Android Home</button>
+          </form>{message}</body></html>"""
+
+          class Handler(BaseHTTPRequestHandler):
+              def authorized(self):
+                  expected = "Basic " + base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
+                  return self.headers.get("Authorization", "") == expected
+
+              def auth(self):
+                  self.send_response(401)
+                  self.send_header("WWW-Authenticate", 'Basic realm="ADB Input"')
+                  self.end_headers()
+
+              def render(self, message=""):
+                  body = PAGE.format(message=message).encode("utf-8")
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if not self.authorized():
+                      return self.auth()
+                  self.render()
+
+              def do_POST(self):
+                  if not self.authorized():
+                      return self.auth()
+                  length = int(self.headers.get("Content-Length", "0"))
+                  form = parse_qs(self.rfile.read(length).decode("utf-8"))
+                  action = form.get("action", [""])[0]
+                  try:
+                      if action == "text":
+                          text = form.get("text", [""])[0]
+                          if len(text) > 2000:
+                              raise ValueError("too long")
+                          encoded = text.replace(" ", "%s")
+                          subprocess.run(["adb", "shell", "input", "text", encoded], check=True, timeout=20)
+                      elif action in KEYEVENTS:
+                          subprocess.run(["adb", "shell", "input", "keyevent", KEYEVENTS[action]], check=True, timeout=20)
+                      else:
+                          raise ValueError("unknown action")
+                      self.render("<p class='ok'>ADB command sent.</p>")
+                  except Exception:
+                      self.render("<p>ADB command failed.</p>")
+
+              def log_message(self, fmt, *args):
+                  pass
+
+          ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+          PY
+
+          cat >/tmp/cloud-phone.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -u
+
+          adb wait-for-device
+          adb shell input keyevent 82 || true
+
+          nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+          nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+          nohup python3 /tmp/adb_input_server.py >/tmp/adb_input.log 2>&1 &
+          nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared_vnc.log 2>&1 &
+          nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >/tmp/cloudflared_adb.log 2>&1 &
+
+          VNC_URL=""
+          ADB_URL=""
+          for i in $(seq 1 50); do
+            VNC_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_vnc.log | head -n1 || true)
+            ADB_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_adb.log | head -n1 || true)
+            [ -n "$VNC_URL" ] && [ -n "$ADB_URL" ] && break
+            sleep 1
+          done
+
+          if [ -z "$VNC_URL" ] || [ -z "$ADB_URL" ]; then
+            echo "::error::Remote tunnel startup failed."
+            exit 1
+          fi
+
+          echo "============================================================"
+          echo "ANDROID CLOUD PHONE READY"
+          echo "VNC: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
+          echo "ADB INPUT: ${ADB_URL}/"
+          echo "ADB INPUT username: adb"
+          echo "Passwords are stored only in GitHub Secrets."
+          echo "ANDROID NETWORK: SOCKS5 bridge enabled"
+          echo "============================================================"
+
+          echo "Downloading Binance APK from official URL..."
+          if curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/binance.apk; then
+            echo "APK downloaded."
+            if adb install -r /tmp/binance.apk; then
+              echo "BINANCE_APK_INSTALL_SUCCESS"
+              PKG=$(adb shell pm list packages | sed 's/^package://' | grep -Ei '^com\.binance' | head -n1 | tr -d '\r' || true)
+              if [ -n "$PKG" ]; then
+                adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+              fi
+            else
+              echo "BINANCE_APK_INSTALL_FAILED"
+            fi
+          else
+            echo "BINANCE_APK_DOWNLOAD_FAILED"
+          fi
+
+          sleep 3
+          WIN_ID=$(xdotool search --onlyvisible --name 'Android Emulator' 2>/dev/null | head -n1 || true)
+          if [ -n "$WIN_ID" ]; then
+            xdotool windowactivate --sync "$WIN_ID" || true
+            echo "ANDROID_EMULATOR_FOCUSED"
+          fi
+
+          echo "Cloud phone will remain online for about 50 minutes."
+          for i in $(seq 1 300); do
+            adb get-state >/dev/null 2>&1 || break
+            sleep 10
+          done
+          SCRIPT
+          chmod +x /tmp/cloud-phone.sh
+
+      - name: Start Android cloud phone
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 8192M
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+            -http-proxy http://127.0.0.1:8118
+          script: bash /tmp/cloud-phone.sh
