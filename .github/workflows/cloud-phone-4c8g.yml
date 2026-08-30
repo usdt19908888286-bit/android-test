@@ -23,7 +23,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Prepare remote desktop and installer
+      - name: Prepare remote desktop and ADB input
         run: |
           set -e
           if [ -z "${VNC_PASSWORD:-}" ]; then
@@ -38,55 +38,145 @@ jobs:
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
 
+          cat >/tmp/adb_input_server.py <<'PY'
+          import base64
+          import html
+          import os
+          import subprocess
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import parse_qs
+
+          USER = "adb"
+          PASSWORD = os.environ["VNC_PASSWORD"]
+          KEYEVENTS = {
+              "enter": "66",
+              "backspace": "67",
+              "tab": "61",
+              "home": "3",
+              "back": "4",
+          }
+
+          PAGE = """<!doctype html>
+          <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+          <title>ADB Input</title>
+          <style>
+          body{font-family:system-ui,sans-serif;max-width:720px;margin:30px auto;padding:0 16px;background:#111;color:#eee}
+          textarea{width:100%;min-height:120px;font-size:18px;padding:10px;box-sizing:border-box}
+          button{font-size:16px;padding:10px 14px;margin:6px 4px 6px 0}
+          .ok{color:#8f8}.note{color:#bbb}
+          </style></head><body>
+          <h2>Android ADB Remote Input</h2>
+          <p class='note'>先在 VNC 里点中 Binance 输入框，再回这里发送。文字直接通过 ADB 注入，不依赖软键盘。</p>
+          <form method='post'>
+          <textarea name='text' autofocus placeholder='输入要发送到 Android 当前焦点输入框的文字'></textarea><br>
+          <button name='action' value='text'>发送文字</button>
+          <button name='action' value='enter'>Enter</button>
+          <button name='action' value='backspace'>Backspace</button>
+          <button name='action' value='tab'>Tab</button>
+          <button name='action' value='back'>Android Back</button>
+          <button name='action' value='home'>Android Home</button>
+          </form>
+          </body></html>"""
+
+          def run_adb(*args):
+              return subprocess.run(["adb", *args], capture_output=True, text=True, timeout=15)
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, fmt, *args):
+                  pass
+
+              def authorized(self):
+                  header = self.headers.get("Authorization", "")
+                  if not header.startswith("Basic "):
+                      return False
+                  try:
+                      raw = base64.b64decode(header[6:]).decode("utf-8")
+                  except Exception:
+                      return False
+                  return raw == f"{USER}:{PASSWORD}"
+
+              def require_auth(self):
+                  self.send_response(401)
+                  self.send_header("WWW-Authenticate", 'Basic realm="ADB Input"')
+                  self.end_headers()
+
+              def send_page(self, message=""):
+                  body = PAGE
+                  if message:
+                      body = body.replace("</h2>", "</h2><p class='ok'>" + html.escape(message) + "</p>")
+                  data = body.encode("utf-8")
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+
+              def do_GET(self):
+                  if not self.authorized():
+                      return self.require_auth()
+                  self.send_page()
+
+              def do_POST(self):
+                  if not self.authorized():
+                      return self.require_auth()
+                  length = int(self.headers.get("Content-Length", "0"))
+                  form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+                  action = form.get("action", [""])[0]
+                  if action == "text":
+                      text = form.get("text", [""])[0]
+                      lines = text.split("\n")
+                      for idx, line in enumerate(lines):
+                          if line:
+                              run_adb("shell", "input", "text", line.replace(" ", "%s"))
+                          if idx + 1 < len(lines):
+                              run_adb("shell", "input", "keyevent", "66")
+                      self.send_page("文字已通过 ADB 发送")
+                      return
+                  if action in KEYEVENTS:
+                      run_adb("shell", "input", "keyevent", KEYEVENTS[action])
+                      self.send_page(action + " 已发送")
+                      return
+                  self.send_page("没有执行操作")
+
+          ThreadingHTTPServer(("127.0.0.1", 8090), Handler).serve_forever()
+          PY
+
           cat >/tmp/cloud-phone.sh <<'SCRIPT'
           #!/usr/bin/env bash
           set -u
 
           adb wait-for-device
           adb shell input keyevent 82 || true
-          adb shell settings put secure show_ime_with_hard_keyboard 1 || true
-          adb shell settings put system show_ime_with_hard_keyboard 1 || true
-
-          echo "Available IMEs:"
-          IME_LIST="$(adb shell ime list -s 2>/dev/null | tr -d '\r' || true)"
-          printf '%s\n' "$IME_LIST"
-          IME="$(printf '%s\n' "$IME_LIST" | grep -Ei 'latin|inputmethod|keyboard' | head -n1 || true)"
-          if [ -z "$IME" ]; then
-            IME="$(printf '%s\n' "$IME_LIST" | head -n1 || true)"
-          fi
-          if [ -n "$IME" ]; then
-            adb shell ime enable "$IME" || true
-            adb shell ime set "$IME" || true
-            adb shell settings put secure default_input_method "$IME" || true
-            echo "IME_SELECTED=$IME"
-          else
-            echo "IME_NOT_FOUND"
-          fi
-          echo "CURRENT_IME=$(adb shell settings get secure default_input_method 2>/dev/null | tr -d '\r' || true)"
-          echo "SHOW_IME_WITH_HARD_KEYBOARD=$(adb shell settings get secure show_ime_with_hard_keyboard 2>/dev/null | tr -d '\r' || true)"
 
           nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
           nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared.log 2>&1 &
 
-          echo "Waiting for secure temporary cloud-phone URL..."
-          URL=""
-          for i in $(seq 1 40); do
-            URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
-            [ -n "$URL" ] && break
+          nohup env VNC_PASSWORD="$VNC_PASSWORD" python3 /tmp/adb_input_server.py >/tmp/adb-input.log 2>&1 &
+          nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8090 >/tmp/adb-cloudflared.log 2>&1 &
+
+          VNC_URL=""
+          ADB_URL=""
+          for i in $(seq 1 50); do
+            [ -n "$VNC_URL" ] || VNC_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
+            [ -n "$ADB_URL" ] || ADB_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/adb-cloudflared.log | head -n1 || true)
+            [ -n "$VNC_URL" ] && [ -n "$ADB_URL" ] && break
             sleep 1
           done
 
-          if [ -z "$URL" ]; then
-            echo "::error::Cloudflare tunnel did not start."
-            cat /tmp/cloudflared.log
+          if [ -z "$VNC_URL" ] || [ -z "$ADB_URL" ]; then
+            echo "::error::Remote tunnels did not start."
+            cat /tmp/cloudflared.log || true
+            cat /tmp/adb-cloudflared.log || true
             exit 1
           fi
 
           echo "============================================================"
           echo "ANDROID CLOUD PHONE READY"
-          echo "Open: ${URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
-          echo "Password: use repository secret VNC_PASSWORD"
+          echo "VNC: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"
+          echo "ADB INPUT: ${ADB_URL}/"
+          echo "ADB INPUT username: adb"
+          echo "Password: repository secret VNC_PASSWORD"
           echo "============================================================"
 
           echo "Downloading Binance APK from official URL..."
@@ -104,25 +194,18 @@ jobs:
               fi
             else
               echo "BINANCE_APK_INSTALL_FAILED"
-              echo "Emulator ABI: $(adb shell getprop ro.product.cpu.abi | tr -d '\r')"
-              echo "Emulator ABI list: $(adb shell getprop ro.product.cpu.abilist | tr -d '\r')"
             fi
           else
             echo "BINANCE_APK_DOWNLOAD_FAILED"
           fi
 
           sleep 3
-          echo "X11 windows before focus:"
-          wmctrl -l || true
           WIN_ID=$(xdotool search --onlyvisible --name 'Android Emulator' 2>/dev/null | head -n1 || true)
           if [ -n "$WIN_ID" ]; then
             xdotool windowactivate --sync "$WIN_ID" || true
             echo "ANDROID_EMULATOR_FOCUSED"
-          else
-            echo "ANDROID_EMULATOR_FOCUS_WINDOW_NOT_FOUND"
           fi
 
-          echo "Keyboard mode: interactive; system IME forced as default."
           echo "Cloud phone will remain online for about 50 minutes."
           for i in $(seq 1 300); do
             adb get-state >/dev/null 2>&1 || break
