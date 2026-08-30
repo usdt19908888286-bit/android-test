@@ -30,8 +30,8 @@ jobs:
             exit 1
           fi
           sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc novnc websockify curl
-          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sudo apt-get install -y xvfb x11vnc novnc websockify curl libpulse0
+          nohup Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
           x11vnc -storepasswd "$VNC_PASSWORD" /tmp/vnc.pass >/dev/null
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
@@ -59,9 +59,9 @@ jobs:
             adb wait-for-device
             adb shell input keyevent 82 || true
 
-            x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-            websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
-            /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared.log 2>&1 &
+            nohup x11vnc -display :99 -rfbauth /tmp/vnc.pass -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+            nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:6080 >/tmp/cloudflared.log 2>&1 &
 
             echo "Waiting for secure temporary cloud-phone URL..."
             URL=""
