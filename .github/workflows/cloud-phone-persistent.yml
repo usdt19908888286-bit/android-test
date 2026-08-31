@@ -1,0 +1,231 @@
+name: Persistent Android Cloud Phone
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone_id:
+        description: Logical phone ID (digits only, e.g. 001)
+        required: true
+        default: '001'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-cloud-phone-${{ inputs.phone_id }}
+  cancel-in-progress: true
+
+env:
+  DISPLAY: :99
+  AVD_NAME: full-avd-api35-pixel6-frida-v2
+  BASE_CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate phone ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.phone_id }}' in
+            ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
+          esac
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: persistent-phone${{ inputs.phone_id }}-${{ github.run_id }}
+          version: latest
+          log-mode: normal
+
+      - name: Enable KVM and prepare display
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11vnc netcat-openbsd jq
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+
+      - name: Restore latest full phone archive or base AVD
+        id: avd-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.android/avd
+          key: cloud-phone-full-avd-phone${{ inputs.phone_id }}-current
+          restore-keys: |
+            cloud-phone-full-avd-phone${{ inputs.phone_id }}-
+            ${{ env.BASE_CACHE_KEY }}
+
+      - name: Identify restore source
+        shell: bash
+        run: |
+          set -euo pipefail
+          MATCHED='${{ steps.avd-restore.outputs.cache-matched-key }}'
+          [ -n "$MATCHED" ] || { echo '::error::AVD_CACHE_MISS'; exit 1; }
+          case "$MATCHED" in
+            cloud-phone-full-avd-phone${{ inputs.phone_id }}-*)
+              echo 'RESTORE_KIND=archive' >> "$GITHUB_ENV"
+              echo "FULL_AVD_ARCHIVE_RESTORED=$MATCHED"
+              ;;
+            *)
+              echo 'RESTORE_KIND=base' >> "$GITHUB_ENV"
+              echo "BASE_AVD_RESTORED=$MATCHED"
+              ;;
+          esac
+
+      - name: Prepare persistent phone runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/persistent-phone.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          PHONE_ID='${{ inputs.phone_id }}'
+          BACKUP_TRIGGER_TAG="cloud-phone-backup-phone${PHONE_ID}-${GITHUB_RUN_ID}"
+
+          adb wait-for-device
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
+
+          adb root >/tmp/adb-root-persistent.log 2>&1 || true
+          sleep 2
+          adb wait-for-device
+          adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
+          echo 'ADB_ROOT_OK'
+
+          if [ "${RESTORE_KIND:-base}" = 'base' ]; then
+            adb shell settings put global window_animation_scale 0 || true
+            adb shell settings put global transition_animation_scale 0 || true
+            adb shell settings put global animator_duration_scale 0 || true
+            adb shell settings put global disable_window_blurs 1 || true
+            adb shell settings put system peak_refresh_rate 60.0 || true
+            adb shell settings put system min_refresh_rate 60.0 || true
+            adb shell wm size 720x1600 || true
+            adb shell wm density 280 || true
+            echo 'BASE_DISPLAY_TUNING_APPLIED'
+          else
+            echo 'ARCHIVE_DISPLAY_STATE_PRESERVED'
+          fi
+
+          if adb shell 'test -x /data/local/tmp/frida-server'; then
+            adb shell 'chmod 755 /data/local/tmp/frida-server'
+            adb shell 'pidof frida-server >/dev/null 2>&1 || (nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null &)'
+            echo 'FRIDA_SERVER_AVAILABLE'
+          fi
+
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ]
+          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+
+          nohup x11vnc -display :99 -nopw -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+          echo $! >/tmp/x11vnc.pid
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 5900 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 5900
+          sudo -E tailscale serve --bg --yes --tcp=5900 tcp://127.0.0.1:5900
+
+          echo 'PERSISTENT_CLOUD_PHONE_READY'
+          echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+          echo "TAILSCALE_VNC=${TS_IPV4}:5900"
+          echo "BACKUP_TRIGGER_TAG=$BACKUP_TRIGGER_TAG"
+          echo 'Say backup in chat when you want this exact AVD state archived.'
+
+          ADB_FAILURES=0
+          for _ in $(seq 1 1800); do
+            if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --tags origin "refs/tags/$BACKUP_TRIGGER_TAG" >/dev/null 2>&1; then
+              echo 'BACKUP_REQUEST_DETECTED'
+              adb shell sync >/dev/null 2>&1 || true
+              sync
+              touch /tmp/full-avd-backup-requested
+              printf '%s' "$BACKUP_TRIGGER_TAG" >/tmp/full-avd-backup-trigger-tag
+              echo 'FULL_AVD_SYNC_COMPLETE'
+              adb emu kill >/dev/null 2>&1 || true
+              sleep 5
+              echo 'EMULATOR_STOPPED_FOR_FULL_AVD_BACKUP'
+              exit 0
+            fi
+
+            if timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
+              ADB_FAILURES=0
+            else
+              ADB_FAILURES=$((ADB_FAILURES + 1))
+              if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
+                adb kill-server >/dev/null 2>&1 || true
+                adb start-server >/dev/null 2>&1 || true
+              fi
+            fi
+            sleep 10
+          done
+          SCRIPT
+          chmod +x /tmp/persistent-phone.sh
+
+      - name: Start persistent Android phone
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: ${{ env.AVD_NAME }}
+          cores: 4
+          ram-size: 8192M
+          emulator-port: 5554
+          force-avd-creation: false
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/persistent-phone.sh
+
+      - name: Detect on-demand backup request
+        if: always()
+        id: backup-state
+        shell: bash
+        run: |
+          if [ -f /tmp/full-avd-backup-requested ]; then
+            echo 'requested=true' >> "$GITHUB_OUTPUT"
+            echo 'FULL_AVD_BACKUP_REQUEST_CONFIRMED'
+            du -sh "$HOME/.android/avd" || true
+          else
+            echo 'requested=false' >> "$GITHUB_OUTPUT"
+            echo 'NO_FULL_AVD_BACKUP_REQUEST'
+          fi
+
+      - name: Save complete AVD to GitHub Cache
+        if: steps.backup-state.outputs.requested == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.android/avd
+          key: cloud-phone-full-avd-phone${{ inputs.phone_id }}-${{ github.run_id }}
+
+      - name: Report archive key
+        if: steps.backup-state.outputs.requested == 'true'
+        shell: bash
+        run: |
+          echo 'FULL_AVD_BACKUP_SAVED'
+          echo 'ARCHIVE_KEY=cloud-phone-full-avd-phone${{ inputs.phone_id }}-${{ github.run_id }}'
