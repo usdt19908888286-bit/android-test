@@ -1,9 +1,18 @@
 name: Android Cloud Phone 4C8G S5
 on:
   workflow_dispatch:
+    inputs:
+      phone_id:
+        description: Logical cloud phone ID (for example 001)
+        required: true
+        default: '001'
+        type: string
+
+permissions:
+  contents: read
 
 concurrency:
-  group: android-cloud-phone
+  group: android-cloud-phone-${{ inputs.phone_id }}
   cancel-in-progress: true
 
 jobs:
@@ -12,6 +21,7 @@ jobs:
     timeout-minutes: 330
     env:
       DISPLAY: :99
+      PHONE_ID: ${{ inputs.phone_id }}
       VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
       APK_URL: https://download.binance.com/pack/BNApp64.apk
       AVD_NAME: full-avd-api35-pixel6-frida-v2
@@ -20,6 +30,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: phone${{ inputs.phone_id }}-gh-${{ github.run_id }}
+          version: latest
+          log-mode: normal
+
+      - name: Verify Tailscale connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${PHONE_ID:-}" in
+            ''|*[!0-9]*) echo "::error::PHONE_ID must contain digits only"; exit 1 ;;
+          esac
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ] || { echo "::error::TAILSCALE_IPV4_MISSING"; exit 1; }
+          tailscale status --json | jq -e '.BackendState == "Running" or .Self.Online == true' >/dev/null
+          echo "TAILSCALE_CONNECTED"
+          echo "TAILSCALE_NODE_IPV4=$TS_IPV4"
 
       - name: Enable KVM
         run: |
@@ -611,6 +644,10 @@ jobs:
               echo "WATCHDOG_RESTART_NAMED_ADB_TUNNEL"
               start_named_adb_tunnel || echo "NAMED_ADB_TUNNEL_RESTART_FAILED"
             fi
+            if ! sudo -E tailscale serve status 2>/dev/null | grep -q 'tcp://.*:5555'; then
+              echo "WATCHDOG_RESTORE_TAILSCALE_ADB"
+              sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555 >/dev/null 2>&1 || echo "TAILSCALE_ADB_RESTORE_FAILED"
+            fi
             if ! adb shell 'pidof frida-server >/dev/null 2>&1'; then
               echo "WATCHDOG_RESTART_FRIDA"
               start_frida || echo "FRIDA_RESTART_FAILED"
@@ -635,6 +672,26 @@ jobs:
             exit 1
           fi
           echo "EMULATOR_ADB_TCP_5555_OK"
+
+          TS_NODE_IPV4=$(tailscale ip -4 | head -n1 || true)
+          if [ -z "$TS_NODE_IPV4" ]; then
+            echo "::error::TAILSCALE_NODE_IPV4_MISSING"
+            exit 1
+          fi
+          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+          if ! sudo -E tailscale serve status | grep -q 'tcp://.*:5555'; then
+            echo "::error::TAILSCALE_NODE_TCP_5555_FAILED"
+            exit 1
+          fi
+          echo "TAILSCALE_NODE_TCP_5555_READY"
+          echo "TAILSCALE_ADB_IPV4=$TS_NODE_IPV4"
+
+          TS_SERVICE="svc:phone${PHONE_ID}"
+          if sudo -E tailscale serve --yes --service="$TS_SERVICE" --tcp=5555 tcp://127.0.0.1:5555 >/tmp/tailscale-service.log 2>&1; then
+            echo "TAILSCALE_SERVICE_READY"
+          else
+            echo "TAILSCALE_SERVICE_UNAVAILABLE"
+          fi
 
           if ! start_frida; then
             echo "::error::FRIDA_START_FAILED"
@@ -676,6 +733,7 @@ jobs:
             echo "ADB INPUT: pending watchdog reconnect"
           fi
           echo "ADB INPUT username: adb"
+          echo "TAILSCALE ADB: ${TS_NODE_IPV4}:5555"
           echo "Passwords are stored only in GitHub Secrets."
           echo "ANDROID NETWORK: SOCKS5 bridge enabled"
           echo "============================================================"
