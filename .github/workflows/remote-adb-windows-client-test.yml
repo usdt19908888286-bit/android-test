@@ -102,19 +102,27 @@ jobs:
             }
             Write-Host 'CF_ACCESS_CLIENT_CONNECTED'
 
-            & $env:ADB_EXE kill-server 2>$null | Out-Null
-            & $env:ADB_EXE start-server | Out-Null
-            & $env:ADB_EXE connect 127.0.0.1:15555 | Out-Null
+            # Windows PowerShell 5.1 promotes native stderr to error records when
+            # ErrorActionPreference=Stop. ADB legitimately writes daemon startup
+            # messages to stderr, so use exit codes for the native ADB calls.
+            $ErrorActionPreference = 'Continue'
+            & $env:ADB_EXE start-server 2>&1 | Out-Null
+            $adbStartExit = $LASTEXITCODE
+            & $env:ADB_EXE connect 127.0.0.1:15555 2>&1 | Out-Null
+            $adbConnectExit = $LASTEXITCODE
 
             $state = (& $env:ADB_EXE -s 127.0.0.1:15555 get-state 2>$null | Out-String).Trim()
-            if ($state -ne 'device') {
+            $stateExit = $LASTEXITCODE
+            if ($adbStartExit -ne 0 -or $adbConnectExit -ne 0 -or $stateExit -ne 0 -or $state -ne 'device') {
               Write-Host 'PUBLIC_ADB_CONNECT_FAILED'
               exit 1
             }
             Write-Host 'PUBLIC_ADB_CONNECT_OK'
 
             $id = (& $env:ADB_EXE -s 127.0.0.1:15555 shell id 2>$null | Out-String).Trim()
-            if ($id -notmatch 'uid=0\(root\)') {
+            $idExit = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            if ($idExit -ne 0 -or $id -notmatch 'uid=0\(root\)') {
               Write-Host 'PUBLIC_ADB_ROOT_FAILED'
               exit 1
             }
