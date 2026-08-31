@@ -51,6 +51,14 @@ jobs:
           nc -z 127.0.0.1 5555
           echo "LOCAL_TCP_5555_OK"
 
+      - name: Expose TCP 5555 on runner Tailscale IP
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E tailscale serve --yes --tcp=5555 tcp://127.0.0.1:5555
+          sudo -E tailscale serve status | grep -q 'tcp://.*:5555'
+          echo "TAILSCALE_NODE_TCP_5555_READY"
+
       - name: Advertise and verify phone001 Tailscale Service
         shell: bash
         env:
