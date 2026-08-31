@@ -8,10 +8,6 @@ on:
         required: true
         default: '001'
         type: string
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/cloud-phone-persistent.yml
 
 permissions:
   contents: read
