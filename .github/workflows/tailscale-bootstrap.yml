@@ -1,0 +1,111 @@
+name: Tailscale Cloud Phone Bootstrap
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/tailscale-bootstrap.yml
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TS_API_CLIENT_ID: ${{ secrets.TS_API_CLIENT_ID }}
+      TS_API_CLIENT_SECRET: ${{ secrets.TS_API_CLIENT_SECRET }}
+    steps:
+      - name: Bootstrap Tailscale policy and phone001 service
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [ -n "${TS_API_CLIENT_ID:-}" ] || { echo "::error::TS_API_CLIENT_ID missing"; exit 1; }
+          [ -n "${TS_API_CLIENT_SECRET:-}" ] || { echo "::error::TS_API_CLIENT_SECRET missing"; exit 1; }
+
+          TOKEN_JSON=/tmp/ts-oauth-token.json
+          ACL_JSON=/tmp/ts-acl.json
+          ACL_HEADERS=/tmp/ts-acl.headers
+          ACL_UPDATED=/tmp/ts-acl.updated.json
+          SERVICE_JSON=/tmp/ts-service.json
+          trap 'rm -f "$TOKEN_JSON" "$ACL_JSON" "$ACL_HEADERS" "$ACL_UPDATED" "$SERVICE_JSON"' EXIT
+
+          curl -fsS -X POST \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "client_id=$TS_API_CLIENT_ID" \
+            --data-urlencode "client_secret=$TS_API_CLIENT_SECRET" \
+            --data-urlencode 'scope=all' \
+            https://api.tailscale.com/api/v2/oauth/token \
+            -o "$TOKEN_JSON"
+
+          TS_ACCESS_TOKEN=$(jq -r '.access_token // empty' "$TOKEN_JSON")
+          [ -n "$TS_ACCESS_TOKEN" ] || { echo "::error::TAILSCALE_OAUTH_TOKEN_FAILED"; exit 1; }
+          echo "::add-mask::$TS_ACCESS_TOKEN"
+          unset TS_API_CLIENT_ID TS_API_CLIENT_SECRET
+
+          ts_api() {
+            curl -fsS \
+              -H "Authorization: Bearer $TS_ACCESS_TOKEN" \
+              -H 'Accept: application/json' \
+              "$@"
+          }
+
+          ts_api -D "$ACL_HEADERS" \
+            https://api.tailscale.com/api/v2/tailnet/-/acl \
+            -o "$ACL_JSON"
+
+          jq '
+            .tagOwners = (.tagOwners // {}) |
+            .tagOwners["tag:github-phone"] = (((.tagOwners["tag:github-phone"] // []) + ["autogroup:admin"]) | unique) |
+            .tagOwners["tag:cloud-phone-service"] = (((.tagOwners["tag:cloud-phone-service"] // []) + ["autogroup:admin"]) | unique) |
+            .autoApprovers = (.autoApprovers // {}) |
+            .autoApprovers.services = (.autoApprovers.services // {}) |
+            .autoApprovers.services["tag:cloud-phone-service"] = (((.autoApprovers.services["tag:cloud-phone-service"] // []) + ["tag:github-phone"]) | unique) |
+            .grants = (.grants // []) |
+            if any(.grants[]?; (.src == ["autogroup:member"] and .dst == ["tag:cloud-phone-service"] and .ip == ["tcp:5555"]))
+            then .
+            else .grants += [{"src":["autogroup:member"],"dst":["tag:cloud-phone-service"],"ip":["tcp:5555"]}]
+            end
+          ' "$ACL_JSON" > "$ACL_UPDATED"
+
+          ETAG=$(awk 'BEGIN{IGNORECASE=1} /^etag:/ {sub(/\r$/, ""); sub(/^[^:]+:[[:space:]]*/, ""); print; exit}' "$ACL_HEADERS")
+          if [ -n "$ETAG" ]; then
+            ts_api -X POST \
+              -H 'Content-Type: application/json' \
+              -H "If-Match: $ETAG" \
+              --data-binary "@$ACL_UPDATED" \
+              https://api.tailscale.com/api/v2/tailnet/-/acl \
+              -o /dev/null
+          else
+            ts_api -X POST \
+              -H 'Content-Type: application/json' \
+              --data-binary "@$ACL_UPDATED" \
+              https://api.tailscale.com/api/v2/tailnet/-/acl \
+              -o /dev/null
+          fi
+          echo "TAILSCALE_POLICY_BOOTSTRAP_OK"
+
+          jq -n '{
+            name:"svc:phone001",
+            displayName:"phone001",
+            comment:"GitHub Android cloud phone 001",
+            ports:["tcp:5555"],
+            tags:["tag:cloud-phone-service"]
+          }' > "$SERVICE_JSON"
+
+          ts_api -X PUT \
+            -H 'Content-Type: application/json' \
+            --data-binary "@$SERVICE_JSON" \
+            'https://api.tailscale.com/api/v2/tailnet/-/vip-services/svc:phone001' \
+            -o /dev/null
+
+          ts_api \
+            'https://api.tailscale.com/api/v2/tailnet/-/vip-services/svc:phone001' \
+            | jq -e '.name == "svc:phone001" and (.ports | index("tcp:5555")) != null and (.tags | index("tag:cloud-phone-service")) != null' \
+            >/dev/null
+
+          echo "TAILSCALE_SERVICE_PHONE001_OK"
+          echo "TAILSCALE_BOOTSTRAP_COMPLETE"
