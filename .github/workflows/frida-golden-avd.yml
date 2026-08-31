@@ -1,0 +1,232 @@
+name: Frida Golden AVD Build and Restore
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/frida-golden-avd.yml
+
+jobs:
+  build-golden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AVD_NAME: full-avd-api35-pixel6-frida-v2
+      CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Prepare clean Frida Golden source
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq xz-utils netcat-openbsd
+
+          curl -fsSL 'https://api.github.com/repos/frida/frida/releases/latest' -o /tmp/frida-release.json
+          FRIDA_URL=$(jq -r '.assets[]? | select(.name | test("^frida-server-.*-android-x86_64\\.xz$")) | .browser_download_url' /tmp/frida-release.json | head -n1)
+          if [ -z "$FRIDA_URL" ]; then
+            echo "::error::FRIDA_GOLDEN_DOWNLOAD_FAILED"
+            exit 1
+          fi
+          curl -fsSL "$FRIDA_URL" -o /tmp/frida-server.xz
+          unxz -f /tmp/frida-server.xz
+          chmod 755 /tmp/frida-server
+          rm -f /tmp/frida-release.json
+
+          nohup python3 -m http.server 18080 --bind 127.0.0.1 --directory /tmp >/tmp/frida-http.log 2>&1 &
+          echo $! >/tmp/frida-http.pid
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 18080 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 18080
+          echo "FRIDA_GOLDEN_DOWNLOAD_READY"
+
+          cat >/tmp/frida-golden-seed.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          adb wait-for-device
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1"
+
+          adb root >/tmp/adb-root-golden.log 2>&1 || true
+          sleep 2
+          adb wait-for-device
+          adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
+
+          ABI=$(adb shell getprop ro.product.cpu.abi | tr -d '\r')
+          test "$ABI" = "x86_64"
+
+          if adb shell 'command -v curl >/dev/null 2>&1'; then
+            adb shell 'curl -fsSL http://10.0.2.2:18080/frida-server -o /data/local/tmp/frida-server'
+          elif adb shell 'toybox wget --help >/dev/null 2>&1'; then
+            adb shell 'toybox wget -O /data/local/tmp/frida-server http://10.0.2.2:18080/frida-server'
+          elif adb shell 'command -v wget >/dev/null 2>&1'; then
+            adb shell 'wget -O /data/local/tmp/frida-server http://10.0.2.2:18080/frida-server'
+          else
+            adb push /tmp/frida-server /data/local/tmp/frida-server >/dev/null
+          fi
+
+          adb shell 'chmod 755 /data/local/tmp/frida-server'
+          adb shell 'test -x /data/local/tmp/frida-server'
+          adb shell 'echo FULL_AVD_FRIDA_GOLDEN_V2 > /data/local/tmp/full-avd-backup-marker.txt'
+          adb shell settings put system screen_off_timeout 1234567
+
+          adb shell 'if command -v nohup >/dev/null 2>&1; then nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & else /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & fi'
+          for _ in $(seq 1 30); do
+            adb shell 'pidof frida-server >/dev/null 2>&1' && break
+            sleep 1
+          done
+          adb shell 'pidof frida-server >/dev/null 2>&1'
+          adb shell sync
+
+          echo "SOURCE_MARKER=$(adb shell cat /data/local/tmp/full-avd-backup-marker.txt | tr -d '\r')"
+          echo "SOURCE_FRIDA_SERVER=READY"
+          echo "SOURCE_GOLDEN_AVD_READY"
+          SCRIPT
+          chmod +x /tmp/frida-golden-seed.sh
+
+      - name: Create clean Frida Golden AVD
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: full-avd-api35-pixel6-frida-v2
+          cores: 4
+          ram-size: 8192M
+          emulator-port: 5554
+          force-avd-creation: true
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-window
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/frida-golden-seed.sh
+
+      - name: Measure clean Golden AVD
+        run: |
+          set -euo pipefail
+          test -d "$HOME/.android/avd"
+          echo "FRIDA_GOLDEN_DISK_USAGE=$(du -sh "$HOME/.android/avd" | awk '{print $1}')"
+          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/frida-golden.tar.zst
+          BYTES=$(stat -c '%s' /tmp/frida-golden.tar.zst)
+          echo "FRIDA_GOLDEN_ZSTD_BYTES=$BYTES"
+          rm -f /tmp/frida-golden.tar.zst
+
+      - name: Save clean Frida Golden AVD
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.android/avd/*
+          key: ${{ env.CACHE_KEY }}
+
+  restore-verify:
+    needs: build-golden
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AVD_NAME: full-avd-api35-pixel6-frida-v2
+      CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Restore clean Frida Golden AVD
+        id: avd-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.android/avd/*
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Require clean Golden cache
+        run: |
+          if [ "${{ steps.avd-restore.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::FRIDA_GOLDEN_CACHE_MISS"
+            exit 1
+          fi
+          echo "FRIDA_GOLDEN_CACHE_HIT"
+
+          cat >/tmp/frida-golden-verify.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          adb wait-for-device
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1"
+
+          adb root >/tmp/adb-root-restore.log 2>&1 || true
+          sleep 2
+          adb wait-for-device
+          adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
+
+          MARKER=$(adb shell cat /data/local/tmp/full-avd-backup-marker.txt | tr -d '\r')
+          test "$MARKER" = "FULL_AVD_FRIDA_GOLDEN_V2"
+          adb shell 'test -x /data/local/tmp/frida-server'
+
+          adb shell 'if command -v nohup >/dev/null 2>&1; then nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & else /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & fi'
+          for _ in $(seq 1 30); do
+            adb shell 'pidof frida-server >/dev/null 2>&1' && break
+            sleep 1
+          done
+          adb shell 'pidof frida-server >/dev/null 2>&1'
+
+          echo "RESTORED_MARKER=$MARKER"
+          echo "RESTORED_FRIDA_SERVER=READY"
+          echo "FRIDA_GOLDEN_CROSS_RUNNER_RESTORE_OK"
+          SCRIPT
+          chmod +x /tmp/frida-golden-verify.sh
+
+      - name: Boot restored Golden AVD and verify Frida
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: full-avd-api35-pixel6-frida-v2
+          cores: 4
+          ram-size: 8192M
+          emulator-port: 5554
+          force-avd-creation: false
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-window
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/frida-golden-verify.sh
