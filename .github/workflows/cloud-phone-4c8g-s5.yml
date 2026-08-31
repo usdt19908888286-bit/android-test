@@ -1,6 +1,14 @@
 name: Android Cloud Phone 4C8G S5
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cloud-phone-4c8g-s5.yml
+
+concurrency:
+  group: android-cloud-phone
+  cancel-in-progress: true
 
 jobs:
   cloud-phone:
@@ -10,6 +18,8 @@ jobs:
       DISPLAY: :99
       VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
       APK_URL: https://download.binance.com/pack/BNApp64.apk
+      AVD_NAME: full-avd-api35-pixel6-frida-v2
+      AVD_CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
 
     steps:
       - name: Checkout
@@ -22,12 +32,28 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Prepare remote desktop, SOCKS5 and ADB input
+      - name: Restore clean Frida Golden AVD
+        id: avd-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.android/avd/*
+          key: ${{ env.AVD_CACHE_KEY }}
+
+      - name: Require clean Frida Golden AVD
+        run: |
+          if [ "${{ steps.avd-restore.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::FRIDA_GOLDEN_CACHE_MISS"
+            exit 1
+          fi
+          echo "FRIDA_GOLDEN_CACHE_HIT"
+
+      - name: Prepare remote desktop, SOCKS5, Cloudflare and ADB input
         env:
           S5_HOST: ${{ secrets.S5_HOST }}
           S5_PORT: ${{ secrets.S5_PORT }}
           S5_USER: ${{ secrets.S5_USER }}
           S5_PASS: ${{ secrets.S5_PASS }}
+          CLOUD_PHONE_SECRETS: ${{ secrets.CLOUD_PHONE_SECRETS }}
         run: |
           set -e
           if [ -z "${VNC_PASSWORD:-}" ]; then
@@ -40,7 +66,7 @@ jobs:
           fi
 
           sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc novnc websockify curl libpulse0 unzip xdotool wmctrl python3-pip
+          sudo apt-get install -y xvfb x11vnc novnc websockify curl jq openssl netcat-openbsd libpulse0 unzip xdotool wmctrl python3-pip
           python3 -m pip install --quiet --break-system-packages PySocks
 
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
@@ -49,6 +75,156 @@ jobs:
 
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
+
+          cf_fail() {
+            echo "CF_TUNNEL_FAILED"
+            exit 1
+          }
+
+          if [ -z "${CLOUD_PHONE_SECRETS:-}" ] || ! jq -e . >/dev/null 2>&1 <<<"$CLOUD_PHONE_SECRETS"; then
+            cf_fail
+          fi
+
+          CF_API_TOKEN=$(jq -r '.cf_api_token // empty' <<<"$CLOUD_PHONE_SECRETS")
+          CF_ZONE=$(jq -r '.cf_zone // empty' <<<"$CLOUD_PHONE_SECRETS")
+          CF_ADB_INPUT=$(jq -r '.cf_adb_hostname // empty' <<<"$CLOUD_PHONE_SECRETS")
+          CF_PHONE_INPUT=$(jq -r '.cf_phone_hostname // empty' <<<"$CLOUD_PHONE_SECRETS")
+          unset CLOUD_PHONE_SECRETS
+
+          [ -n "$CF_API_TOKEN" ] || cf_fail
+          [ -n "$CF_ZONE" ] || cf_fail
+          [ -n "$CF_ADB_INPUT" ] || cf_fail
+          [ -n "$CF_PHONE_INPUT" ] || cf_fail
+
+          normalize_hostname() {
+            local value="$1"
+            case "$value" in
+              *.*)
+                case "$value" in *.$CF_ZONE) printf '%s' "$value" ;; *) return 1 ;; esac
+                ;;
+              *) printf '%s.%s' "$value" "$CF_ZONE" ;;
+            esac
+          }
+
+          CF_ADB_HOSTNAME=$(normalize_hostname "$CF_ADB_INPUT") || cf_fail
+          CF_PHONE_HOSTNAME=$(normalize_hostname "$CF_PHONE_INPUT") || cf_fail
+          unset CF_ADB_INPUT CF_PHONE_INPUT
+          [ "$CF_ADB_HOSTNAME" != "$CF_PHONE_HOSTNAME" ] || cf_fail
+
+          echo "::add-mask::$CF_API_TOKEN"
+          printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$CF_API_TOKEN" >/tmp/cf-curl.conf
+          chmod 600 /tmp/cf-curl.conf
+
+          cf_curl() {
+            curl -fsS --config /tmp/cf-curl.conf "$@"
+          }
+
+          cf_curl -G 'https://api.cloudflare.com/client/v4/zones' \
+            --data-urlencode "name=$CF_ZONE" \
+            --data-urlencode 'status=active' \
+            --data-urlencode 'per_page=1' \
+            -o /tmp/cf-zone.json || cf_fail
+          jq -e '.success == true and (.result | length) == 1' /tmp/cf-zone.json >/dev/null || cf_fail
+          ZONE_ID=$(jq -r '.result[0].id // empty' /tmp/cf-zone.json)
+          ACCOUNT_ID=$(jq -r '.result[0].account.id // empty' /tmp/cf-zone.json)
+          [ -n "$ZONE_ID" ] && [ -n "$ACCOUNT_ID" ] || cf_fail
+
+          TUNNEL_NAME="github-android-cloud-phone-${ZONE_ID:0:8}"
+          cf_curl -G "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel" \
+            --data-urlencode "name=$TUNNEL_NAME" \
+            --data-urlencode 'is_deleted=false' \
+            --data-urlencode 'per_page=100' \
+            -o /tmp/cf-tunnels.json || cf_fail
+          jq -e '.success == true' /tmp/cf-tunnels.json >/dev/null || cf_fail
+
+          TUNNEL_ID=$(jq -r --arg name "$TUNNEL_NAME" '.result[]? | select(.name == $name and .config_src == "cloudflare") | .id' /tmp/cf-tunnels.json | head -n1)
+          if [ -z "$TUNNEL_ID" ]; then
+            if jq -e --arg name "$TUNNEL_NAME" '.result[]? | select(.name == $name)' /tmp/cf-tunnels.json >/dev/null; then
+              cf_fail
+            fi
+
+            TUNNEL_SECRET=$(openssl rand -base64 32 | tr -d '\n')
+            echo "::add-mask::$TUNNEL_SECRET"
+            jq -n \
+              --arg name "$TUNNEL_NAME" \
+              --arg secret "$TUNNEL_SECRET" \
+              '{name:$name, config_src:"cloudflare", tunnel_secret:$secret}' \
+              >/tmp/cf-create-tunnel.json
+            cf_curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel" \
+              --data-binary @/tmp/cf-create-tunnel.json \
+              -o /tmp/cf-created-tunnel.json || cf_fail
+            jq -e '.success == true and (.result.id | length) > 0' /tmp/cf-created-tunnel.json >/dev/null || cf_fail
+            TUNNEL_ID=$(jq -r '.result.id' /tmp/cf-created-tunnel.json)
+            unset TUNNEL_SECRET
+          fi
+
+          jq -n \
+            --arg adb "$CF_ADB_HOSTNAME" \
+            --arg phone "$CF_PHONE_HOSTNAME" \
+            '{config:{ingress:[
+              {hostname:$adb,service:"tcp://localhost:5555"},
+              {hostname:$phone,service:"http_status:404"},
+              {service:"http_status:404"}
+            ]}}' >/tmp/cf-ingress.json
+          cf_curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            --data-binary @/tmp/cf-ingress.json \
+            -o /tmp/cf-config-result.json || cf_fail
+          jq -e '.success == true' /tmp/cf-config-result.json >/dev/null || cf_fail
+
+          upsert_tunnel_dns() {
+            local hostname="$1"
+            local target="$TUNNEL_ID.cfargotunnel.com"
+            local record_id
+
+            cf_curl -G "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+              --data-urlencode "name=$hostname" \
+              --data-urlencode 'per_page=100' \
+              -o /tmp/cf-dns-list.json || cf_fail
+            jq -e '.success == true' /tmp/cf-dns-list.json >/dev/null || cf_fail
+
+            record_id=$(jq -r --arg hostname "$hostname" '.result[]? | select(.name == $hostname and .type == "CNAME") | .id' /tmp/cf-dns-list.json | head -n1)
+            jq -n \
+              --arg name "$hostname" \
+              --arg content "$target" \
+              '{type:"CNAME",name:$name,content:$content,proxied:true,ttl:1}' \
+              >/tmp/cf-dns-write.json
+
+            if [ -n "$record_id" ]; then
+              cf_curl -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$record_id" \
+                --data-binary @/tmp/cf-dns-write.json \
+                -o /tmp/cf-dns-result.json || cf_fail
+            else
+              while IFS= read -r old_id; do
+                [ -n "$old_id" ] || continue
+                cf_curl -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$old_id" \
+                  -o /tmp/cf-dns-delete.json || cf_fail
+              done < <(jq -r --arg hostname "$hostname" '.result[]? | select(.name == $hostname) | .id' /tmp/cf-dns-list.json)
+
+              cf_curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                --data-binary @/tmp/cf-dns-write.json \
+                -o /tmp/cf-dns-result.json || cf_fail
+            fi
+            jq -e '.success == true' /tmp/cf-dns-result.json >/dev/null || cf_fail
+          }
+
+          upsert_tunnel_dns "$CF_ADB_HOSTNAME"
+          upsert_tunnel_dns "$CF_PHONE_HOSTNAME"
+
+          cf_curl "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" \
+            -o /tmp/cf-tunnel-token-response.json || cf_fail
+          jq -e '.success == true and (.result | type) == "string" and (.result | length) > 0' /tmp/cf-tunnel-token-response.json >/dev/null || cf_fail
+          CF_TUNNEL_TOKEN=$(jq -r '.result' /tmp/cf-tunnel-token-response.json)
+          echo "::add-mask::$CF_TUNNEL_TOKEN"
+          printf '%s' "$CF_TUNNEL_TOKEN" >/tmp/cf_tunnel_token
+          chmod 600 /tmp/cf_tunnel_token
+          printf '%s' "$CF_ADB_HOSTNAME" >/tmp/cf_adb_hostname
+
+          unset CF_API_TOKEN CF_TUNNEL_TOKEN
+          rm -f /tmp/cf-curl.conf /tmp/cf-zone.json /tmp/cf-tunnels.json \
+            /tmp/cf-create-tunnel.json /tmp/cf-created-tunnel.json \
+            /tmp/cf-ingress.json /tmp/cf-config-result.json \
+            /tmp/cf-dns-list.json /tmp/cf-dns-write.json /tmp/cf-dns-result.json \
+            /tmp/cf-dns-delete.json /tmp/cf-tunnel-token-response.json
 
           cat >/tmp/s5_bridge.py <<'PY'
           import os
@@ -335,19 +511,66 @@ jobs:
             return 1
           }
 
-          start_adb_tunnel() {
-            : >/tmp/cloudflared_adb.log
-            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >/tmp/cloudflared_adb.log 2>&1 &
-            echo $! >/tmp/cloudflared_adb.pid
-            ADB_URL=""
+          start_adb_input_tunnel() {
+            : >/tmp/cloudflared_adb_input.log
+            nohup /tmp/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 >/tmp/cloudflared_adb_input.log 2>&1 &
+            echo $! >/tmp/cloudflared_adb_input.pid
+            ADB_INPUT_URL=""
             for _ in $(seq 1 50); do
-              ADB_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_adb.log | head -n1 || true)
-              [ -n "$ADB_URL" ] && return 0
-              if ! pid_alive /tmp/cloudflared_adb.pid; then break; fi
+              ADB_INPUT_URL=$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared_adb_input.log | head -n1 || true)
+              [ -n "$ADB_INPUT_URL" ] && return 0
+              if ! pid_alive /tmp/cloudflared_adb_input.pid; then break; fi
               sleep 1
             done
-            if pid_alive /tmp/cloudflared_adb.pid; then kill "$(cat /tmp/cloudflared_adb.pid)" >/dev/null 2>&1 || true; fi
-            rm -f /tmp/cloudflared_adb.pid
+            if pid_alive /tmp/cloudflared_adb_input.pid; then kill "$(cat /tmp/cloudflared_adb_input.pid)" >/dev/null 2>&1 || true; fi
+            rm -f /tmp/cloudflared_adb_input.pid
+            return 1
+          }
+
+          start_named_adb_tunnel() {
+            [ -s /tmp/cf_tunnel_token ] || return 1
+            echo "CF_TUNNEL_STARTING"
+            : >/tmp/cloudflared_named_adb.log
+            nohup /tmp/cloudflared tunnel \
+              --no-autoupdate \
+              --loglevel info \
+              --logfile /tmp/cloudflared_named_adb.log \
+              run --token-file /tmp/cf_tunnel_token \
+              >/dev/null 2>&1 &
+            echo $! >/tmp/cloudflared_named_adb.pid
+
+            for _ in $(seq 1 60); do
+              if grep -q 'Registered tunnel connection' /tmp/cloudflared_named_adb.log 2>/dev/null; then
+                echo "CF_TUNNEL_CONNECTED"
+                echo "REMOTE_ADB_READY"
+                return 0
+              fi
+              if ! pid_alive /tmp/cloudflared_named_adb.pid; then break; fi
+              sleep 1
+            done
+
+            if pid_alive /tmp/cloudflared_named_adb.pid; then kill "$(cat /tmp/cloudflared_named_adb.pid)" >/dev/null 2>&1 || true; fi
+            rm -f /tmp/cloudflared_named_adb.pid
+            echo "CF_TUNNEL_FAILED"
+            return 1
+          }
+
+          start_frida() {
+            local abi
+            abi=$(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r' || true)
+            [ "$abi" = "x86_64" ] || return 1
+            adb shell 'test -x /data/local/tmp/frida-server' || return 1
+            adb shell 'chmod 755 /data/local/tmp/frida-server'
+            if ! adb shell 'pidof frida-server >/dev/null 2>&1'; then
+              adb shell 'if command -v nohup >/dev/null 2>&1; then nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & else /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & fi'
+            fi
+            for _ in $(seq 1 30); do
+              if adb shell 'pidof frida-server >/dev/null 2>&1'; then
+                echo "FRIDA_SERVER_READY"
+                return 0
+              fi
+              sleep 1
+            done
             return 1
           }
 
@@ -368,23 +591,65 @@ jobs:
               echo "WATCHDOG_RESTART_VNC_TUNNEL"
               if start_vnc_tunnel; then echo "VNC_RECONNECTED: ${VNC_URL}/vnc.html?autoconnect=1&resize=scale&view_only=0"; else echo "VNC_TUNNEL_RESTART_FAILED"; fi
             fi
-            if ! pid_alive /tmp/cloudflared_adb.pid; then
-              echo "WATCHDOG_RESTART_ADB_TUNNEL"
-              if start_adb_tunnel; then echo "ADB_INPUT_RECONNECTED: ${ADB_URL}/"; else echo "ADB_TUNNEL_RESTART_FAILED"; fi
+            if ! pid_alive /tmp/cloudflared_adb_input.pid; then
+              echo "WATCHDOG_RESTART_ADB_INPUT_TUNNEL"
+              if start_adb_input_tunnel; then echo "ADB_INPUT_RECONNECTED: ${ADB_INPUT_URL}/"; else echo "ADB_INPUT_TUNNEL_RESTART_FAILED"; fi
+            fi
+            if ! pid_alive /tmp/cloudflared_named_adb.pid; then
+              echo "WATCHDOG_RESTART_NAMED_ADB_TUNNEL"
+              start_named_adb_tunnel || true
+            fi
+            if ! adb shell 'pidof frida-server >/dev/null 2>&1'; then
+              echo "WATCHDOG_RESTART_FRIDA"
+              start_frida || echo "FRIDA_RESTART_FAILED"
             fi
           }
 
           adb wait-for-device
-          adb shell input keyevent 82 || true
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1"
 
+          adb root >/tmp/adb-root-main.log 2>&1 || true
+          sleep 2
+          adb wait-for-device
+          adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
+          echo "ADB_ROOT_OK"
+
+          if ! nc -z 127.0.0.1 5555; then
+            echo "::error::EMULATOR_ADB_TCP_5555_FAILED"
+            exit 1
+          fi
+          echo "EMULATOR_ADB_TCP_5555_OK"
+
+          if ! start_frida; then
+            echo "::error::FRIDA_START_FAILED"
+            exit 1
+          fi
+
+          GOLDEN_MARKER=$(adb shell cat /data/local/tmp/full-avd-backup-marker.txt 2>/dev/null | tr -d '\r' || true)
+          if [ "$GOLDEN_MARKER" != "FULL_AVD_FRIDA_GOLDEN_V2" ]; then
+            echo "::error::GOLDEN_AVD_MARKER_INVALID"
+            exit 1
+          fi
+          if adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -Eq '^package:com\.binance'; then
+            echo "::error::GOLDEN_AVD_NOT_CLEAN"
+            exit 1
+          fi
+          echo "CLEAN_FRIDA_GOLDEN_AVD_OK"
+
+          adb shell input keyevent 82 || true
           start_x11vnc
           start_novnc
           start_adb_input
 
           VNC_URL=""
-          ADB_URL=""
+          ADB_INPUT_URL=""
           if ! start_vnc_tunnel; then echo "VNC_TUNNEL_START_PENDING"; fi
-          if ! start_adb_tunnel; then echo "ADB_TUNNEL_START_PENDING"; fi
+          if ! start_adb_input_tunnel; then echo "ADB_INPUT_TUNNEL_START_PENDING"; fi
+          if ! start_named_adb_tunnel; then exit 1; fi
 
           echo "============================================================"
           echo "ANDROID CLOUD PHONE READY"
@@ -393,8 +658,8 @@ jobs:
           else
             echo "VNC: pending watchdog reconnect"
           fi
-          if [ -n "$ADB_URL" ]; then
-            echo "ADB INPUT: ${ADB_URL}/"
+          if [ -n "$ADB_INPUT_URL" ]; then
+            echo "ADB INPUT: ${ADB_INPUT_URL}/"
           else
             echo "ADB INPUT: pending watchdog reconnect"
           fi
@@ -459,8 +724,11 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
+          avd-name: full-avd-api35-pixel6-frida-v2
           cores: 4
           ram-size: 8192M
+          emulator-port: 5554
+          force-avd-creation: false
           disable-animations: false
           emulator-options: >-
             -no-snapshot
