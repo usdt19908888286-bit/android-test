@@ -2,22 +2,22 @@ name: Persistent Android Cloud Phone
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/cloud-phone-persistent.yml
     inputs:
       phone_id:
         description: Logical phone ID (digits only, e.g. 001)
         required: true
         default: '001'
         type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cloud-phone-persistent.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-cloud-phone-${{ inputs.phone_id }}
+  group: android-cloud-phone-${{ inputs.phone_id || '001' }}
   cancel-in-progress: true
 
 env:
@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case '${{ inputs.phone_id }}' in
+          case '${{ inputs.phone_id || '001' }}' in
             ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
           esac
 
@@ -47,7 +47,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
           tags: tag:github-phone
-          hostname: persistent-phone${{ inputs.phone_id }}-${{ github.run_id }}
+          hostname: persistent-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
           version: latest
           log-mode: normal
 
@@ -69,9 +69,9 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.android/avd
-          key: cloud-phone-full-avd-phone${{ inputs.phone_id }}-current
+          key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-current
           restore-keys: |
-            cloud-phone-full-avd-phone${{ inputs.phone_id }}-
+            cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-
             ${{ env.BASE_CACHE_KEY }}
 
       - name: Identify restore source
@@ -81,7 +81,7 @@ jobs:
           MATCHED='${{ steps.avd-restore.outputs.cache-matched-key }}'
           [ -n "$MATCHED" ] || { echo '::error::AVD_CACHE_MISS'; exit 1; }
           case "$MATCHED" in
-            cloud-phone-full-avd-phone${{ inputs.phone_id }}-*)
+            cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-*)
               echo 'RESTORE_KIND=archive' >> "$GITHUB_ENV"
               echo "FULL_AVD_ARCHIVE_RESTORED=$MATCHED"
               ;;
@@ -99,7 +99,7 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          PHONE_ID='${{ inputs.phone_id }}'
+          PHONE_ID='${{ inputs.phone_id || '001' }}'
           BACKUP_TRIGGER_TAG="cloud-phone-backup-phone${PHONE_ID}-${GITHUB_RUN_ID}"
 
           adb wait-for-device
@@ -225,11 +225,11 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.android/avd
-          key: cloud-phone-full-avd-phone${{ inputs.phone_id }}-${{ github.run_id }}
+          key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
 
       - name: Report archive key
         if: steps.backup-state.outputs.requested == 'true'
         shell: bash
         run: |
           echo 'FULL_AVD_BACKUP_SAVED'
-          echo 'ARCHIVE_KEY=cloud-phone-full-avd-phone${{ inputs.phone_id }}-${{ github.run_id }}'
+          echo 'ARCHIVE_KEY=cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}'
