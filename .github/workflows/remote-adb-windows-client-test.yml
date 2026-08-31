@@ -130,6 +130,28 @@ jobs:
             Write-Host 'PUBLIC_ADB_ROOT_OK'
             Write-Host 'PUBLIC_ADB_END_TO_END_OK'
 
+            # Verify the cloud phone's Frida server through the same public ADB
+            # session, then prove its default control port can be forwarded back
+            # to the Windows client through ADB.
+            $ErrorActionPreference = 'Continue'
+            $fridaPid = (& $env:ADB_EXE -s 127.0.0.1:15555 shell 'test -x /data/local/tmp/frida-server && pidof frida-server' 2>$null | Out-String).Trim()
+            $fridaCheckExit = $LASTEXITCODE
+            & $env:ADB_EXE -s 127.0.0.1:15555 forward tcp:27042 tcp:27042 2>&1 | Out-Null
+            $fridaForwardExit = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+
+            if ($fridaCheckExit -ne 0 -or [string]::IsNullOrWhiteSpace($fridaPid) -or $fridaForwardExit -ne 0) {
+              Write-Host 'FRIDA_REMOTE_SERVER_FAILED'
+              exit 1
+            }
+
+            $fridaTcp = Test-NetConnection -ComputerName 127.0.0.1 -Port 27042 -WarningAction SilentlyContinue
+            if (-not $fridaTcp.TcpTestSucceeded) {
+              Write-Host 'FRIDA_REMOTE_SERVER_FAILED'
+              exit 1
+            }
+            Write-Host 'FRIDA_REMOTE_SERVER_OK'
+
             # Prove that the same public ADB tunnel can sustain a real scrcpy
             # H.264 video stream. Keep the recording only long enough to verify
             # non-empty video data, then delete it without uploading an artifact.
