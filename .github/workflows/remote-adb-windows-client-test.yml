@@ -1,5 +1,6 @@
 name: Remote ADB Windows Client Test
 
+# Re-check the currently active production cloud-phone tunnel from an independent Windows runner.
 on:
   workflow_dispatch:
   push:
