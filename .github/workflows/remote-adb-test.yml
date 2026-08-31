@@ -90,7 +90,8 @@ jobs:
           if printf '%s' "$ROOT_AFTER" | grep -q 'uid=0(root)'; then
             echo "ADB_ROOT_OK"
           else
-            echo "ADB_ROOT_UNAVAILABLE"
+            echo "::error::ADB_ROOT_UNAVAILABLE"
+            exit 1
           fi
 
           # emulator-port is fixed at 5554, so its host-side ADB TCP port is 5555.
@@ -119,7 +120,8 @@ jobs:
               echo "FRESH_ADB_CLIENT_SHELL_OK"
             fi
           else
-            echo "FRESH_ADB_CLIENT_STATE=${FRESH_STATE:-unavailable}"
+            echo "::error::FRESH_ADB_CLIENT_STATE=${FRESH_STATE:-unavailable}"
+            exit 1
           fi
           adb kill-server >/dev/null 2>&1 || true
           unset ADB_SERVER_PORT
