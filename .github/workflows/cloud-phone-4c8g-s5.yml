@@ -674,6 +674,8 @@ jobs:
           adb shell settings put global disable_window_blurs 1 || true
           adb shell settings put system peak_refresh_rate 60.0 || true
           adb shell settings put system min_refresh_rate 60.0 || true
+          adb shell wm size 720x1600 || true
+          adb shell wm density 280 || true
           echo "SYSTEMUI_STABILITY_SETTINGS_OK"
 
           if ! nc -z 127.0.0.1 5555; then
