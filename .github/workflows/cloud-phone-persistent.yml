@@ -1,4 +1,4 @@
-name: Persistent Android Cloud Phone
+name: Fresh Android Cloud Phone
 
 on:
   workflow_dispatch:
@@ -8,38 +8,40 @@ on:
         required: true
         default: '001'
         type: string
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/cloud-phone-persistent.yml
+      apk_url:
+        description: APK URL installed automatically after boot
+        required: false
+        default: 'https://bcoin666.com/app-release.apk'
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-cloud-phone-${{ inputs.phone_id || '001' }}
+  group: fresh-android-cloud-phone-${{ inputs.phone_id || '001' }}
   cancel-in-progress: true
 
 env:
   DISPLAY: :99
-  AVD_NAME: full-avd-api35-pixel6-frida-v2
-  BASE_CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
 
 jobs:
   phone:
     runs-on: ubuntu-latest
     timeout-minutes: 330
+    env:
+      APK_URL: ${{ inputs.apk_url || 'https://bcoin666.com/app-release.apk' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate phone ID
+      - name: Validate inputs
         shell: bash
         run: |
           set -euo pipefail
           case '${{ inputs.phone_id || '001' }}' in
             ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
           esac
+          [ -n "${APK_URL:-}" ] || { echo '::error::apk_url is empty'; exit 1; }
 
       - name: Join Tailscale
         uses: tailscale/github-action@v4
@@ -47,7 +49,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
           tags: tag:github-phone
-          hostname: persistent-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
+          hostname: fresh-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
           version: latest
 
       - name: Enable KVM and prepare display
@@ -58,8 +60,8 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           test -e /dev/kvm
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc netcat-openbsd jq libpulse0 curl python3-pip
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip python3-pip
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
 
@@ -98,9 +100,8 @@ jobs:
               return s
 
           def relay(a, b):
-              sockets = [a, b]
               while True:
-                  readable, _, _ = select.select(sockets, [], [], 60)
+                  readable, _, _ = select.select([a, b], [], [], 60)
                   if not readable:
                       continue
                   for src in readable:
@@ -177,18 +178,7 @@ jobs:
           Server(("127.0.0.1", 8118), Handler).serve_forever()
           PY
 
-          cat >/tmp/s5_bridge_supervisor.sh <<'SH'
-          #!/usr/bin/env bash
-          set -u
-          while true; do
-            python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1
-            sleep 2
-          done
-          SH
-          chmod +x /tmp/s5_bridge_supervisor.sh
-          : >/tmp/s5_bridge.log
-          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &
-          echo $! >/tmp/s5_bridge_supervisor.pid
+          nohup python3 /tmp/s5_bridge.py >/tmp/s5_bridge.log 2>&1 &
           for _ in $(seq 1 20); do
             nc -z 127.0.0.1 8118 && break
             sleep 1
@@ -196,171 +186,19 @@ jobs:
           nc -z 127.0.0.1 8118
           curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
           echo 'SOCKS5_BRIDGE_OK'
-      - name: Restore latest full phone archive or base AVD
-        id: avd-restore
-        uses: actions/cache/restore@v5
-        with:
-          path: ~/.android/avd/*
-          key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-current
-          restore-keys: |
-            cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-
-            ${{ env.BASE_CACHE_KEY }}
 
-      - name: Identify restore source
-        shell: bash
-        run: |
-          set -euo pipefail
-          MATCHED='${{ steps.avd-restore.outputs.cache-matched-key }}'
-          [ -n "$MATCHED" ] || { echo '::error::AVD_CACHE_MISS'; exit 1; }
-          case "$MATCHED" in
-            cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-*)
-              echo 'RESTORE_KIND=archive' >> "$GITHUB_ENV"
-              echo "FULL_AVD_ARCHIVE_RESTORED=$MATCHED"
-              ;;
-            *)
-              echo 'RESTORE_KIND=base' >> "$GITHUB_ENV"
-              echo "BASE_AVD_RESTORED=$MATCHED"
-              ;;
-          esac
-
-      - name: Prepare persistent phone runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat >/tmp/persistent-phone.sh <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          PHONE_ID='${{ inputs.phone_id || '001' }}'
-          BACKUP_TRIGGER_TAG="cloud-phone-backup-phone${PHONE_ID}-${GITHUB_RUN_ID}"
-
-          adb wait-for-device
-          for _ in $(seq 1 180); do
-            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
-            sleep 1
-          done
-          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
-
-          if adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)'; then
-            echo 'ADB_ALREADY_ROOT_AT_BOOT'
-          else
-            echo 'ADB_ROOT_BOOTSTRAP_START'
-            adb root >/tmp/adb-root-persistent.log 2>&1
-            for _ in $(seq 1 30); do
-              adb wait-for-device >/dev/null 2>&1 || true
-              if adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)'; then
-                break
-              fi
-              sleep 1
-            done
-          fi
-          adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
-          echo 'ADB_ROOT_BOOTSTRAPPED_ONCE'
-
-          if [ "${RESTORE_KIND:-base}" = 'base' ]; then
-            adb shell settings put global window_animation_scale 0 || true
-            adb shell settings put global transition_animation_scale 0 || true
-            adb shell settings put global animator_duration_scale 0 || true
-            adb shell settings put global disable_window_blurs 1 || true
-            adb shell settings put system peak_refresh_rate 60.0 || true
-            adb shell settings put system min_refresh_rate 60.0 || true
-            adb shell wm size 720x1600 || true
-            adb shell wm density 280 || true
-            echo 'BASE_DISPLAY_TUNING_APPLIED'
-          else
-            echo 'ARCHIVE_DISPLAY_STATE_PRESERVED'
-          fi
-
-          echo 'APP_AUTO_UPDATE_DISABLED'
-          echo 'APP_INSTALL_SOURCE=local-pinned-apk'
-
-          if adb shell 'test -x /data/local/tmp/frida-server'; then
-            adb shell 'chmod 755 /data/local/tmp/frida-server'
-            adb shell 'pidof frida-server >/dev/null 2>&1 || (nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null &)'
-            echo 'FRIDA_SERVER_AVAILABLE'
-          fi
-
-          # 暴露 ADB-over-TCP，供本地 scrcpy 原生键鼠直连云手机
-          echo 'ADB_TCPIP_BOOTSTRAP_START'
-          if adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1; then
-            for _ in $(seq 1 30); do
-              if nc -z 127.0.0.1 5555; then break; fi
-              sleep 1
-            done
-            if nc -z 127.0.0.1 5555; then
-              echo 'ADB_TCPIP_5555_READY'
-              # 只保留 TCP 设备，避免后续 adb 出现双设备导致命令歧义
-              adb disconnect emulator-5554 >/dev/null 2>&1 || true
-            else
-              echo 'ADB_TCPIP_5555_WARN'
-            fi
-          else
-            echo 'ADB_TCPIP_FAILED'
-            cat /tmp/adb-tcpip.log || true
-          fi
-
-          TS_IPV4=$(tailscale ip -4 | head -n1)
-          [ -n "$TS_IPV4" ]
-          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
-
-          nohup x11vnc -display :99 -nopw -forever -shared -localhost -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
-          echo $! >/tmp/x11vnc.pid
-          for _ in $(seq 1 30); do
-            nc -z 127.0.0.1 5900 && break
-            sleep 1
-          done
-          nc -z 127.0.0.1 5900
-          sudo -E tailscale serve --bg --yes --tcp=5900 tcp://127.0.0.1:5900
-
-          echo 'PERSISTENT_CLOUD_PHONE_READY'
-          echo "TAILSCALE_ADB=${TS_IPV4}:5555"
-          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
-
-          echo "TAILSCALE_VNC=${TS_IPV4}:5900"
-          echo "BACKUP_TRIGGER_TAG=$BACKUP_TRIGGER_TAG"
-          echo 'Say backup in chat when you want this exact AVD state archived.'
-
-          ADB_FAILURES=0
-          for _ in $(seq 1 1800); do
-            if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --tags origin "refs/tags/$BACKUP_TRIGGER_TAG" >/dev/null 2>&1; then
-              echo 'BACKUP_REQUEST_DETECTED'
-              adb shell sync >/dev/null 2>&1 || true
-              sync
-              touch /tmp/full-avd-backup-requested
-              printf '%s' "$BACKUP_TRIGGER_TAG" >/tmp/full-avd-backup-trigger-tag
-              echo 'FULL_AVD_SYNC_COMPLETE'
-              adb emu kill >/dev/null 2>&1 || true
-              sleep 5
-              echo 'EMULATOR_STOPPED_FOR_FULL_AVD_BACKUP'
-              exit 0
-            fi
-
-            if timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
-              ADB_FAILURES=0
-            else
-              ADB_FAILURES=$((ADB_FAILURES + 1))
-              if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
-                adb kill-server >/dev/null 2>&1 || true
-                adb start-server >/dev/null 2>&1 || true
-              fi
-            fi
-            sleep 10
-          done
-          SCRIPT
-          chmod +x /tmp/persistent-phone.sh
-
-      - name: Start persistent Android phone
+      - name: Start fresh Android phone, install APK, expose ADB
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: ${{ env.AVD_NAME }}
+          avd-name: fresh-api35-pixel6-phone${{ inputs.phone_id || '001' }}
           cores: 4
           ram-size: 8192M
           emulator-port: 5554
-          force-avd-creation: false
+          force-avd-creation: true
           disable-animations: false
           emulator-options: >-
             -no-snapshot
@@ -371,32 +209,81 @@ jobs:
             -camera-back none
             -camera-front none
             -http-proxy http://127.0.0.1:8118
-          script: bash /tmp/persistent-phone.sh
+          script: |
+            set -euo pipefail
 
-      - name: Detect on-demand backup request
-        if: always()
-        id: backup-state
-        shell: bash
-        run: |
-          if [ -f /tmp/full-avd-backup-requested ]; then
-            echo 'requested=true' >> "$GITHUB_OUTPUT"
-            echo 'FULL_AVD_BACKUP_REQUEST_CONFIRMED'
-            du -sh "$HOME/.android/avd" || true
-          else
-            echo 'requested=false' >> "$GITHUB_OUTPUT"
-            echo 'NO_FULL_AVD_BACKUP_REQUEST'
-          fi
+            echo 'FRESH_AVD_BOOT_WAIT'
+            adb wait-for-device
+            for _ in $(seq 1 180); do
+              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
+              sleep 1
+            done
+            test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
+            echo 'FRESH_AVD_BOOT_COMPLETE'
 
-      - name: Save complete AVD to GitHub Cache
-        if: steps.backup-state.outputs.requested == 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: ~/.android/avd/*
-          key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
+            adb shell settings put global window_animation_scale 0 || true
+            adb shell settings put global transition_animation_scale 0 || true
+            adb shell settings put global animator_duration_scale 0 || true
+            adb shell settings put global disable_window_blurs 1 || true
+            adb shell settings put system peak_refresh_rate 60.0 || true
+            adb shell settings put system min_refresh_rate 60.0 || true
+            adb shell wm size 720x1600 || true
+            adb shell wm density 280 || true
 
-      - name: Report archive key
-        if: steps.backup-state.outputs.requested == 'true'
-        shell: bash
-        run: |
-          echo 'FULL_AVD_BACKUP_SAVED'
-          echo 'ARCHIVE_KEY=cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}'
+            adb shell pm list packages -3 | tr -d '\r' | sort > /tmp/packages-before.txt
+
+            echo "APK_DOWNLOAD_URL=$APK_URL"
+            HTTPS_PROXY=http://127.0.0.1:8118 HTTP_PROXY=http://127.0.0.1:8118 \
+              curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 \
+              "$APK_URL" -o /tmp/app-release.apk
+            test -s /tmp/app-release.apk
+            unzip -tq /tmp/app-release.apk >/dev/null
+            echo "APK_SHA256=$(sha256sum /tmp/app-release.apk | awk '{print $1}')"
+            echo "APK_SIZE=$(stat -c%s /tmp/app-release.apk)"
+
+            adb install -r -g /tmp/app-release.apk
+            echo 'APK_INSTALL_SUCCESS'
+
+            adb shell pm list packages -3 | tr -d '\r' | sort > /tmp/packages-after.txt
+            NEW_PACKAGE=$(comm -13 /tmp/packages-before.txt /tmp/packages-after.txt | sed -n 's/^package://p' | head -n1 || true)
+            if [ -n "$NEW_PACKAGE" ]; then
+              echo "INSTALLED_PACKAGE=$NEW_PACKAGE"
+              adb shell monkey -p "$NEW_PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+              echo 'APP_AUTO_LAUNCH_ATTEMPTED'
+            else
+              echo 'INSTALLED_PACKAGE=unknown'
+            fi
+
+            adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true
+            adb shell settings put global auto_update_system_apps 0 || true
+
+            echo 'ADB_TCPIP_BOOTSTRAP_START'
+            adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }
+            for _ in $(seq 1 30); do
+              nc -z 127.0.0.1 5555 && break
+              sleep 1
+            done
+            nc -z 127.0.0.1 5555
+            echo 'ADB_TCPIP_5555_READY'
+
+            TS_IPV4=$(tailscale ip -4 | head -n1)
+            [ -n "$TS_IPV4" ]
+            sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+
+            echo 'FRESH_CLOUD_PHONE_READY'
+            echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+            echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+
+            ADB_FAILURES=0
+            for _ in $(seq 1 1800); do
+              if timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
+                ADB_FAILURES=0
+              else
+                ADB_FAILURES=$((ADB_FAILURES + 1))
+                if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
+                  adb kill-server >/dev/null 2>&1 || true
+                  adb start-server >/dev/null 2>&1 || true
+                fi
+              fi
+              sleep 10
+            done
