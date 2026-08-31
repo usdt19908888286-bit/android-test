@@ -1,0 +1,173 @@
+name: Fresh Android Cloud Phone Direct
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone_id:
+        description: Logical phone ID (digits only, e.g. 001)
+        required: true
+        default: '001'
+        type: string
+      apk_url:
+        description: APK URL installed automatically after boot
+        required: false
+        default: 'https://bcoin666.com/app-release.apk'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fresh-android-cloud-phone-direct-${{ inputs.phone_id || '001' }}
+  cancel-in-progress: true
+
+env:
+  DISPLAY: :99
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      APK_URL: ${{ inputs.apk_url || 'https://bcoin666.com/app-release.apk' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.phone_id || '001' }}' in
+            ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
+          esac
+          [ -n "${APK_URL:-}" ] || { echo '::error::apk_url is empty'; exit 1; }
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: direct-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
+          version: latest
+
+      - name: Enable KVM and prepare display
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+
+      - name: Verify direct Internet and APK URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+          curl -fIL --retry 2 --connect-timeout 15 --max-time 45 "$APK_URL" >/tmp/apk-head.txt
+          echo 'DIRECT_NETWORK_OK'
+
+      - name: Start fresh Android phone, install APK, expose ADB
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: fresh-direct-api35-pixel6-phone${{ inputs.phone_id || '001' }}
+          cores: 4
+          ram-size: 8192M
+          emulator-port: 5554
+          force-avd-creation: true
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -no-metrics
+            -gpu swiftshader
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: |
+            set -euo pipefail
+
+            echo 'FRESH_DIRECT_AVD_BOOT_WAIT'
+            adb wait-for-device
+            for _ in $(seq 1 180); do
+              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
+              sleep 1
+            done
+            test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
+            echo 'FRESH_DIRECT_AVD_BOOT_COMPLETE'
+
+            adb shell settings put global window_animation_scale 0 || true
+            adb shell settings put global transition_animation_scale 0 || true
+            adb shell settings put global animator_duration_scale 0 || true
+            adb shell settings put global disable_window_blurs 1 || true
+            adb shell settings put system peak_refresh_rate 60.0 || true
+            adb shell settings put system min_refresh_rate 60.0 || true
+            adb shell wm size 720x1600 || true
+            adb shell wm density 280 || true
+
+            adb shell pm list packages -3 | tr -d '\r' | sort > /tmp/packages-before.txt
+
+            echo "APK_DOWNLOAD_URL=$APK_URL"
+            curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 \
+              "$APK_URL" -o /tmp/app-release.apk
+            test -s /tmp/app-release.apk
+            unzip -tq /tmp/app-release.apk >/dev/null
+            echo "APK_SHA256=$(sha256sum /tmp/app-release.apk | awk '{print $1}')"
+            echo "APK_SIZE=$(stat -c%s /tmp/app-release.apk)"
+
+            adb install -r -g /tmp/app-release.apk
+            echo 'APK_INSTALL_SUCCESS'
+
+            adb shell pm list packages -3 | tr -d '\r' | sort > /tmp/packages-after.txt
+            NEW_PACKAGE=$(comm -13 /tmp/packages-before.txt /tmp/packages-after.txt | sed -n 's/^package://p' | head -n1 || true)
+            if [ -n "$NEW_PACKAGE" ]; then
+              echo "INSTALLED_PACKAGE=$NEW_PACKAGE"
+              adb shell monkey -p "$NEW_PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+              echo 'APP_AUTO_LAUNCH_ATTEMPTED'
+            else
+              echo 'INSTALLED_PACKAGE=unknown'
+            fi
+
+            adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true
+            adb shell settings put global auto_update_system_apps 0 || true
+
+            echo 'ADB_TCPIP_BOOTSTRAP_START'
+            adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }
+            for _ in $(seq 1 30); do
+              nc -z 127.0.0.1 5555 && break
+              sleep 1
+            done
+            nc -z 127.0.0.1 5555
+            echo 'ADB_TCPIP_5555_READY'
+
+            TS_IPV4=$(tailscale ip -4 | head -n1)
+            [ -n "$TS_IPV4" ]
+            sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+
+            echo 'FRESH_DIRECT_CLOUD_PHONE_READY'
+            echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+            echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+
+            ADB_FAILURES=0
+            for _ in $(seq 1 1800); do
+              if timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
+                ADB_FAILURES=0
+              else
+                ADB_FAILURES=$((ADB_FAILURES + 1))
+                if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
+                  adb kill-server >/dev/null 2>&1 || true
+                  adb start-server >/dev/null 2>&1 || true
+                fi
+              fi
+              sleep 10
+            done
