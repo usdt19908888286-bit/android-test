@@ -8,7 +8,7 @@ on:
       - .github/workflows/remote-adb-test.yml
 
 concurrency:
-  group: android-remote-adb-test
+  group: android-cloud-phone
   cancel-in-progress: true
 
 jobs:
@@ -29,38 +29,180 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - name: Prepare remote ADB test
+      - name: Prepare Cloudflare managed tunnel and remote ADB test
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl jq netcat-openbsd
+          sudo apt-get install -y curl jq netcat-openbsd openssl
 
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
 
-          rm -f /tmp/cf_tunnel_token /tmp/cf_adb_hostname
-          if [ -n "${CLOUD_PHONE_SECRETS:-}" ]; then
-            if ! jq -e . >/dev/null 2>&1 <<<"$CLOUD_PHONE_SECRETS"; then
-              echo "::error::CLOUD_PHONE_SECRETS is not valid JSON."
-              exit 1
-            fi
+          cf_fail() {
+            echo "CF_TUNNEL_FAILED"
+            exit 1
+          }
 
-            CF_TUNNEL_TOKEN=$(jq -r '.cf_tunnel_token // empty' <<<"$CLOUD_PHONE_SECRETS")
-            CF_ADB_HOSTNAME=$(jq -r '.cf_adb_hostname // empty' <<<"$CLOUD_PHONE_SECRETS")
-
-            if [ -n "$CF_TUNNEL_TOKEN" ]; then
-              echo "::add-mask::$CF_TUNNEL_TOKEN"
-              printf '%s' "$CF_TUNNEL_TOKEN" >/tmp/cf_tunnel_token
-              chmod 600 /tmp/cf_tunnel_token
-            fi
-            if [ -n "$CF_ADB_HOSTNAME" ]; then
-              printf '%s' "$CF_ADB_HOSTNAME" >/tmp/cf_adb_hostname
-            fi
+          if [ -z "${CLOUD_PHONE_SECRETS:-}" ] || ! jq -e . >/dev/null 2>&1 <<<"$CLOUD_PHONE_SECRETS"; then
+            cf_fail
           fi
+
+          CF_API_TOKEN=$(jq -r '.cf_api_token // empty' <<<"$CLOUD_PHONE_SECRETS")
+          CF_ZONE=$(jq -r '.cf_zone // empty' <<<"$CLOUD_PHONE_SECRETS")
+          CF_ADB_INPUT=$(jq -r '.cf_adb_hostname // empty' <<<"$CLOUD_PHONE_SECRETS")
+          CF_PHONE_INPUT=$(jq -r '.cf_phone_hostname // empty' <<<"$CLOUD_PHONE_SECRETS")
+          unset CLOUD_PHONE_SECRETS
+
+          [ -n "$CF_API_TOKEN" ] || cf_fail
+          [ -n "$CF_ZONE" ] || cf_fail
+          [ -n "$CF_ADB_INPUT" ] || cf_fail
+          [ -n "$CF_PHONE_INPUT" ] || cf_fail
+
+          normalize_hostname() {
+            local value="$1"
+            case "$value" in
+              *.*)
+                case "$value" in *.$CF_ZONE) printf '%s' "$value" ;; *) return 1 ;; esac
+                ;;
+              *) printf '%s.%s' "$value" "$CF_ZONE" ;;
+            esac
+          }
+
+          CF_ADB_HOSTNAME=$(normalize_hostname "$CF_ADB_INPUT") || cf_fail
+          CF_PHONE_HOSTNAME=$(normalize_hostname "$CF_PHONE_INPUT") || cf_fail
+          unset CF_ADB_INPUT CF_PHONE_INPUT
+          [ "$CF_ADB_HOSTNAME" != "$CF_PHONE_HOSTNAME" ] || cf_fail
+
+          echo "::add-mask::$CF_API_TOKEN"
+          printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$CF_API_TOKEN" >/tmp/cf-curl.conf
+          chmod 600 /tmp/cf-curl.conf
+
+          cf_curl() {
+            curl -fsS --config /tmp/cf-curl.conf "$@"
+          }
+
+          # Resolve the zone and its owning account from the API token itself.
+          cf_curl -G 'https://api.cloudflare.com/client/v4/zones' \
+            --data-urlencode "name=$CF_ZONE" \
+            --data-urlencode 'status=active' \
+            --data-urlencode 'per_page=1' \
+            -o /tmp/cf-zone.json || cf_fail
+          jq -e '.success == true and (.result | length) == 1' /tmp/cf-zone.json >/dev/null || cf_fail
+          ZONE_ID=$(jq -r '.result[0].id // empty' /tmp/cf-zone.json)
+          ACCOUNT_ID=$(jq -r '.result[0].account.id // empty' /tmp/cf-zone.json)
+          [ -n "$ZONE_ID" ] && [ -n "$ACCOUNT_ID" ] || cf_fail
+
+          # One stable remotely-managed tunnel per Cloudflare zone. The tunnel is
+          # managed here in the GitHub job; the connector itself also runs here.
+          TUNNEL_NAME="github-android-cloud-phone-${ZONE_ID:0:8}"
+          cf_curl -G "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel" \
+            --data-urlencode "name=$TUNNEL_NAME" \
+            --data-urlencode 'is_deleted=false' \
+            --data-urlencode 'per_page=100' \
+            -o /tmp/cf-tunnels.json || cf_fail
+          jq -e '.success == true' /tmp/cf-tunnels.json >/dev/null || cf_fail
+
+          TUNNEL_ID=$(jq -r --arg name "$TUNNEL_NAME" '.result[]? | select(.name == $name and .config_src == "cloudflare") | .id' /tmp/cf-tunnels.json | head -n1)
+          if [ -z "$TUNNEL_ID" ]; then
+            if jq -e --arg name "$TUNNEL_NAME" '.result[]? | select(.name == $name)' /tmp/cf-tunnels.json >/dev/null; then
+              cf_fail
+            fi
+
+            TUNNEL_SECRET=$(openssl rand -base64 32 | tr -d '\n')
+            echo "::add-mask::$TUNNEL_SECRET"
+            jq -n \
+              --arg name "$TUNNEL_NAME" \
+              --arg secret "$TUNNEL_SECRET" \
+              '{name:$name, config_src:"cloudflare", tunnel_secret:$secret}' \
+              >/tmp/cf-create-tunnel.json
+            cf_curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel" \
+              --data-binary @/tmp/cf-create-tunnel.json \
+              -o /tmp/cf-created-tunnel.json || cf_fail
+            jq -e '.success == true and (.result.id | length) > 0' /tmp/cf-created-tunnel.json >/dev/null || cf_fail
+            TUNNEL_ID=$(jq -r '.result.id' /tmp/cf-created-tunnel.json)
+            unset TUNNEL_SECRET
+          fi
+
+          # The ADB hostname is live now. phone.<zone> is reserved on the same
+          # tunnel and intentionally returns 404 until the HD web controller is added.
+          jq -n \
+            --arg adb "$CF_ADB_HOSTNAME" \
+            --arg phone "$CF_PHONE_HOSTNAME" \
+            '{config:{ingress:[
+              {hostname:$adb,service:"tcp://localhost:5555"},
+              {hostname:$phone,service:"http_status:404"},
+              {service:"http_status:404"}
+            ]}}' >/tmp/cf-ingress.json
+          cf_curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+            --data-binary @/tmp/cf-ingress.json \
+            -o /tmp/cf-config-result.json || cf_fail
+          jq -e '.success == true' /tmp/cf-config-result.json >/dev/null || cf_fail
+
+          upsert_tunnel_dns() {
+            local hostname="$1"
+            local target="$TUNNEL_ID.cfargotunnel.com"
+            local record_id
+
+            cf_curl -G "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+              --data-urlencode "name=$hostname" \
+              --data-urlencode 'per_page=100' \
+              -o /tmp/cf-dns-list.json || cf_fail
+            jq -e '.success == true' /tmp/cf-dns-list.json >/dev/null || cf_fail
+
+            record_id=$(jq -r --arg hostname "$hostname" '.result[]? | select(.name == $hostname and .type == "CNAME") | .id' /tmp/cf-dns-list.json | head -n1)
+            jq -n \
+              --arg name "$hostname" \
+              --arg content "$target" \
+              '{type:"CNAME",name:$name,content:$content,proxied:true,ttl:1}' \
+              >/tmp/cf-dns-write.json
+
+            if [ -n "$record_id" ]; then
+              cf_curl -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$record_id" \
+                --data-binary @/tmp/cf-dns-write.json \
+                -o /tmp/cf-dns-result.json || cf_fail
+            else
+              while IFS= read -r old_id; do
+                [ -n "$old_id" ] || continue
+                cf_curl -X DELETE "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$old_id" \
+                  -o /tmp/cf-dns-delete.json || cf_fail
+              done < <(jq -r --arg hostname "$hostname" '.result[]? | select(.name == $hostname) | .id' /tmp/cf-dns-list.json)
+
+              cf_curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                --data-binary @/tmp/cf-dns-write.json \
+                -o /tmp/cf-dns-result.json || cf_fail
+            fi
+            jq -e '.success == true' /tmp/cf-dns-result.json >/dev/null || cf_fail
+          }
+
+          upsert_tunnel_dns "$CF_ADB_HOSTNAME"
+          upsert_tunnel_dns "$CF_PHONE_HOSTNAME"
+
+          # Retrieve the runner-side connector credential only after the control
+          # plane is ready. Never print it or put it on the command line.
+          cf_curl "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" \
+            -o /tmp/cf-tunnel-token-response.json || cf_fail
+          jq -e '.success == true and (.result | type) == "string" and (.result | length) > 0' /tmp/cf-tunnel-token-response.json >/dev/null || cf_fail
+          CF_TUNNEL_TOKEN=$(jq -r '.result' /tmp/cf-tunnel-token-response.json)
+          echo "::add-mask::$CF_TUNNEL_TOKEN"
+          printf '%s' "$CF_TUNNEL_TOKEN" >/tmp/cf_tunnel_token
+          chmod 600 /tmp/cf_tunnel_token
+          printf '%s' "$CF_ADB_HOSTNAME" >/tmp/cf_adb_hostname
+
+          unset CF_API_TOKEN CF_TUNNEL_TOKEN
+          rm -f /tmp/cf-curl.conf /tmp/cf-zone.json /tmp/cf-tunnels.json \
+            /tmp/cf-create-tunnel.json /tmp/cf-created-tunnel.json \
+            /tmp/cf-ingress.json /tmp/cf-config-result.json \
+            /tmp/cf-dns-list.json /tmp/cf-dns-write.json /tmp/cf-dns-result.json \
+            /tmp/cf-dns-delete.json /tmp/cf-tunnel-token-response.json
 
           cat >/tmp/remote-adb-test.sh <<'SCRIPT'
           #!/usr/bin/env bash
           set -euo pipefail
+
+          fail_cf() {
+            echo "CF_TUNNEL_FAILED"
+            exit 1
+          }
 
           wait_boot_completed() {
             adb wait-for-device
@@ -129,43 +271,33 @@ jobs:
           adb start-server >/dev/null 2>&1 || true
           adb wait-for-device
 
-          CF_PID=""
-          if [ -s /tmp/cf_tunnel_token ]; then
-            : >/tmp/cloudflared-named.log
-            nohup /tmp/cloudflared tunnel \
-              --no-autoupdate \
-              --loglevel info \
-              --logfile /tmp/cloudflared-named.log \
-              run --token-file /tmp/cf_tunnel_token \
-              >/dev/null 2>&1 &
-            CF_PID=$!
-            echo "$CF_PID" >/tmp/cloudflared-named.pid
+          [ -s /tmp/cf_tunnel_token ] || fail_cf
+          echo "CF_TUNNEL_STARTING"
+          : >/tmp/cloudflared-named.log
+          nohup /tmp/cloudflared tunnel \
+            --no-autoupdate \
+            --loglevel info \
+            --logfile /tmp/cloudflared-named.log \
+            run --token-file /tmp/cf_tunnel_token \
+            >/dev/null 2>&1 &
+          CF_PID=$!
+          echo "$CF_PID" >/tmp/cloudflared-named.pid
 
-            CF_CONNECTED=0
-            for _ in $(seq 1 60); do
-              if grep -q 'Registered tunnel connection' /tmp/cloudflared-named.log 2>/dev/null; then
-                CF_CONNECTED=1
-                break
-              fi
-              if ! kill -0 "$CF_PID" 2>/dev/null; then
-                break
-              fi
-              sleep 1
-            done
-
-            if [ "$CF_CONNECTED" -eq 1 ]; then
-              echo "CF_NAMED_TUNNEL_CONNECTED"
-              if [ -s /tmp/cf_adb_hostname ]; then
-                echo "REMOTE_ADB_HOSTNAME=$(cat /tmp/cf_adb_hostname)"
-              fi
-              echo "REMOTE_ADB_READY"
-            else
-              echo "CF_NAMED_TUNNEL_FAILED"
+          CF_CONNECTED=0
+          for _ in $(seq 1 60); do
+            if grep -q 'Registered tunnel connection' /tmp/cloudflared-named.log 2>/dev/null; then
+              CF_CONNECTED=1
+              break
             fi
-          else
-            echo "CF_NAMED_TUNNEL_NOT_CONFIGURED"
-            echo "REMOTE_ADB_LOCAL_SIMULATION_COMPLETE"
-          fi
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          [ "$CF_CONNECTED" -eq 1 ] || fail_cf
+          echo "CF_TUNNEL_CONNECTED"
+          echo "REMOTE_ADB_READY"
 
           echo "============================================================"
           echo "REMOTE ADB TEST READY"
@@ -173,22 +305,15 @@ jobs:
           echo "Windows target after cloudflared access tcp: 127.0.0.1:15555"
           echo "============================================================"
 
-          if [ -n "$CF_PID" ] && kill -0 "$CF_PID" 2>/dev/null; then
-            echo "Keeping remote ADB test online for up to 90 minutes."
-            for _ in $(seq 1 540); do
-              if ! kill -0 "$CF_PID" 2>/dev/null; then
-                echo "CF_NAMED_TUNNEL_STOPPED"
-                break
-              fi
-              if ! timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx device; then
-                echo "ADB_TEMP_UNAVAILABLE"
-                adb start-server >/dev/null 2>&1 || true
-              fi
-              sleep 10
-            done
-          else
+          # Keep the actual phone-side connector alive for up to 90 minutes.
+          for _ in $(seq 1 540); do
+            kill -0 "$CF_PID" 2>/dev/null || fail_cf
+            if ! timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx device; then
+              echo "ADB_TEMP_UNAVAILABLE"
+              adb start-server >/dev/null 2>&1 || true
+            fi
             sleep 10
-          fi
+          done
           SCRIPT
           chmod +x /tmp/remote-adb-test.sh
 
