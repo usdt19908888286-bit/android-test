@@ -1,53 +1,36 @@
-# =============================================================
-#  云手机统一 Workflow  v3  (scrcpy 直连版，无 noVNC)
-# -------------------------------------------------------------
-#  一个账号 = 一个仓库（由 GUI 推送本文件）。
-#  mode 分派：
-#    bootstrap  首次 / 换版：装锁定 APK → 等人工 scrcpy 登录 → 自动备份
-#    renew      每 3 天：    从最新快照恢复 → 挂机 → 等本地主程序续期
-#  接入方式只暴露 ADB-over-Tailscale（5555），由本地 scrcpy 原生键鼠直连。
-# =============================================================
-name: Cloud Phone
+name: Android Cloud Phone
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: '运行模式: bootstrap(首次/换版登录) 或 renew(续期)'
+        description: "bootstrap=首次安装并等人工登录；renew=恢复快照供程序续期"
         required: true
-        default: 'renew'
+        default: "renew"
         type: choice
         options:
           - renew
           - bootstrap
       phone_id:
-        description: '逻辑手机编号（纯数字，如 001）'
+        description: "手机编号（对应一个 Binance 账号）"
         required: true
-        default: '001'
-        type: string
+        default: "001"
       apk_url:
-        description: '锁定版 APK 直链（bootstrap 用；不填则用下方默认锁定地址）'
+        description: "bootstrap 用的 Binance APK 下载地址（renew 模式留空）"
         required: false
-        default: 'https://download.binance.com/pack/BNApp64.apk'
-        type: string
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/cloud-phone.yml
+        default: ""
 
 permissions:
-  contents: write   # 允许主程序经 API 建 tag 触发备份
+  contents: read
+  actions: write
 
 concurrency:
-  group: cloud-phone-phone${{ inputs.phone_id || '001' }}
-  cancel-in-progress: true
+  group: cloud-phone-${{ inputs.phone_id }}
+  cancel-in-progress: false
 
 env:
-  DISPLAY: :99
   AVD_NAME: full-avd-api35-pixel6-frida-v2
-  BASE_CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
-  PINNED_VERSION: '3.19.5'
-  CACHE_KEY: cloud-phone-avd-phone${{ inputs.phone_id || '001' }}-current
+  BASE_CACHE_KEY: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-current
 
 jobs:
   phone:
@@ -57,272 +40,140 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate phone ID
-        shell: bash
-        run: |
-          set -euo pipefail
-          case '${{ inputs.phone_id || '001' }}' in
-            ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
-          esac
-
-      - name: Join Tailscale
+      - name: Tailscale up
         uses: tailscale/github-action@v4
         with:
-          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
-          tags: tag:github-phone
-          hostname: phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
-          version: latest
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
 
-      - name: Enable KVM and prepare display
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -e /dev/kvm
-          sudo apt-get update
-          sudo apt-get install -y xvfb netcat-openbsd jq curl python3-pip
-          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
-          sleep 2
-
-      - name: Start and verify SOCKS5 bridge
-        shell: bash
+      - name: Setup SOCKS5→HTTP bridge (for emulator outbound)
         env:
           S5_HOST: ${{ secrets.S5_HOST }}
           S5_PORT: ${{ secrets.S5_PORT }}
           S5_USER: ${{ secrets.S5_USER }}
           S5_PASS: ${{ secrets.S5_PASS }}
         run: |
-          set -euo pipefail
-          [ -n "${S5_HOST:-}" ] || { echo '::error::Missing S5_HOST secret'; exit 1; }
-          [ -n "${S5_PORT:-}" ] || { echo '::error::Missing S5_PORT secret'; exit 1; }
+          set -e
+          if [ -z "${S5_HOST:-}" ] || [ -z "${S5_PORT:-}" ]; then
+            echo "::error::Missing S5_HOST or S5_PORT repository secret."
+            exit 1
+          fi
+          sudo apt-get update -qq
           python3 -m pip install --quiet --break-system-packages PySocks
-
           cat >/tmp/s5_bridge.py <<'PY'
           import os, select, socketserver
           from urllib.parse import urlsplit
           import socks
-          S5_HOST = os.environ["S5_HOST"]; S5_PORT = int(os.environ["S5_PORT"])
+          S5_HOST = os.environ["S5_HOST"]
+          S5_PORT = int(os.environ["S5_PORT"])
           S5_USER = os.environ.get("S5_USER") or None
           S5_PASS = os.environ.get("S5_PASS") or None
           def open_upstream(host, port):
               s = socks.socksocket()
               s.set_proxy(socks.SOCKS5, S5_HOST, S5_PORT, rdns=True, username=S5_USER, password=S5_PASS)
-              s.settimeout(30); s.connect((host, int(port))); s.settimeout(None); return s
+              s.settimeout(30)
+              s.connect((host, int(port)))
+              s.settimeout(None)
+              return s
           def relay(a, b):
               while True:
-                  r, _, _ = select.select([a, b], [], [], 60)
-                  if not r: continue
-                  for src in r:
+                  readable, _, _ = select.select([a, b], [], [], 60)
+                  if not readable:
+                      continue
+                  for src in readable:
                       dst = b if src is a else a
-                      d = src.recv(65536)
-                      if not d: return
-                      dst.sendall(d)
+                      data = src.recv(65536)
+                      if not data:
+                          return
+                      dst.sendall(data)
           class Handler(socketserver.BaseRequestHandler):
               def handle(self):
-                  c = self.request; c.settimeout(30); data = b""
+                  client = self.request
+                  client.settimeout(30)
+                  data = b""
                   while b"\r\n\r\n" not in data and len(data) < 65536:
-                      ch = c.recv(4096)
-                      if not ch: return
-                      data += ch
-                  if b"\r\n\r\n" not in data: return
+                      chunk = client.recv(4096)
+                      if not chunk:
+                          return
+                      data += chunk
+                  if b"\r\n\r\n" not in data:
+                      return
                   head, rest = data.split(b"\r\n\r\n", 1)
-                  lines = head.split(b"\r\n")
-                  parts = lines[0].decode("latin1").split(" ", 2)
-                  if len(parts) != 3: return
+                  parts = head.split(b"\r\n")[0].decode("latin1").split(" ", 2)
+                  if len(parts) != 3:
+                      return
                   method, target, version = parts
                   try:
                       if method.upper() == "CONNECT":
                           host, port = target.rsplit(":", 1)
-                          up = open_upstream(host.strip("[]"), int(port))
-                          c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                          if rest: up.sendall(rest)
-                          relay(c, up); up.close(); return
-                      p = urlsplit(target)
-                      if p.hostname:
-                          host, port, path = p.hostname, (p.port or 80), (p.path or "/")
-                          if p.query: path += "?" + p.query
+                          host = host.strip("[]")
+                          upstream = open_upstream(host, int(port))
+                          client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                          if rest:
+                              upstream.sendall(rest)
+                          relay(client, upstream)
+                          upstream.close()
+                          return
+                      parsed = urlsplit(target)
+                      if parsed.hostname:
+                          host, port, path = parsed.hostname, parsed.port or 80, (parsed.path or "/")
+                          if parsed.query:
+                              path += "?" + parsed.query
                       else:
-                          hh = ""
-                          for ln in lines[1:]:
-                              if ln.lower().startswith(b"host:"):
-                                  hh = ln.split(b":",1)[1].strip().decode("latin1"); break
-                          if not hh: return
-                          if ":" in hh: host, port = hh.rsplit(":",1); port=int(port)
-                          else: host, port = hh, 80
+                          host_header = ""
+                          for line in head.split(b"\r\n")[1:]:
+                              if line.lower().startswith(b"host:"):
+                                  host_header = line.split(b":", 1)[1].strip().decode("latin1")
+                                  break
+                          if not host_header:
+                              return
+                          if ":" in host_header:
+                              host, port = host_header.rsplit(":", 1)
+                              port = int(port)
+                          else:
+                              host, port = host_header, 80
                           path = target
-                      up = open_upstream(host, port)
+                      upstream = open_upstream(host, port)
+                      lines = head.split(b"\r\n")
                       lines[0] = f"{method} {path} {version}".encode("latin1")
-                      up.sendall(b"\r\n".join(lines)+b"\r\n\r\n"+rest)
-                      relay(c, up); up.close()
+                      upstream.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + rest)
+                      relay(client, upstream)
+                      upstream.close()
                   except Exception:
-                      try: c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                      except Exception: pass
+                      try:
+                          client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                      except Exception:
+                          pass
           class Server(socketserver.ThreadingTCPServer):
-              allow_reuse_address = True; daemon_threads = True
+              allow_reuse_address = True
+              daemon_threads = True
           Server(("127.0.0.1", 8118), Handler).serve_forever()
           PY
-          cat >/tmp/s5_bridge_supervisor.sh <<'SH'
-          #!/usr/bin/env bash
-          set -u
-          while true; do python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1; sleep 2; done
-          SH
-          chmod +x /tmp/s5_bridge_supervisor.sh
-          : >/tmp/s5_bridge.log
-          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &
-          echo $! >/tmp/s5_bridge_supervisor.pid
-          for _ in $(seq 1 20); do nc -z 127.0.0.1 8118 && break; sleep 1; done
-          nc -z 127.0.0.1 8118
-          curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
-          echo 'SOCKS5_BRIDGE_OK'
+          nohup python3 /tmp/s5_bridge.py >/tmp/s5_bridge.log 2>&1 &
+          sleep 1
+          if ! kill -0 $(pgrep -f s5_bridge.py) 2>/dev/null; then
+            echo "::error::SOCKS5 local bridge failed to start."; cat /tmp/s5_bridge.log; exit 1
+          fi
+          python3 - <<'PY'
+          import os, socks
+          s = socks.socksocket()
+          s.set_proxy(socks.SOCKS5, os.environ["S5_HOST"], int(os.environ["S5_PORT"]),
+                      rdns=True, username=os.environ.get("S5_USER") or None, password=os.environ.get("S5_PASS") or None)
+          s.settimeout(12)
+          s.connect(("www.cloudflare.com", 443)); s.close()
+          print("SOCKS5_UPSTREAM_OK")
+          PY
 
-      - name: Restore latest snapshot (or base AVD)
+      - name: Restore latest AVD snapshot
         id: avd-restore
         uses: actions/cache/restore@v5
         with:
           path: ~/.android/avd/*
-          key: ${{ env.CACHE_KEY }}
+          key: ${{ env.BASE_CACHE_KEY }}
           restore-keys: |
-            ${{ env.CACHE_KEY }}
-            ${{ env.BASE_CACHE_KEY }}
+            cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-
 
-      - name: Identify restore source
-        shell: bash
-        run: |
-          set -euo pipefail
-          MATCHED='${{ steps.avd-restore.outputs.cache-matched-key }}'
-          [ -n "$MATCHED" ] || { echo '::error::AVD_CACHE_MISS'; exit 1; }
-          case "$MATCHED" in
-            ${{ env.CACHE_KEY }}) echo 'RESTORE_KIND=snapshot' >> "$GITHUB_ENV" ;;
-            *)                  echo 'RESTORE_KIND=base'     >> "$GITHUB_ENV" ;;
-          esac
-
-      - name: Prepare phone runtime + scrcpy ADB exposure
-        shell: bash
-        env:
-          MODE: ${{ inputs.mode || 'renew' }}
-          APK_URL: ${{ inputs.apk_url || 'https://download.binance.com/pack/BNApp64.apk' }}
-          PINNED_VERSION: ${{ env.PINNED_VERSION }}
-        run: |
-          set -euo pipefail
-          cat >/tmp/phone.sh <<'SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          MODE="${MODE:-renew}"
-          PHONE_ID='${{ inputs.phone_id || '001' }}'
-          BACKUP_TRIGGER_TAG="cloud-phone-backup-phone${PHONE_ID}-${GITHUB_RUN_ID}"
-
-          adb wait-for-device
-          for _ in $(seq 1 180); do
-            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
-            sleep 1
-          done
-          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
-
-          # root（frida / 关自动更新需要）
-          if adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)'; then
-            echo 'ADB_ALREADY_ROOT'
-          else
-            adb root >/tmp/adb-root.log 2>&1
-            for _ in $(seq 1 30); do
-              adb wait-for-device >/dev/null 2>&1 || true
-              adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)' && break
-              sleep 1
-            done
-          fi
-          adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
-          echo 'ADB_ROOTED'
-
-          # 基础调优（仅 base 镜像，快照保留原状）
-          if [ "${RESTORE_KIND:-base}" = 'base' ]; then
-            adb shell settings put global window_animation_scale 0 || true
-            adb shell settings put global transition_animation_scale 0 || true
-            adb shell settings put global animator_duration_scale 0 || true
-            adb shell settings put global disable_window_blurs 1 || true
-            adb shell settings put system peak_refresh_rate 60.0 || true
-            adb shell settings put system min_refresh_rate 60.0 || true
-            adb shell wm size 720x1600 || true
-            adb shell wm density 280 || true
-          fi
-
-          # 禁用 Play 商店自动更新（防版本漂移）
-          adb shell pm disable-user --user 0 com.android.vending 2>/dev/null || true
-          echo 'APP_AUTO_UPDATE_DISABLED'
-
-          # frida-server
-          if adb shell 'test -x /data/local/tmp/frida-server'; then
-            adb shell 'chmod 755 /data/local/tmp/frida-server'
-            adb shell 'pidof frida-server >/dev/null 2>&1 || (nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null &)'
-            echo 'FRIDA_SERVER_AVAILABLE'
-          else
-            echo 'FRIDA_SERVER_MISSING'
-          fi
-
-          # bootstrap：安装锁定版 APK（renew 跳过）
-          if [ "$MODE" = 'bootstrap' ]; then
-            echo 'BOOTSTRAP_INSTALL_START'
-            curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/binance.apk
-            echo "APK_BYTES=$(stat -c%s /tmp/binance.apk)"
-            PKG=$(adb shell pm list packages 2>/dev/null | sed 's/^package://' | grep -Ei '^com\.binance' | head -n1 | tr -d '\r' || true)
-            if [ -n "$PKG" ]; then
-              adb uninstall "$PKG" >/dev/null 2>&1 || true
-            fi
-            adb install -r /tmp/binance.apk
-            sleep 3
-            INSTALLED=$(adb shell dumpsys package com.binance.dev 2>/dev/null | grep -m1 versionName | tr -d '\r' | awk '{print $2}')
-            echo "INSTALLED_VERSION=$INSTALLED"
-            if [ "${PINNED_VERSION}" != "$INSTALLED" ]; then
-              echo "::error::版本漂移！期望 ${PINNED_VERSION}，实际 ${INSTALLED}"
-              exit 7
-            fi
-            echo 'BOOTSTRAP_INSTALL_OK'
-            # 打开币安等人工登录
-            adb shell monkey -p com.binance.dev -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
-            echo 'WAITING_FOR_MANUAL_LOGIN_VIA_SCRCPY'
-          fi
-
-          # 暴露 ADB-over-TCP 供 scrcpy 直连
-          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1
-          for _ in $(seq 1 30); do nc -z 127.0.0.1 5555 && break; sleep 1; done
-          nc -z 127.0.0.1 5555 && echo 'ADB_TCPIP_5555_READY' || { echo 'ADB_TCPIP_FAILED'; cat /tmp/adb-tcpip.log; }
-          adb disconnect emulator-5554 >/dev/null 2>&1 || true
-
-          # 经 Tailscale 暴露 ADB 端口
-          TS_IPV4=$(tailscale ip -4 | head -n1)
-          [ -n "$TS_IPV4" ]
-          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
-
-          echo 'CLOUD_PHONE_READY'
-          echo "TAILSCALE_ADB=${TS_IPV4}:5555"
-          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555 --no-audio --stay-awake -b 16M -m 1280"
-          echo "MODE=$MODE"
-          echo "BACKUP_TRIGGER_TAG=$BACKUP_TRIGGER_TAG"
-
-          # 备份触发：主程序经 API 建 tag，本脚本检测到即关机备份
-          for _ in $(seq 1 1800); do
-            if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --tags origin "refs/tags/$BACKUP_TRIGGER_TAG" >/dev/null 2>&1; then
-              echo 'BACKUP_REQUEST_DETECTED'
-              adb shell sync >/dev/null 2>&1 || true
-              sync
-              touch /tmp/avd-backup-requested
-              printf '%s' "$BACKUP_TRIGGER_TAG" >/tmp/avd-backup-trigger-tag
-              echo 'AVD_SYNC_COMPLETE'
-              adb emu kill >/dev/null 2>&1 || true
-              sleep 5
-              echo 'EMULATOR_STOPPED_FOR_BACKUP'
-              exit 0
-            fi
-            timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device' || {
-              adb kill-server >/dev/null 2>&1 || true; adb start-server >/dev/null 2>&1 || true
-            }
-            sleep 10
-          done
-          SCRIPT
-          chmod +x /tmp/phone.sh
-
-      - name: Start Android phone
+      - name: Start Android cloud phone (ADB over Tailscale, scrcpy direct control)
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -344,32 +195,147 @@ jobs:
             -camera-back none
             -camera-front none
             -http-proxy http://127.0.0.1:8118
-          script: bash /tmp/phone.sh
+          script: |
+            set -e
+            PHONE_ID="${{ inputs.phone_id || '001' }}"
+            BACKUP_TRIGGER_TAG="cloud-phone-backup-phone${PHONE_ID}-${GITHUB_RUN_ID}"
 
-      - name: Detect on-demand backup request
+            echo "Waiting for device boot..."
+            adb wait-for-device
+            for _ in $(seq 1 60); do
+              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
+              sleep 2
+            done
+            test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
+
+            # root
+            if adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)'; then
+              echo "adb already root"
+            else
+              adb root >/tmp/adb-root.log 2>&1 || true
+              sleep 3
+              adb wait-for-device >/dev/null 2>&1 || true
+            fi
+            adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
+
+            # 性能与显示
+            adb shell settings put global window_animation_scale 0 || true
+            adb shell settings put global transition_animation_scale 0 || true
+            adb shell settings put global animator_duration_scale 0 || true
+            adb shell wm size 720x1600 || true
+            adb shell wm density 280 || true
+
+            # frida-server
+            if adb shell 'test -x /data/local/tmp/frida-server'; then
+              adb shell 'chmod 755 /data/local/tmp/frida-server'
+              adb shell 'pidof frida-server >/dev/null 2>&1 || (nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null &)'
+            fi
+
+            # bootstrap：装指定 APK + 禁 Play 商店自动更新
+            if [ "${{ inputs.mode }}" = "bootstrap" ]; then
+              APK_URL="${{ inputs.apk_url }}"
+              if [ -n "$APK_URL" ]; then
+                echo "Downloading APK via S5 bridge..."
+                HTTPS_PROXY=http://127.0.0.1:8118 HTTP_PROXY=http://127.0.0.1:8118 curl -fsSL "$APK_URL" -o /tmp/binance.apk
+                adb install -r /tmp/binance.apk || adb install -g /tmp/binance.apk
+              fi
+              # 禁用 Play 商店自动更新，防止 APK 被覆盖
+              adb shell pm disable-user --user 0 com.android.vending || true
+              adb shell settings put global auto_update_system_apps 0 || true
+            fi
+
+            # 暴露 ADB-over-TCP
+            if adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1; then
+              for _ in $(seq 1 30); do
+                nc -z 127.0.0.1 5555 && break
+                sleep 1
+              done
+              if nc -z 127.0.0.1 5555; then
+                echo "ADB_TCPIP_5555_READY"
+                adb disconnect emulator-5554 >/dev/null 2>&1 || true
+              else
+                echo "ADB_TCPIP_5555_WARN"
+              fi
+            fi
+
+            # Tailscale 暴露 ADB 端口给本机 scrcpy
+            TS_IPV4=$(tailscale ip -4 | head -n1)
+            [ -n "$TS_IPV4" ]
+            sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+
+            echo "PERSISTENT_CLOUD_PHONE_READY"
+            echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+            echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+            echo "BACKUP_TRIGGER_TAG=${BACKUP_TRIGGER_TAG}"
+            echo "Waiting for backup trigger tag (shutdown auto-backup)..."
+
+            # 长循环：轮询备份 tag，命中即快照并关机
+            ADB_FAILURES=0
+            for _ in $(seq 1 1800); do
+              if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --tags origin "refs/tags/$BACKUP_TRIGGER_TAG" >/dev/null 2>&1; then
+                echo "BACKUP_REQUEST_DETECTED"
+                adb shell sync >/dev/null 2>&1 || true
+                sync
+                touch /tmp/full-avd-backup-requested
+                printf '%s' "$BACKUP_TRIGGER_TAG" >/tmp/full-avd-backup-trigger-tag
+                echo "FULL_AVD_SYNC_COMPLETE"
+                adb emu kill >/dev/null 2>&1 || true
+                sleep 5
+                echo "EMULATOR_STOPPED_FOR_FULL_AVD_BACKUP"
+                exit 0
+              fi
+              if timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx 'device'; then
+                ADB_FAILURES=0
+              else
+                ADB_FAILURES=$((ADB_FAILURES + 1))
+                if [ $((ADB_FAILURES % 6)) -eq 0 ]; then
+                  adb kill-server >/dev/null 2>&1 || true
+                  adb start-server >/dev/null 2>&1 || true
+                fi
+              fi
+              sleep 10
+            done
+
+      - name: Detect backup request
         if: always()
         id: backup-state
         shell: bash
         run: |
-          if [ -f /tmp/avd-backup-requested ]; then
+          if [ -f /tmp/full-avd-backup-requested ]; then
             echo 'requested=true' >> "$GITHUB_OUTPUT"
-            echo 'BACKUP_REQUEST_CONFIRMED'
+            echo "FULL_AVD_BACKUP_REQUEST_CONFIRMED"
             du -sh "$HOME/.android/avd" || true
           else
             echo 'requested=false' >> "$GITHUB_OUTPUT"
-            echo 'NO_BACKUP_REQUEST'
+            echo "NO_FULL_AVD_BACKUP_REQUEST"
           fi
 
-      - name: Save single snapshot to Cache (overwrite -current)
+      - name: Save AVD snapshot to GitHub Cache
         if: steps.backup-state.outputs.requested == 'true'
         uses: actions/cache/save@v5
         with:
           path: ~/.android/avd/*
-          key: ${{ env.CACHE_KEY }}
+          key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
 
-      - name: Report
+      - name: Report archive key
         if: steps.backup-state.outputs.requested == 'true'
         shell: bash
+        run: echo "FULL_AVD_BACKUP_SAVED"
+
+      - name: Keep only latest snapshot (delete older caches)
+        if: steps.backup-state.outputs.requested == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo 'SNAPSHOT_SAVED'
-          echo 'ARCHIVE_KEY=${{ env.CACHE_KEY }}'
+          KEY_PREFIX="cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-"
+          CURRENT="cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}"
+          # 列出该 phone 的全部缓存，按 createdAt 排序，删掉除了最新以外的
+          maps=$(gh cache list --repo "$GITHUB_REPOSITORY" --key "$KEY_PREFIX" --json key,createdAt 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); d.sort(key=lambda x:x['createdAt']); print(json.dumps([x['key'] for x in d]))" 2>/dev/null || echo '[]')
+          echo "cached keys: $maps"
+          for k in $(echo "$maps" | python3 -c "import sys,json; [print(x) for x in json.load(sys.stdin)]" 2>/dev/null); do
+            [ "$k" = "$CURRENT" ] && continue
+            echo "deleting old cache: $k"
+            gh cache delete "$k" --repo "$GITHUB_REPOSITORY" || true
+          done
