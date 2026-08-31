@@ -1,0 +1,209 @@
+name: Android Remote ADB Test
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: android-remote-adb-test
+  cancel-in-progress: true
+
+jobs:
+  remote-adb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CLOUD_PHONE_SECRETS: ${{ secrets.CLOUD_PHONE_SECRETS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Prepare remote ADB test
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq netcat-openbsd
+
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          rm -f /tmp/cf_tunnel_token /tmp/cf_adb_hostname
+          if [ -n "${CLOUD_PHONE_SECRETS:-}" ]; then
+            if ! jq -e . >/dev/null 2>&1 <<<"$CLOUD_PHONE_SECRETS"; then
+              echo "::error::CLOUD_PHONE_SECRETS is not valid JSON."
+              exit 1
+            fi
+
+            CF_TUNNEL_TOKEN=$(jq -r '.cf_tunnel_token // empty' <<<"$CLOUD_PHONE_SECRETS")
+            CF_ADB_HOSTNAME=$(jq -r '.cf_adb_hostname // empty' <<<"$CLOUD_PHONE_SECRETS")
+
+            if [ -n "$CF_TUNNEL_TOKEN" ]; then
+              echo "::add-mask::$CF_TUNNEL_TOKEN"
+              printf '%s' "$CF_TUNNEL_TOKEN" >/tmp/cf_tunnel_token
+              chmod 600 /tmp/cf_tunnel_token
+            fi
+            if [ -n "$CF_ADB_HOSTNAME" ]; then
+              printf '%s' "$CF_ADB_HOSTNAME" >/tmp/cf_adb_hostname
+            fi
+          fi
+
+          cat >/tmp/remote-adb-test.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          wait_boot_completed() {
+            adb wait-for-device
+            for _ in $(seq 1 180); do
+              if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::ANDROID_BOOT_TIMEOUT"
+            return 1
+          }
+
+          wait_boot_completed
+          echo "ANDROID_BOOT_COMPLETED"
+
+          ROOT_BEFORE=$(adb shell id 2>/dev/null | tr -d '\r' || true)
+          if printf '%s' "$ROOT_BEFORE" | grep -q 'uid=0(root)'; then
+            echo "ADB_ALREADY_ROOT"
+          else
+            adb root >/tmp/adb-root-result.log 2>&1 || true
+            sleep 2
+            adb wait-for-device
+          fi
+
+          ROOT_AFTER=$(adb shell id 2>/dev/null | tr -d '\r' || true)
+          if printf '%s' "$ROOT_AFTER" | grep -q 'uid=0(root)'; then
+            echo "ADB_ROOT_OK"
+          else
+            echo "ADB_ROOT_UNAVAILABLE"
+          fi
+
+          # emulator-port is fixed at 5554, so its host-side ADB TCP port is 5555.
+          if nc -z 127.0.0.1 5555; then
+            echo "EMULATOR_ADB_TCP_5555_OK"
+          else
+            echo "::error::EMULATOR_ADB_TCP_5555_FAILED"
+            exit 1
+          fi
+
+          # Simulate a completely fresh remote computer: separate ADB server and fresh RSA key.
+          rm -rf /tmp/adb-fresh-home
+          mkdir -p /tmp/adb-fresh-home/.android
+          export HOME=/tmp/adb-fresh-home
+          export ADB_SERVER_PORT=5041
+          adb start-server >/dev/null
+          adb connect 127.0.0.1:5555 >/tmp/fresh-adb-connect.log 2>&1 || true
+
+          FRESH_STATE=$(adb -s 127.0.0.1:5555 get-state 2>/dev/null | tr -d '\r' || true)
+          if [ "$FRESH_STATE" = "device" ]; then
+            echo "FRESH_ADB_CLIENT_CONNECT_OK"
+            FRESH_ID=$(adb -s 127.0.0.1:5555 shell id 2>/dev/null | tr -d '\r' || true)
+            if printf '%s' "$FRESH_ID" | grep -q 'uid=0(root)'; then
+              echo "FRESH_ADB_CLIENT_ROOT_OK"
+            else
+              echo "FRESH_ADB_CLIENT_SHELL_OK"
+            fi
+          else
+            echo "FRESH_ADB_CLIENT_STATE=${FRESH_STATE:-unavailable}"
+          fi
+          adb kill-server >/dev/null 2>&1 || true
+          unset ADB_SERVER_PORT
+          export HOME=/home/runner
+          adb start-server >/dev/null 2>&1 || true
+          adb wait-for-device
+
+          CF_PID=""
+          if [ -s /tmp/cf_tunnel_token ]; then
+            : >/tmp/cloudflared-named.log
+            nohup /tmp/cloudflared tunnel \
+              --no-autoupdate \
+              --loglevel info \
+              --logfile /tmp/cloudflared-named.log \
+              run --token-file /tmp/cf_tunnel_token \
+              >/dev/null 2>&1 &
+            CF_PID=$!
+            echo "$CF_PID" >/tmp/cloudflared-named.pid
+
+            CF_CONNECTED=0
+            for _ in $(seq 1 60); do
+              if grep -q 'Registered tunnel connection' /tmp/cloudflared-named.log 2>/dev/null; then
+                CF_CONNECTED=1
+                break
+              fi
+              if ! kill -0 "$CF_PID" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$CF_CONNECTED" -eq 1 ]; then
+              echo "CF_NAMED_TUNNEL_CONNECTED"
+              if [ -s /tmp/cf_adb_hostname ]; then
+                echo "REMOTE_ADB_HOSTNAME=$(cat /tmp/cf_adb_hostname)"
+              fi
+              echo "REMOTE_ADB_READY"
+            else
+              echo "CF_NAMED_TUNNEL_FAILED"
+            fi
+          else
+            echo "CF_NAMED_TUNNEL_NOT_CONFIGURED"
+            echo "REMOTE_ADB_LOCAL_SIMULATION_COMPLETE"
+          fi
+
+          echo "============================================================"
+          echo "REMOTE ADB TEST READY"
+          echo "Origin: tcp://127.0.0.1:5555"
+          echo "Windows target after cloudflared access tcp: 127.0.0.1:15555"
+          echo "============================================================"
+
+          if [ -n "$CF_PID" ] && kill -0 "$CF_PID" 2>/dev/null; then
+            echo "Keeping remote ADB test online for up to 90 minutes."
+            for _ in $(seq 1 540); do
+              if ! kill -0 "$CF_PID" 2>/dev/null; then
+                echo "CF_NAMED_TUNNEL_STOPPED"
+                break
+              fi
+              if ! timeout 5 adb get-state 2>/dev/null | tr -d '\r' | grep -qx device; then
+                echo "ADB_TEMP_UNAVAILABLE"
+                adb start-server >/dev/null 2>&1 || true
+              fi
+              sleep 10
+            done
+          else
+            sleep 10
+          fi
+          SCRIPT
+          chmod +x /tmp/remote-adb-test.sh
+
+      - name: Start Android and test remote ADB
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 8192M
+          emulator-port: 5554
+          disable-animations: false
+          emulator-options: >-
+            -no-window
+            -no-snapshot
+            -no-metrics
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/remote-adb-test.sh
