@@ -129,6 +129,54 @@ jobs:
 
             Write-Host 'PUBLIC_ADB_ROOT_OK'
             Write-Host 'PUBLIC_ADB_END_TO_END_OK'
+
+            # Prove that the same public ADB tunnel can sustain a real scrcpy
+            # H.264 video stream. Keep the recording only long enough to verify
+            # non-empty video data, then delete it without uploading an artifact.
+            Write-Host 'SCRCPY_STREAM_STARTING'
+            $release = Invoke-RestMethod -UseBasicParsing -Uri 'https://api.github.com/repos/Genymobile/scrcpy/releases/latest'
+            $asset = $release.assets | Where-Object { $_.name -like 'scrcpy-win64-*.zip' } | Select-Object -First 1
+            if (-not $asset) {
+              Write-Host 'SCRCPY_VIDEO_STREAM_FAILED'
+              exit 1
+            }
+
+            $scrcpyZip = Join-Path $env:RUNNER_TEMP 'scrcpy-win64.zip'
+            $scrcpyRoot = Join-Path $env:RUNNER_TEMP 'scrcpy-win64'
+            Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $scrcpyZip
+            Expand-Archive -Path $scrcpyZip -DestinationPath $scrcpyRoot -Force
+            $scrcpy = Get-ChildItem -Path $scrcpyRoot -Recurse -Filter 'scrcpy.exe' | Select-Object -First 1
+            if (-not $scrcpy) {
+              Write-Host 'SCRCPY_VIDEO_STREAM_FAILED'
+              exit 1
+            }
+
+            $platformTools = Split-Path -Parent $env:ADB_EXE
+            $env:Path = "$platformTools;$env:Path"
+            $record = Join-Path $env:RUNNER_TEMP 'scrcpy-proof.mkv'
+
+            $ErrorActionPreference = 'Continue'
+            & $scrcpy.FullName `
+              -s 127.0.0.1:15555 `
+              --no-audio `
+              --no-playback `
+              --no-window `
+              --no-control `
+              --video-codec=h264 `
+              --video-bit-rate=12M `
+              --max-fps=30 `
+              --time-limit=8 `
+              --record=$record `
+              2>&1 | Out-Null
+            $scrcpyExit = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+
+            if ($scrcpyExit -ne 0 -or -not (Test-Path $record) -or (Get-Item $record).Length -lt 65536) {
+              Write-Host 'SCRCPY_VIDEO_STREAM_FAILED'
+              exit 1
+            }
+            Remove-Item -LiteralPath $record -Force
+            Write-Host 'SCRCPY_VIDEO_STREAM_OK'
           } finally {
             if ($cfProc -and -not $cfProc.HasExited) {
               Stop-Process -Id $cfProc.Id -Force -ErrorAction SilentlyContinue
