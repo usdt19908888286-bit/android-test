@@ -56,10 +56,143 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           test -e /dev/kvm
           sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc netcat-openbsd jq libpulse0
+          sudo apt-get install -y xvfb x11vnc netcat-openbsd jq libpulse0 curl python3-pip
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
 
+      - name: Start and verify SOCKS5 bridge
+        shell: bash
+        env:
+          S5_HOST: ${{ secrets.S5_HOST }}
+          S5_PORT: ${{ secrets.S5_PORT }}
+          S5_USER: ${{ secrets.S5_USER }}
+          S5_PASS: ${{ secrets.S5_PASS }}
+        run: |
+          set -euo pipefail
+          [ -n "${S5_HOST:-}" ] || { echo '::error::Missing S5_HOST secret'; exit 1; }
+          [ -n "${S5_PORT:-}" ] || { echo '::error::Missing S5_PORT secret'; exit 1; }
+          python3 -m pip install --quiet --break-system-packages PySocks
+
+          cat >/tmp/s5_bridge.py <<'PY'
+          import os
+          import select
+          import socketserver
+          from urllib.parse import urlsplit
+          import socks
+
+          S5_HOST = os.environ["S5_HOST"]
+          S5_PORT = int(os.environ["S5_PORT"])
+          S5_USER = os.environ.get("S5_USER") or None
+          S5_PASS = os.environ.get("S5_PASS") or None
+
+          def open_upstream(host, port):
+              s = socks.socksocket()
+              s.set_proxy(socks.SOCKS5, S5_HOST, S5_PORT, rdns=True,
+                          username=S5_USER, password=S5_PASS)
+              s.settimeout(30)
+              s.connect((host, int(port)))
+              s.settimeout(None)
+              return s
+
+          def relay(a, b):
+              sockets = [a, b]
+              while True:
+                  readable, _, _ = select.select(sockets, [], [], 60)
+                  if not readable:
+                      continue
+                  for src in readable:
+                      dst = b if src is a else a
+                      data = src.recv(65536)
+                      if not data:
+                          return
+                      dst.sendall(data)
+
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  client = self.request
+                  client.settimeout(30)
+                  data = b""
+                  while b"\r\n\r\n" not in data and len(data) < 65536:
+                      chunk = client.recv(4096)
+                      if not chunk:
+                          return
+                      data += chunk
+                  if b"\r\n\r\n" not in data:
+                      return
+                  head, rest = data.split(b"\r\n\r\n", 1)
+                  lines = head.split(b"\r\n")
+                  parts = lines[0].decode("latin1").split(" ", 2)
+                  if len(parts) != 3:
+                      return
+                  method, target, version = parts
+                  try:
+                      if method.upper() == "CONNECT":
+                          host, port = target.rsplit(":", 1)
+                          upstream = open_upstream(host.strip("[]"), int(port))
+                          client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                          if rest:
+                              upstream.sendall(rest)
+                          relay(client, upstream)
+                          upstream.close()
+                          return
+                      parsed = urlsplit(target)
+                      if parsed.hostname:
+                          host = parsed.hostname
+                          port = parsed.port or 80
+                          path = parsed.path or "/"
+                          if parsed.query:
+                              path += "?" + parsed.query
+                      else:
+                          host_header = ""
+                          for line in lines[1:]:
+                              if line.lower().startswith(b"host:"):
+                                  host_header = line.split(b":", 1)[1].strip().decode("latin1")
+                                  break
+                          if not host_header:
+                              return
+                          if ":" in host_header:
+                              host, port = host_header.rsplit(":", 1)
+                              port = int(port)
+                          else:
+                              host, port = host_header, 80
+                          path = target
+                      upstream = open_upstream(host, port)
+                      lines[0] = f"{method} {path} {version}".encode("latin1")
+                      upstream.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + rest)
+                      relay(client, upstream)
+                      upstream.close()
+                  except Exception:
+                      try:
+                          client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                      except Exception:
+                          pass
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+
+          Server(("127.0.0.1", 8118), Handler).serve_forever()
+          PY
+
+          cat >/tmp/s5_bridge_supervisor.sh <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          while true; do
+            python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1
+            sleep 2
+          done
+          SH
+          chmod +x /tmp/s5_bridge_supervisor.sh
+          : >/tmp/s5_bridge.log
+          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &
+          echo $! >/tmp/s5_bridge_supervisor.pid
+          for _ in $(seq 1 20); do
+            nc -z 127.0.0.1 8118 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 8118
+          curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+          echo 'SOCKS5_BRIDGE_OK'
       - name: Restore latest full phone archive or base AVD
         id: avd-restore
         uses: actions/cache/restore@v5
@@ -213,6 +346,7 @@ jobs:
             -no-boot-anim
             -camera-back none
             -camera-front none
+            -http-proxy http://127.0.0.1:8118
           script: bash /tmp/persistent-phone.sh
 
       - name: Detect on-demand backup request
