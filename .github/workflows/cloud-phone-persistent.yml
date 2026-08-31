@@ -20,6 +20,7 @@ env:
   DISPLAY: :99
   AVD_NAME: full-avd-api35-pixel6-frida-v2
   BASE_CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
+  APK_URL: https://download.binance.com/pack/BNApp64.apk
 
 jobs:
   phone:
@@ -120,8 +121,19 @@ jobs:
             adb shell wm size 720x1600 || true
             adb shell wm density 280 || true
             echo 'BASE_DISPLAY_TUNING_APPLIED'
+
+            echo 'Installing Binance APK on fresh/base phone...'
+            if adb shell 'command -v curl >/dev/null 2>&1'; then
+              adb shell "curl -fL --retry 3 --retry-delay 2 '$APK_URL' -o /data/local/tmp/binance.apk"
+            else
+              curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/binance.apk
+              adb push /tmp/binance.apk /data/local/tmp/binance.apk >/dev/null
+            fi
+            adb shell pm install -r /data/local/tmp/binance.apk >/tmp/binance-install.log
+            echo 'BINANCE_APK_INSTALL_SUCCESS'
           else
             echo 'ARCHIVE_DISPLAY_STATE_PRESERVED'
+            echo 'ARCHIVE_RESTORE_SKIPS_BINANCE_REINSTALL'
           fi
 
           if adb shell 'test -x /data/local/tmp/frida-server'; then
@@ -194,7 +206,7 @@ jobs:
           emulator-options: >-
             -no-snapshot
             -no-metrics
-            -gpu swiftshader_indirect
+            -gpu swiftshader
             -noaudio
             -no-boot-anim
             -camera-back none
