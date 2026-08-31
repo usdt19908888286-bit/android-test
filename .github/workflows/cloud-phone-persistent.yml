@@ -20,7 +20,6 @@ env:
   DISPLAY: :99
   AVD_NAME: full-avd-api35-pixel6-frida-v2
   BASE_CACHE_KEY: full-avd-api35-pixel6-frida-cold-v2
-  APK_URL: https://download.binance.com/pack/BNApp64.apk
 
 jobs:
   phone:
@@ -238,11 +237,21 @@ jobs:
           done
           test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
 
-          adb root >/tmp/adb-root-persistent.log 2>&1 || true
-          sleep 2
-          adb wait-for-device
+          if adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)'; then
+            echo 'ADB_ALREADY_ROOT_AT_BOOT'
+          else
+            echo 'ADB_ROOT_BOOTSTRAP_START'
+            adb root >/tmp/adb-root-persistent.log 2>&1
+            for _ in $(seq 1 30); do
+              adb wait-for-device >/dev/null 2>&1 || true
+              if adb shell id 2>/dev/null | tr -d '\r' | grep -q 'uid=0(root)'; then
+                break
+              fi
+              sleep 1
+            done
+          fi
           adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
-          echo 'ADB_ROOT_OK'
+          echo 'ADB_ROOT_BOOTSTRAPPED_ONCE'
 
           if [ "${RESTORE_KIND:-base}" = 'base' ]; then
             adb shell settings put global window_animation_scale 0 || true
@@ -258,18 +267,8 @@ jobs:
             echo 'ARCHIVE_DISPLAY_STATE_PRESERVED'
           fi
 
-          if adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -E '^package:com\.binance'; then
-            echo 'BINANCE_APK_ALREADY_INSTALLED'
-          else
-            echo 'BINANCE_APK_INSTALL_START'
-            rm -f /tmp/binance.apk
-            curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o /tmp/binance.apk
-            test -s /tmp/binance.apk
-            adb install -r /tmp/binance.apk
-            rm -f /tmp/binance.apk
-            adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -E '^package:com\.binance'
-            echo 'BINANCE_APK_INSTALL_SUCCESS'
-          fi
+          echo 'APP_AUTO_UPDATE_DISABLED'
+          echo 'APP_INSTALL_SOURCE=local-pinned-apk'
 
           if adb shell 'test -x /data/local/tmp/frida-server'; then
             adb shell 'chmod 755 /data/local/tmp/frida-server'
