@@ -33,10 +33,41 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl jq netcat-openbsd openssl
+          sudo apt-get install -y curl jq netcat-openbsd openssl xz-utils
 
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
+
+          # Prepare the latest Android x86_64 Frida server on the runner. The
+          # emulator first tries to fetch it from the host through 10.0.2.2;
+          # ADB push remains only as a compatibility fallback.
+          curl -fsSL 'https://api.github.com/repos/frida/frida/releases/latest' -o /tmp/frida-release.json
+          FRIDA_URL=$(jq -r '.assets[]? | select(.name | test("^frida-server-.*-android-x86_64\\.xz$")) | .browser_download_url' /tmp/frida-release.json | head -n1)
+          if [ -z "$FRIDA_URL" ]; then
+            echo "FRIDA_PREP_FAILED"
+            exit 1
+          fi
+          curl -fsSL "$FRIDA_URL" -o /tmp/frida-server.xz
+          unxz -f /tmp/frida-server.xz
+          chmod 755 /tmp/frida-server
+          rm -f /tmp/frida-release.json
+
+          nohup python3 -m http.server 18080 --bind 127.0.0.1 --directory /tmp \
+            >/tmp/frida-http.log 2>&1 &
+          echo $! >/tmp/frida-http.pid
+          FRIDA_HTTP_READY=0
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 18080; then
+              FRIDA_HTTP_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$FRIDA_HTTP_READY" -ne 1 ]; then
+            echo "FRIDA_PREP_FAILED"
+            exit 1
+          fi
+          echo "FRIDA_PREP_READY"
 
           cf_fail() {
             echo "CF_TUNNEL_FAILED"
@@ -204,6 +235,44 @@ jobs:
             exit 1
           }
 
+          install_frida() {
+            local abi
+            abi=$(adb shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r' || true)
+            if [ "$abi" != "x86_64" ]; then
+              echo "FRIDA_INSTALL_FAILED"
+              return 1
+            fi
+
+            echo "FRIDA_INSTALL_STARTING"
+            if ! adb shell 'test -x /data/local/tmp/frida-server' >/dev/null 2>&1; then
+              if adb shell 'command -v curl >/dev/null 2>&1'; then
+                adb shell 'curl -fsSL http://10.0.2.2:18080/frida-server -o /data/local/tmp/frida-server'
+              elif adb shell 'toybox wget --help >/dev/null 2>&1'; then
+                adb shell 'toybox wget -O /data/local/tmp/frida-server http://10.0.2.2:18080/frida-server'
+              elif adb shell 'command -v wget >/dev/null 2>&1'; then
+                adb shell 'wget -O /data/local/tmp/frida-server http://10.0.2.2:18080/frida-server'
+              else
+                adb push /tmp/frida-server /data/local/tmp/frida-server >/dev/null
+              fi
+              adb shell 'chmod 755 /data/local/tmp/frida-server'
+            fi
+
+            if ! adb shell 'pidof frida-server >/dev/null 2>&1'; then
+              adb shell 'if command -v nohup >/dev/null 2>&1; then nohup /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & else /data/local/tmp/frida-server >/data/local/tmp/frida.log 2>&1 </dev/null & fi'
+            fi
+
+            for _ in $(seq 1 30); do
+              if adb shell 'pidof frida-server >/dev/null 2>&1'; then
+                echo "FRIDA_SERVER_READY"
+                return 0
+              fi
+              sleep 1
+            done
+
+            echo "FRIDA_INSTALL_FAILED"
+            return 1
+          }
+
           wait_boot_completed() {
             adb wait-for-device
             for _ in $(seq 1 180); do
@@ -235,6 +304,8 @@ jobs:
             echo "::error::ADB_ROOT_UNAVAILABLE"
             exit 1
           fi
+
+          install_frida || exit 1
 
           # emulator-port is fixed at 5554, so its host-side ADB TCP port is 5555.
           if nc -z 127.0.0.1 5555; then
