@@ -1,0 +1,70 @@
+name: Tailscale Phone Service End-to-End Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/tailscale-phone-service-test.yml
+
+concurrency:
+  group: tailscale-phone-service-e2e-test
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Join tailnet as ephemeral phone host
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: gh-phone001-test-${{ github.run_id }}
+          version: latest
+          log-mode: normal
+
+      - name: Start local TCP proof service
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/ts_phone_test.py <<'PY'
+          import socketserver
+
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  self.request.sendall(b"TS_PHONE_TEST_OK\n")
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+
+          Server(("127.0.0.1", 5555), Handler).serve_forever()
+          PY
+          nohup python3 /tmp/ts_phone_test.py >/tmp/ts_phone_test.log 2>&1 &
+          echo $! >/tmp/ts_phone_test.pid
+          for _ in $(seq 1 20); do
+            nc -z 127.0.0.1 5555 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 5555
+          echo "LOCAL_TCP_5555_OK"
+
+      - name: Advertise phone001 Tailscale Service
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E tailscale serve --yes --service=svc:phone001 --tcp=5555 tcp://127.0.0.1:5555
+          sudo -E tailscale serve get-config --service=svc:phone001 | grep -q 'tcp:5555'
+          SUFFIX=$(sudo -E tailscale status --json | jq -r '.MagicDNSSuffix // empty')
+          [ -n "$SUFFIX" ]
+          echo "TS_PHONE_FQDN=phone001.$SUFFIX"
+          echo "TAILSCALE_PHONE_SERVICE_READY"
+
+      - name: Hold for Windows end-to-end probe
+        shell: bash
+        run: |
+          echo "TAILSCALE_PHONE_SERVICE_HOLD_START"
+          sleep 240
+          echo "TAILSCALE_PHONE_SERVICE_HOLD_END"
