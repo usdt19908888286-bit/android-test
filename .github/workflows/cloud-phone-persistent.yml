@@ -258,7 +258,7 @@ jobs:
             echo 'ARCHIVE_DISPLAY_STATE_PRESERVED'
           fi
 
-          if adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -Eq '^package:com\.binance'; then
+          if adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -E '^package:com\.binance'; then
             echo 'BINANCE_APK_ALREADY_INSTALLED'
           else
             echo 'BINANCE_APK_INSTALL_START'
@@ -267,7 +267,7 @@ jobs:
             test -s /tmp/binance.apk
             adb install -r /tmp/binance.apk
             rm -f /tmp/binance.apk
-            adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -Eq '^package:com\.binance'
+            adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -E '^package:com\.binance'
             echo 'BINANCE_APK_INSTALL_SUCCESS'
           fi
 
