@@ -51,15 +51,78 @@ jobs:
           nc -z 127.0.0.1 5555
           echo "LOCAL_TCP_5555_OK"
 
-      - name: Advertise phone001 Tailscale Service
+      - name: Advertise and verify phone001 Tailscale Service
         shell: bash
+        env:
+          TS_API_CLIENT_ID: ${{ secrets.TS_API_CLIENT_ID }}
+          TS_API_CLIENT_SECRET: ${{ secrets.TS_API_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          sudo -E tailscale serve --yes --service=svc:phone001 --tcp=5555 tcp://127.0.0.1:5555
-          sudo -E tailscale serve get-config --service=svc:phone001 | grep -q 'tcp:5555'
+          SERVICE='svc:phone001'
+
+          sudo -E tailscale serve --yes --service="$SERVICE" --tcp=5555 tcp://127.0.0.1:5555
+          sudo -E tailscale serve get-config --service="$SERVICE" | grep -q 'tcp:5555'
+
+          SELF_ID=$(sudo -E tailscale status --json | jq -r '.Self.ID // empty')
           SUFFIX=$(sudo -E tailscale status --json | jq -r '.MagicDNSSuffix // empty')
+          [ -n "$SELF_ID" ]
           [ -n "$SUFFIX" ]
-          echo "TS_PHONE_FQDN=phone001.$SUFFIX"
+
+          TOKEN_JSON=/tmp/ts-e2e-oauth.json
+          HOSTS_JSON=/tmp/ts-e2e-hosts.json
+          trap 'rm -f "$TOKEN_JSON" "$HOSTS_JSON"' EXIT
+          curl -fsS -X POST \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "client_id=$TS_API_CLIENT_ID" \
+            --data-urlencode "client_secret=$TS_API_CLIENT_SECRET" \
+            --data-urlencode 'scope=all' \
+            https://api.tailscale.com/api/v2/oauth/token \
+            -o "$TOKEN_JSON"
+          TS_ACCESS_TOKEN=$(jq -r '.access_token // empty' "$TOKEN_JSON")
+          [ -n "$TS_ACCESS_TOKEN" ]
+          echo "::add-mask::$TS_ACCESS_TOKEN"
+          unset TS_API_CLIENT_ID TS_API_CLIENT_SECRET
+
+          ts_api() {
+            curl -fsS -H "Authorization: Bearer $TS_ACCESS_TOKEN" -H 'Accept: application/json' "$@"
+          }
+
+          approved_ready() {
+            ts_api "https://api.tailscale.com/api/v2/tailnet/-/services/$SERVICE/devices" -o "$HOSTS_JSON"
+            jq -e --arg id "$SELF_ID" '.hosts[]? | select(.nodeId == $id) | (.approvalLevel | startswith("approved:")) and (.configured == "ready")' "$HOSTS_JSON" >/dev/null
+          }
+
+          for _ in $(seq 1 15); do
+            approved_ready && break
+            sleep 2
+          done
+
+          if ! approved_ready; then
+            ts_api "https://api.tailscale.com/api/v2/tailnet/-/services/$SERVICE/devices" -o "$HOSTS_JSON"
+            NODE_ID=$(jq -r --arg id "$SELF_ID" '.hosts[]? | select(.nodeId == $id) | .nodeId' "$HOSTS_JSON" | head -n1)
+            [ -n "$NODE_ID" ] || { echo "::error::TAILSCALE_SERVICE_HOST_NOT_REGISTERED"; exit 1; }
+            ts_api -X POST \
+              -H 'Content-Type: application/json' \
+              --data '{"approved":true}' \
+              "https://api.tailscale.com/api/v2/tailnet/-/services/$SERVICE/device/$NODE_ID/approved" \
+              -o /dev/null
+            sleep 3
+            sudo -E tailscale serve --yes --service="$SERVICE" --tcp=5555 tcp://127.0.0.1:5555
+          fi
+
+          for _ in $(seq 1 20); do
+            approved_ready && break
+            sleep 2
+          done
+          approved_ready || { echo "::error::TAILSCALE_SERVICE_HOST_NOT_READY"; exit 1; }
+
+          sudo -E tailscale status --json | jq -e '.Self.CapMap."service-host" != null' >/dev/null
+          FQDN="phone001.$SUFFIX"
+          echo "TS_PHONE_FQDN=$FQDN"
+
+          PROBE=$(timeout 10 nc -w 5 "$FQDN" 5555 | tr -d '\r' | head -n1 || true)
+          [ "$PROBE" = 'TS_PHONE_TEST_OK' ] || { echo "::error::TAILSCALE_SERVICE_LOCAL_PROBE_FAILED"; exit 1; }
+          echo "TAILSCALE_SERVICE_LOCAL_PROBE_OK"
           echo "TAILSCALE_PHONE_SERVICE_READY"
 
       - name: Hold for Windows end-to-end probe
