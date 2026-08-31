@@ -280,6 +280,25 @@ jobs:
             echo 'FRIDA_SERVER_AVAILABLE'
           fi
 
+          # 暴露 ADB-over-TCP，供本地 scrcpy 原生键鼠直连云手机
+          echo 'ADB_TCPIP_BOOTSTRAP_START'
+          if adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1; then
+            for _ in $(seq 1 30); do
+              if nc -z 127.0.0.1 5555; then break; fi
+              sleep 1
+            done
+            if nc -z 127.0.0.1 5555; then
+              echo 'ADB_TCPIP_5555_READY'
+              # 只保留 TCP 设备，避免后续 adb 出现双设备导致命令歧义
+              adb disconnect emulator-5554 >/dev/null 2>&1 || true
+            else
+              echo 'ADB_TCPIP_5555_WARN'
+            fi
+          else
+            echo 'ADB_TCPIP_FAILED'
+            cat /tmp/adb-tcpip.log || true
+          fi
+
           TS_IPV4=$(tailscale ip -4 | head -n1)
           [ -n "$TS_IPV4" ]
           sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
@@ -295,6 +314,8 @@ jobs:
 
           echo 'PERSISTENT_CLOUD_PHONE_READY'
           echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+
           echo "TAILSCALE_VNC=${TS_IPV4}:5900"
           echo "BACKUP_TRIGGER_TAG=$BACKUP_TRIGGER_TAG"
           echo 'Say backup in chat when you want this exact AVD state archived.'
