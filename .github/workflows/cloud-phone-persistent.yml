@@ -2,6 +2,10 @@ name: Persistent Android Cloud Phone
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cloud-phone-persistent.yml
     inputs:
       phone_id:
         description: Logical phone ID (digits only, e.g. 001)
