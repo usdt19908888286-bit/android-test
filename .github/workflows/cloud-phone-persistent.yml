@@ -49,7 +49,6 @@ jobs:
           tags: tag:github-phone
           hostname: persistent-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
           version: latest
-          log-mode: normal
 
       - name: Enable KVM and prepare display
         shell: bash
@@ -60,7 +59,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           test -e /dev/kvm
           sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc netcat-openbsd jq
+          sudo apt-get install -y xvfb x11vnc netcat-openbsd jq libpulse0
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
 
