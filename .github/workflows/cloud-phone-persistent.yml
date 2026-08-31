@@ -68,7 +68,7 @@ jobs:
         id: avd-restore
         uses: actions/cache/restore@v5
         with:
-          path: ~/.android/avd
+          path: ~/.android/avd/*
           key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-current
           restore-keys: |
             cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-
@@ -224,7 +224,7 @@ jobs:
         if: steps.backup-state.outputs.requested == 'true'
         uses: actions/cache/save@v5
         with:
-          path: ~/.android/avd
+          path: ~/.android/avd/*
           key: cloud-phone-full-avd-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
 
       - name: Report archive key
