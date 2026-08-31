@@ -92,22 +92,25 @@ jobs:
           fi
           echo "TAILSCALE_POLICY_BOOTSTRAP_OK"
 
-          jq -n '{
-            name:"svc:phone001",
-            displayName:"phone001",
-            comment:"GitHub Android cloud phone 001",
-            ports:["tcp:5555"],
-            tags:["tag:cloud-phone-service"]
-          }' > "$SERVICE_JSON"
+          SERVICE_URL='https://api.tailscale.com/api/v2/tailnet/-/vip-services/svc:phone001'
+          if ts_api "$SERVICE_URL" -o "$SERVICE_JSON"; then
+            echo "TAILSCALE_SERVICE_PHONE001_EXISTS"
+          else
+            jq -n '{
+              name:"svc:phone001",
+              displayName:"phone001",
+              comment:"GitHub Android cloud phone 001",
+              ports:["tcp:5555"],
+              tags:["tag:cloud-phone-service"]
+            }' > "$SERVICE_JSON"
+            ts_api -X PUT \
+              -H 'Content-Type: application/json' \
+              --data-binary "@$SERVICE_JSON" \
+              "$SERVICE_URL" \
+              -o /dev/null
+          fi
 
-          ts_api -X PUT \
-            -H 'Content-Type: application/json' \
-            --data-binary "@$SERVICE_JSON" \
-            'https://api.tailscale.com/api/v2/tailnet/-/vip-services/svc:phone001' \
-            -o /dev/null
-
-          ts_api \
-            'https://api.tailscale.com/api/v2/tailnet/-/vip-services/svc:phone001' \
+          ts_api "$SERVICE_URL" \
             | jq -e '.name == "svc:phone001" and (.ports | index("tcp:5555")) != null and (.tags | index("tag:cloud-phone-service")) != null' \
             >/dev/null
 
