@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo -E tailscale serve --yes --tcp=5555 tcp://127.0.0.1:5555
+          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
           sudo -E tailscale serve status | grep -q 'tcp://.*:5555'
           echo "TAILSCALE_NODE_TCP_5555_READY"
 
