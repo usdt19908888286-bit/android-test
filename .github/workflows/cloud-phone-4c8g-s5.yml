@@ -523,20 +523,36 @@ jobs:
             return 1
           }
 
+          named_adb_tunnel_healthy() {
+            local metrics sum
+            metrics=$(curl -fsS --max-time 3 http://127.0.0.1:60123/metrics 2>/dev/null || true)
+            [ -n "$metrics" ] || return 1
+            sum=$(printf '%s\n' "$metrics" | awk '/^cloudflared_tunnel_ha_connections/ {s+=$NF} END {print s+0}')
+            [ "${sum:-0}" -ge 1 ]
+          }
+
           start_named_adb_tunnel() {
             [ -s /tmp/cf_tunnel_token ] || return 1
+
+            if pid_alive /tmp/cloudflared_named_adb.pid; then
+              kill "$(cat /tmp/cloudflared_named_adb.pid)" >/dev/null 2>&1 || true
+              sleep 1
+            fi
+            rm -f /tmp/cloudflared_named_adb.pid
+
             echo "CF_TUNNEL_STARTING"
             : >/tmp/cloudflared_named_adb.log
             nohup /tmp/cloudflared tunnel \
               --no-autoupdate \
               --loglevel info \
               --logfile /tmp/cloudflared_named_adb.log \
+              --metrics 127.0.0.1:60123 \
               run --token-file /tmp/cf_tunnel_token \
               >/dev/null 2>&1 &
             echo $! >/tmp/cloudflared_named_adb.pid
 
             for _ in $(seq 1 60); do
-              if grep -q 'Registered tunnel connection' /tmp/cloudflared_named_adb.log 2>/dev/null; then
+              if grep -q 'Registered tunnel connection' /tmp/cloudflared_named_adb.log 2>/dev/null && named_adb_tunnel_healthy; then
                 echo "CF_TUNNEL_CONNECTED"
                 echo "REMOTE_ADB_READY"
                 return 0
@@ -591,9 +607,9 @@ jobs:
               echo "WATCHDOG_RESTART_ADB_INPUT_TUNNEL"
               if start_adb_input_tunnel; then echo "ADB_INPUT_RECONNECTED: ${ADB_INPUT_URL}/"; else echo "ADB_INPUT_TUNNEL_RESTART_FAILED"; fi
             fi
-            if ! pid_alive /tmp/cloudflared_named_adb.pid; then
+            if ! pid_alive /tmp/cloudflared_named_adb.pid || ! named_adb_tunnel_healthy; then
               echo "WATCHDOG_RESTART_NAMED_ADB_TUNNEL"
-              start_named_adb_tunnel || true
+              start_named_adb_tunnel || echo "NAMED_ADB_TUNNEL_RESTART_FAILED"
             fi
             if ! adb shell 'pidof frida-server >/dev/null 2>&1'; then
               echo "WATCHDOG_RESTART_FRIDA"
