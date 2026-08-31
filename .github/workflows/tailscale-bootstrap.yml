@@ -68,6 +68,10 @@ jobs:
             if any(.grants[]?; (.src == ["autogroup:member"] and .dst == ["tag:cloud-phone-service"] and .ip == ["tcp:5555"]))
             then .
             else .grants += [{"src":["autogroup:member"],"dst":["tag:cloud-phone-service"],"ip":["tcp:5555"]}]
+            end |
+            if any(.grants[]?; (.src == ["autogroup:member"] and .dst == ["tag:github-phone"] and .ip == ["tcp:5555"]))
+            then .
+            else .grants += [{"src":["autogroup:member"],"dst":["tag:github-phone"],"ip":["tcp:5555"]}]
             end
           ' "$ACL_JSON" > "$ACL_UPDATED"
 
