@@ -667,6 +667,15 @@ jobs:
           adb shell id | tr -d '\r' | grep -q 'uid=0(root)'
           echo "ADB_ROOT_OK"
 
+          # Keep Android 15 SystemUI lightweight on GitHub-hosted software rendering.
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          adb shell settings put global disable_window_blurs 1 || true
+          adb shell settings put system peak_refresh_rate 60.0 || true
+          adb shell settings put system min_refresh_rate 60.0 || true
+          echo "SYSTEMUI_STABILITY_SETTINGS_OK"
+
           if ! nc -z 127.0.0.1 5555; then
             echo "::error::EMULATOR_ADB_TCP_5555_FAILED"
             exit 1
