@@ -1,10 +1,6 @@
 name: Android Cloud Phone 4C8G S5
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/cloud-phone-4c8g-s5.yml
 
 concurrency:
   group: android-cloud-phone
