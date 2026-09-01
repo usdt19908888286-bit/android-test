@@ -1126,6 +1126,10 @@ class GitHubAPI:
 class LocalTools:
     def __init__(self):
         self.adb = self._find_adb()
+        if os.name == "nt":
+            bundled_adb = Path(__file__).resolve().parent / "platform-tools" / "adb.exe"
+            if bundled_adb.is_file() or self._managed_adb_path().is_file():
+                self.ensure_managed_adb()
         self.scrcpy = self._find_scrcpy()
         self.tailscale = self._find_tailscale()
         self.gh = self._find_gh()
@@ -1146,8 +1150,8 @@ class LocalTools:
         local_appdata = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
         app_dir = Path(__file__).resolve().parent
         preferred = [
-            app_dir / "platform-tools" / "adb.exe",
             local_appdata / "CloudAndroidManager" / "platform-tools" / "adb.exe",
+            app_dir / "platform-tools" / "adb.exe",
         ]
         for item in preferred:
             if item.is_file():
@@ -1167,7 +1171,13 @@ class LocalTools:
         return local_appdata / "CloudAndroidManager" / "platform-tools" / "adb.exe"
 
     def ensure_managed_adb(self) -> tuple[bool, str]:
-        """Prepare a program-owned Google Platform Tools copy under LocalAppData."""
+        """Prepare a stable program-owned Platform Tools copy under LocalAppData.
+
+        Packaged builds carry Platform Tools inside the EXE. Prefer copying that
+        bundled copy locally so a fresh computer never depends on a preinstalled
+        adb.exe or an Internet download. The Google download remains a fallback for
+        source/development builds that do not contain bundled Platform Tools.
+        """
         if os.name != "nt":
             self.adb = self._find_adb()
             return (bool(self.adb), self.adb or "当前系统未找到 adb")
@@ -1179,10 +1189,33 @@ class LocalTools:
 
         base = target.parent.parent
         base.mkdir(parents=True, exist_ok=True)
+        previous_adb = self.adb
+
+        bundled = Path(__file__).resolve().parent / "platform-tools"
+        bundled_adb = bundled / "adb.exe"
+        if bundled_adb.is_file():
+            staging = base / (".platform-tools-bundled-" + uuid.uuid4().hex)
+            try:
+                shutil.copytree(bundled, staging)
+                copied_adb = staging / "adb.exe"
+                if not copied_adb.is_file() or copied_adb.stat().st_size < 1_000_000:
+                    raise RuntimeError("软件内置 adb.exe 文件异常")
+                if target.parent.exists():
+                    shutil.rmtree(target.parent, ignore_errors=True)
+                os.replace(staging, target.parent)
+                if not target.is_file():
+                    raise RuntimeError("软件内置 ADB 释放后目标文件不存在")
+                self.adb = str(target)
+                return True, str(target)
+            except Exception as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                if previous_adb and Path(previous_adb).is_file():
+                    self.adb = previous_adb
+                    return True, f"内置 ADB 释放失败，暂用现有 ADB：{previous_adb}；原因：{exc}"
+
         archive = base / "platform-tools-latest-windows.zip"
         staging = base / (".platform-tools-" + uuid.uuid4().hex)
         url = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
-        previous_adb = self.adb
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "CloudAndroidManager/1.0"})
             with urllib.request.urlopen(req, timeout=120) as resp, archive.open("wb") as out:
@@ -1206,7 +1239,6 @@ class LocalTools:
             self.adb = str(target)
             return True, str(target)
         except Exception as exc:
-            # Existing Android Studio/scrcpy ADB remains usable as a fallback.
             if previous_adb and Path(previous_adb).is_file():
                 self.adb = previous_adb
                 return True, f"程序自有 ADB 准备失败，暂用现有 ADB：{previous_adb}；原因：{exc}"
@@ -2335,7 +2367,7 @@ class CloudPhoneGUI:
         ttk.Button(actions, text="▶ 启动新机", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=(0, 5))
         ttk.Button(actions, text="↺ 恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(actions, text="复制地址", command=lambda pid=cfg.profile_id: self.copy_scrcpy_address(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="复制 scrcpy 命令", command=lambda pid=cfg.profile_id: self.copy_scrcpy_address(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="备份", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=5)
@@ -5419,8 +5451,17 @@ class CloudPhoneGUI:
         if not cfg or not cfg.last_device:
             messagebox.showinfo(APP_NAME, "还没有可用的 ADB / scrcpy 地址，请先刷新这台手机。")
             return
-        self._copy_to_clipboard(cfg.last_device)
-        self.log(f"{cfg.phone_name}: 已复制 scrcpy 地址 {cfg.last_device}")
+
+        # Prefer the stable program-owned ADB path. Packaged builds release the
+        # bundled Platform Tools copy into LocalAppData on first use.
+        self.tools.ensure_managed_adb()
+        adb_exe = self.tools.adb or "adb"
+        scrcpy_exe = self.tools.scrcpy or "scrcpy"
+        adb_cmd = subprocess.list2cmdline([adb_exe, "connect", cfg.last_device])
+        scrcpy_cmd = subprocess.list2cmdline([scrcpy_exe, "-s", cfg.last_device])
+        command = f"{adb_cmd} && {scrcpy_cmd}"
+        self._copy_to_clipboard(command)
+        self.log(f"{cfg.phone_name}: 已复制 scrcpy 连接命令")
 
     def _choose_app_and_execute(self, profile_id: str, action: str) -> None:
         cfg = self.store.get(profile_id)
