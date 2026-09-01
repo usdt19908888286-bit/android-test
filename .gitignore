@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local build / smoke-test artifacts
+.tmp-*
+.tmp-*/
+.wrangler/
+tmp-*.png
+
+# PyInstaller/local release output
+release/
+
+# Downloaded/runtime binaries and APKs
+app-release.apk
+cloudflared-adb-client.exe
+
+# Local test archives
+backups/
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
