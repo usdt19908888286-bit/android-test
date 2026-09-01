@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 APP_NAME = "Cloud Android Manager"
 CONFIG_PATH = Path.home() / ".cloud_android_manager.json"
@@ -439,6 +439,48 @@ class GitHubAPI:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub API {exc.code}: {detail}") from exc
+
+
+    def create_user_repository(self, name: str, private: bool = True) -> dict[str, Any]:
+        """Create a repository for the authenticated GitHub user and initialize main/default branch."""
+        repo_name = name.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repo_name):
+            raise ValueError("仓库名只能包含字母、数字、点、下划线和短横线")
+        if not self.token:
+            raise RuntimeError("请先完成 GitHub 授权登录")
+        url = "https://api.github.com/user/repos"
+        payload = {
+            "name": repo_name,
+            "private": bool(private),
+            "auto_init": True,
+            "description": "Cloud Android Manager repository",
+        }
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "cloud-android-manager/3.0",
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            return result if isinstance(result, dict) else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                msg = json.loads(detail).get("message", detail)
+            except Exception:
+                msg = detail
+            raise RuntimeError(f"GitHub API {exc.code}: {msg}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"GitHub API 网络错误: {exc.reason}") from exc
+
+    def delete_repository(self) -> None:
+        """Permanently delete this repository using the current GitHub authorization."""
+        self._request("DELETE", "")
 
     def repository_file(self, path: str, ref: str = "") -> Optional[dict[str, Any]]:
         safe = urllib.parse.quote(path, safe="/")
@@ -1463,10 +1505,161 @@ class CloudPhoneGUI:
                 v_repo_status.set(f"已读取 {len(items)} 个仓库")
             self.bg("读取 GitHub 仓库", self._fetch_repositories, done, lambda e: v_repo_status.set(e))
 
-        ttk.Button(repo_box, text="读取我的仓库", command=load_repos).grid(row=0, column=2, padx=5)
+        def create_repo_dialog() -> None:
+            try:
+                token = self._token()
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
+                return
+
+            dlg = tk.Toplevel(win)
+            dlg.title("创建 GitHub 仓库")
+            dlg.geometry("470x245")
+            dlg.resizable(False, False)
+            dlg.transient(win)
+            dlg.grab_set()
+
+            v_new_name = tk.StringVar()
+            v_visibility = tk.StringVar(value="私有")
+            v_create_status = tk.StringVar(value="创建后会自动初始化分支并上传内置 workflow")
+            frame = ttk.Frame(dlg, padding=16)
+            frame.pack(fill="both", expand=True)
+            frame.columnconfigure(1, weight=1)
+            ttk.Label(frame, text="仓库名").grid(row=0, column=0, sticky="w")
+            name_entry = ttk.Entry(frame, textvariable=v_new_name)
+            name_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+            ttk.Label(frame, text="可见性").grid(row=1, column=0, sticky="w", pady=(12, 0))
+            ttk.Combobox(
+                frame,
+                textvariable=v_visibility,
+                values=["私有", "公开"],
+                state="readonly",
+                width=12,
+            ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(12, 0))
+            ttk.Label(frame, textvariable=v_create_status, wraplength=430).grid(
+                row=2, column=0, columnspan=2, sticky="w", pady=(14, 0)
+            )
+            buttons = ttk.Frame(frame)
+            buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(20, 0))
+            ttk.Button(buttons, text="取消", command=dlg.destroy).pack(side="right")
+
+            def submit_create() -> None:
+                name = v_new_name.get().strip()
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", name):
+                    messagebox.showerror(APP_NAME, "仓库名只能包含字母、数字、点、下划线和短横线", parent=dlg)
+                    return
+                private = v_visibility.get() != "公开"
+                create_button.state(["disabled"])
+                v_create_status.set("正在 GitHub 创建仓库…")
+
+                def work() -> tuple[str, str, list[str]]:
+                    bootstrap = GitHubAPI("placeholder/repository", token)
+                    result = bootstrap.create_user_repository(name, private)
+                    full_name = str(result.get("full_name") or "").strip()
+                    branch = str(result.get("default_branch") or "main").strip() or "main"
+                    if not full_name:
+                        raise RuntimeError("GitHub 已响应，但没有返回仓库名称")
+                    notes = [f"已创建 {'私有' if private else '公开'}仓库 {full_name}"]
+                    api = GitHubAPI(full_name, token)
+                    workflow_note = ""
+                    for attempt in range(5):
+                        try:
+                            workflow_note = api.ensure_builtin_workflow(branch)
+                            break
+                        except Exception as exc:
+                            workflow_note = f"workflow 暂未同步: {exc}"
+                            if attempt < 4:
+                                time.sleep(1.5)
+                    notes.append(workflow_note)
+                    names = api.repo_secret_names()
+                    if names is not None:
+                        if "AVD_BACKUP_KEY" not in names:
+                            ok, detail = self.tools.set_github_secret(full_name, token, "AVD_BACKUP_KEY")
+                            notes.append("已初始化 AVD_BACKUP_KEY" if ok else f"备份密钥稍后初始化: {detail}")
+                        missing_ts = [x for x in ("TS_API_CLIENT_ID", "TS_API_CLIENT_SECRET") if x not in names]
+                        if missing_ts:
+                            notes.append("启动云机前还需配置: " + ", ".join(missing_ts))
+                    return full_name, branch, notes
+
+                def done(result: tuple[str, str, list[str]]) -> None:
+                    full_name, branch, notes = result
+                    if full_name not in self.repo_cache:
+                        self.repo_cache.insert(0, full_name)
+                    repo_combo["values"] = self.repo_cache
+                    v_repo.set(full_name)
+                    v_branch.set(branch)
+                    v_repo_status.set("；".join(notes))
+                    self.log("；".join(notes))
+                    dlg.destroy()
+
+                def failed(err: str) -> None:
+                    create_button.state(["!disabled"])
+                    v_create_status.set(f"创建失败：{err}")
+
+                self.bg("创建 GitHub 仓库", work, done, failed)
+
+            create_button = ttk.Button(buttons, text="创建仓库", command=submit_create)
+            create_button.pack(side="right", padx=(0, 8))
+            name_entry.focus_set()
+            dlg.bind("<Return>", lambda _e: submit_create())
+
+        def delete_selected_repo() -> None:
+            target = v_repo.get().strip().strip("/")
+            if "/" not in target:
+                messagebox.showerror(APP_NAME, "请先选择要删除的 owner/repo 仓库", parent=win)
+                return
+            refs = [p.phone_name for p in self.store.profiles if p.repo.lower() == target.lower()]
+            ref_text = f"\n\n当前有 {len(refs)} 个本地手机配置引用这个仓库。删除仓库不会自动删除这些手机配置。" if refs else ""
+            if not messagebox.askyesno(
+                APP_NAME,
+                f"永久删除 GitHub 仓库：\n{target}\n\n此操作不可撤销，Actions、Cache、备份和仓库内容都会一起删除。{ref_text}",
+                parent=win,
+            ):
+                return
+            typed = simpledialog.askstring(
+                "确认删除仓库",
+                f"请输入完整仓库名确认删除：\n{target}",
+                parent=win,
+            )
+            if typed is None:
+                return
+            if typed.strip() != target:
+                messagebox.showerror(APP_NAME, "输入的仓库名不一致，已取消删除。", parent=win)
+                return
+            try:
+                token = self._token()
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
+                return
+            v_repo_status.set(f"正在永久删除 {target}…")
+
+            def work() -> str:
+                try:
+                    GitHubAPI(target, token).delete_repository()
+                except RuntimeError as exc:
+                    text = str(exc)
+                    if "GitHub API 403" in text:
+                        raise RuntimeError(
+                            "当前 GitHub 授权没有删除仓库权限，或你不是该仓库管理员。需要带仓库删除权限的 GitHub 授权。"
+                        ) from exc
+                    raise
+                return target
+
+            def done(deleted: str) -> None:
+                self.repo_cache = [x for x in self.repo_cache if x.lower() != deleted.lower()]
+                repo_combo["values"] = self.repo_cache
+                v_repo.set("")
+                v_repo_status.set(f"已永久删除 {deleted}；请为这台手机重新选择仓库后保存")
+                self.log(f"已永久删除 GitHub 仓库: {deleted}")
+
+            self.bg("删除 GitHub 仓库", work, done, lambda err: v_repo_status.set(f"删除失败：{err}"))
+
+        ttk.Button(repo_box, text="读取我的仓库", command=load_repos).grid(row=0, column=2, padx=(5, 2))
+        ttk.Button(repo_box, text="＋ 创建仓库", command=create_repo_dialog).grid(row=0, column=3, padx=2)
+        ttk.Button(repo_box, text="删除仓库", command=delete_selected_repo).grid(row=0, column=4, padx=(2, 5))
         ttk.Label(repo_box, text="分支").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(repo_box, textvariable=v_branch).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=740).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=800).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         identity = ttk.LabelFrame(body, text="手机身份 / App", padding=10)
         identity.pack(fill="x", pady=(10, 0))
