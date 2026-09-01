@@ -115,10 +115,10 @@ jobs:
           case "$PHONE_ID" in
             ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
           esac
-          [[ "${PACKAGE_NAME:-}" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]] || { echo '::error::package_name is invalid'; exit 1; }
-          [[ "${DEVICE_MANUFACTURER:-}" =~ ^[A-Za-z0-9._+ -]*$ ]] || { echo '::error::device_manufacturer contains unsupported characters'; exit 1; }
-          [[ "${DEVICE_BRAND:-}" =~ ^[A-Za-z0-9._+-]*$ ]] || { echo '::error::device_brand contains unsupported characters'; exit 1; }
-          [[ "${DEVICE_MODEL:-}" =~ ^[A-Za-z0-9._+() -]*$ ]] || { echo '::error::device_model contains unsupported characters'; exit 1; }
+          printf '%s\n' "${PACKAGE_NAME:-}" | grep -Eq '^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$' || { echo '::error::package_name is invalid'; exit 1; }
+          printf '%s\n' "${DEVICE_MANUFACTURER:-}" | grep -Eq '^[A-Za-z0-9._+ -]*$' || { echo '::error::device_manufacturer contains unsupported characters'; exit 1; }
+          printf '%s\n' "${DEVICE_BRAND:-}" | grep -Eq '^[A-Za-z0-9._+-]*$' || { echo '::error::device_brand contains unsupported characters'; exit 1; }
+          printf '%s\n' "${DEVICE_MODEL:-}" | grep -Eq '^[A-Za-z0-9._+() -]*$' || { echo '::error::device_model contains unsupported characters'; exit 1; }
           if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then
             echo '::error::device_model requires device_manufacturer and device_brand'
             exit 1
