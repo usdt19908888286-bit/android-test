@@ -81,16 +81,12 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: fresh-direct-api35-pixel6-phone${{ inputs.phone_id || '001' }}
           cores: 4
           ram-size: 8192M
-          emulator-port: 5554
-          force-avd-creation: true
           disable-animations: false
           emulator-options: >-
             -no-snapshot
-            -no-metrics
-            -gpu swiftshader
+            -gpu swiftshader_indirect
             -noaudio
             -no-boot-anim
             -camera-back none
