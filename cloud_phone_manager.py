@@ -5481,49 +5481,67 @@ class CloudPhoneGUI:
 
         dlg = tk.Toplevel(self.root)
         dlg.title(f"自动化 · {cfg.phone_name}")
-        dlg.geometry("1000x650")
-        dlg.minsize(900, 590)
+        dlg.geometry("1080x760")
+        dlg.minsize(940, 680)
         dlg.transient(self.root)
 
         outer = ttk.Frame(dlg, padding=12)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=0)
+        outer.rowconfigure(3, weight=1)
 
         # ------------------------- 自动换机 -------------------------
-        rotation = ttk.LabelFrame(outer, text="自动换机", padding=9)
+        rotation = ttk.LabelFrame(outer, text="自动换机时间", padding=10)
         rotation.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        rotation.columnconfigure(1, weight=1)
+        rotation.columnconfigure(0, weight=1)
 
         v_rotate = tk.BooleanVar(value=cfg.auto_rotate)
         rotation_rules = list(cfg.rotate_rules or [])
         v_rule_type = tk.StringVar(value="每天时间点")
         v_rule_value = tk.StringVar(value="04:00")
+        v_rule_hint = tk.StringVar(value="格式 HH:MM，例如 04:30")
+        v_rule_count = tk.StringVar(value="")
         v_rotate_status = tk.StringVar(value=self._rotation_text(cfg))
 
-        ttk.Checkbutton(rotation, text="启用", variable=v_rotate).grid(row=0, column=0, sticky="w")
-        rules_list = tk.Listbox(rotation, height=2, exportselection=False)
-        rules_list.grid(row=0, column=1, rowspan=2, sticky="ew", padx=8)
+        rotation_head = ttk.Frame(rotation)
+        rotation_head.grid(row=0, column=0, sticky="ew")
+        rotation_head.columnconfigure(2, weight=1)
+        ttk.Checkbutton(rotation_head, text="启用自动换机", variable=v_rotate).grid(row=0, column=0, sticky="w")
+        ttk.Label(rotation_head, textvariable=v_rule_count).grid(row=0, column=1, sticky="w", padx=(14, 0))
+        ttk.Label(rotation_head, textvariable=v_rotate_status).grid(row=0, column=2, sticky="e", padx=(14, 0))
+
+        rules_box = ttk.Frame(rotation)
+        rules_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        rules_box.columnconfigure(0, weight=1)
+        ttk.Label(rules_box, text="已设置的执行时间 / 周期").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        rules_list = tk.Listbox(rules_box, height=6, exportselection=False)
+        rules_scroll = ttk.Scrollbar(rules_box, orient="vertical", command=rules_list.yview)
+        rules_list.configure(yscrollcommand=rules_scroll.set)
+        rules_list.grid(row=1, column=0, sticky="ew")
+        rules_scroll.grid(row=1, column=1, sticky="ns")
 
         rule_tools = ttk.Frame(rotation)
-        rule_tools.grid(row=0, column=2, sticky="e")
+        rule_tools.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        rule_tools.columnconfigure(5, weight=1)
+        ttk.Label(rule_tools, text="新增规则").grid(row=0, column=0, sticky="w")
         type_combo = ttk.Combobox(
             rule_tools,
             textvariable=v_rule_type,
             values=["每天时间点", "每 N 小时"],
             state="readonly",
-            width=12,
+            width=14,
         )
-        type_combo.pack(side="left")
-        ttk.Entry(rule_tools, textvariable=v_rule_value, width=9).pack(side="left", padx=(5, 0))
-        ttk.Button(rule_tools, text="添加", command=lambda: add_rotation_rule()).pack(side="left", padx=(5, 0))
-        ttk.Button(rule_tools, text="删除", command=lambda: remove_rotation_rule()).pack(side="left", padx=(5, 0))
+        type_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(rule_tools, text="时间 / 间隔").grid(row=0, column=2, sticky="w", padx=(14, 0))
+        ttk.Entry(rule_tools, textvariable=v_rule_value, width=10).grid(row=0, column=3, sticky="w", padx=(6, 0))
+        ttk.Label(rule_tools, textvariable=v_rule_hint).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Button(rule_tools, text="＋ 添加", command=lambda: add_rotation_rule()).grid(row=0, column=6, padx=(8, 0))
+        ttk.Button(rule_tools, text="删除选中", command=lambda: remove_rotation_rule()).grid(row=0, column=7, padx=(6, 0))
 
         rotate_actions = ttk.Frame(rotation)
-        rotate_actions.grid(row=1, column=2, sticky="e", pady=(5, 0))
+        rotate_actions.grid(row=3, column=0, sticky="e", pady=(8, 0))
         ttk.Button(rotate_actions, text="立即换机", command=lambda pid=profile_id: self.rotate_profile(pid)).pack(side="left")
-        ttk.Button(rotate_actions, text="保存", command=lambda: save_rotation()).pack(side="left", padx=(6, 0))
-        ttk.Label(rotation, textvariable=v_rotate_status).grid(row=1, column=0, sticky="w")
+        ttk.Button(rotate_actions, text="保存时间设置", command=lambda: save_rotation()).pack(side="left", padx=(6, 0))
 
         def rotation_rule_label(rule: str) -> str:
             if rule.startswith("time:"):
@@ -5533,8 +5551,9 @@ class CloudPhoneGUI:
 
         def render_rotation_rules() -> None:
             rules_list.delete(0, "end")
-            for item in rotation_rules:
-                rules_list.insert("end", rotation_rule_label(item))
+            for index, item in enumerate(rotation_rules, start=1):
+                rules_list.insert("end", f"{index:02d}.  {rotation_rule_label(item)}")
+            v_rule_count.set(f"已添加 {len(rotation_rules)} 条规则")
             preview = AppConfig.from_dict(cfg.to_dict())
             preview.auto_rotate = bool(v_rotate.get())
             preview.rotate_rules = list(rotation_rules)
@@ -5546,7 +5565,12 @@ class CloudPhoneGUI:
             v_rotate_status.set(self._rotation_text(preview))
 
         def rotation_type_changed(_event=None) -> None:
-            v_rule_value.set("04:00" if v_rule_type.get() == "每天时间点" else "4")
+            if v_rule_type.get() == "每天时间点":
+                v_rule_value.set("04:00")
+                v_rule_hint.set("格式 HH:MM，例如 04:30")
+            else:
+                v_rule_value.set("4")
+                v_rule_hint.set("1–168 小时")
 
         def add_rotation_rule() -> None:
             value = v_rule_value.get().strip()
@@ -5749,9 +5773,9 @@ class CloudPhoneGUI:
 
         # ------------------------- 统一自定义脚本 -------------------------
         script_box = ttk.LabelFrame(outer, text="启动 / 定时脚本", padding=9)
-        script_box.grid(row=3, column=0, sticky="ew")
+        script_box.grid(row=3, column=0, sticky="nsew")
         script_box.columnconfigure(0, weight=1)
-        script_box.rowconfigure(1, weight=0)
+        script_box.rowconfigure(1, weight=1)
 
         tasks = list(cfg.adb_tasks or [])
         first_task = tasks[0] if tasks else {}
@@ -5764,12 +5788,19 @@ class CloudPhoneGUI:
         }.get(common_trigger, "每次云机启动后")
 
         options = ttk.Frame(script_box)
-        options.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        options.columnconfigure(9, weight=1)
+        options.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        options.columnconfigure(5, weight=1)
         v_script_trigger = tk.StringVar(value=trigger_label)
         v_script_value = tk.StringVar(value=str(first_task.get("value") or ""))
         v_script_start_delay = tk.IntVar(value=int(first_task.get("delay_before") or 0))
         v_script_gap = tk.IntVar(value=int(first_task.get("delay_after") or 1))
+        v_script_hint = tk.StringVar(
+            value={
+                "每天固定时间": "格式 HH:MM，例如 04:30",
+                "每 N 分钟": "1–10080 分钟",
+                "每 N 小时": "1–168 小时",
+            }.get(trigger_label, "启动触发不需要填写时间")
+        )
         v_script_status = tk.StringVar(
             value=(
                 f"已加载 {len(tasks)} 条命令"
@@ -5778,26 +5809,42 @@ class CloudPhoneGUI:
             )
         )
 
-        ttk.Label(options, text="执行").grid(row=0, column=0, sticky="w")
+        ttk.Label(options, text="执行方式").grid(row=0, column=0, sticky="w")
         script_trigger_combo = ttk.Combobox(
             options,
             textvariable=v_script_trigger,
             values=["每次云机启动后", "每 N 分钟", "每 N 小时", "每天固定时间"],
             state="readonly",
-            width=14,
+            width=16,
         )
-        script_trigger_combo.grid(row=0, column=1, sticky="w", padx=(4, 10))
-        ttk.Label(options, text="时间/间隔").grid(row=0, column=2, sticky="w")
-        ttk.Entry(options, textvariable=v_script_value, width=10).grid(row=0, column=3, sticky="w", padx=(4, 10))
-        ttk.Label(options, text="启动等待").grid(row=0, column=4, sticky="w")
-        ttk.Spinbox(options, from_=0, to=600, textvariable=v_script_start_delay, width=6).grid(row=0, column=5, sticky="w", padx=(4, 3))
-        ttk.Label(options, text="秒").grid(row=0, column=6, sticky="w", padx=(0, 10))
-        ttk.Label(options, text="命令间隔").grid(row=0, column=7, sticky="w")
-        ttk.Spinbox(options, from_=0, to=60, textvariable=v_script_gap, width=5).grid(row=0, column=8, sticky="w", padx=(4, 3))
-        ttk.Label(options, text="秒").grid(row=0, column=9, sticky="w")
+        script_trigger_combo.grid(row=0, column=1, sticky="w", padx=(6, 14))
+        ttk.Label(options, text="时间 / 间隔").grid(row=0, column=2, sticky="w")
+        ttk.Entry(options, textvariable=v_script_value, width=11).grid(row=0, column=3, sticky="w", padx=(6, 8))
+        ttk.Label(options, textvariable=v_script_hint).grid(row=0, column=4, columnspan=2, sticky="w")
 
-        script_text = tk.Text(script_box, height=8, wrap="none")
-        script_text.grid(row=1, column=0, sticky="ew")
+        ttk.Label(options, text="启动后等待").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(options, from_=0, to=600, textvariable=v_script_start_delay, width=7).grid(
+            row=1, column=1, sticky="w", padx=(6, 14), pady=(8, 0)
+        )
+        ttk.Label(options, text="命令间隔").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Spinbox(options, from_=0, to=60, textvariable=v_script_gap, width=7).grid(
+            row=1, column=3, sticky="w", padx=(6, 8), pady=(8, 0)
+        )
+        ttk.Label(options, text="单位：秒；启动等待只用于“每次云机启动后”的第一条命令").grid(
+            row=1, column=4, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        text_shell = ttk.Frame(script_box)
+        text_shell.grid(row=1, column=0, sticky="nsew")
+        text_shell.columnconfigure(0, weight=1)
+        text_shell.rowconfigure(0, weight=1)
+        script_text = tk.Text(text_shell, height=10, wrap="none")
+        script_y = ttk.Scrollbar(text_shell, orient="vertical", command=script_text.yview)
+        script_x = ttk.Scrollbar(text_shell, orient="horizontal", command=script_text.xview)
+        script_text.configure(yscrollcommand=script_y.set, xscrollcommand=script_x.set)
+        script_text.grid(row=0, column=0, sticky="nsew")
+        script_y.grid(row=0, column=1, sticky="ns")
+        script_x.grid(row=1, column=0, sticky="ew")
         if tasks:
             script_text.insert("1.0", "\n".join(str(task.get("command") or "") for task in tasks))
 
@@ -5836,12 +5883,16 @@ class CloudPhoneGUI:
             label = v_script_trigger.get()
             if label == "每天固定时间":
                 v_script_value.set("04:00")
+                v_script_hint.set("格式 HH:MM，例如 04:30")
             elif label == "每 N 分钟":
                 v_script_value.set("30")
+                v_script_hint.set("1–10080 分钟")
             elif label == "每 N 小时":
                 v_script_value.set("4")
+                v_script_hint.set("1–168 小时")
             else:
                 v_script_value.set("")
+                v_script_hint.set("启动触发不需要填写时间")
 
         def save_script() -> None:
             lines: list[str] = []
