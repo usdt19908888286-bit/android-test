@@ -3242,73 +3242,171 @@ class CloudPhoneGUI:
     def api_for(self, cfg: AppConfig) -> GitHubAPI:
         return GitHubAPI(cfg.repo, self._token_for(cfg))
 
-    def _reauthorize_profile_github(
+    def _upgrade_global_github_permissions(
         self,
-        cfg: AppConfig,
         on_success: Optional[Callable[[], None]] = None,
-        force_new_account: bool = False,
     ) -> None:
-        """Reauthorize the GitHub identity this phone is already configured to use.
+        """Upgrade the one shared global GitHub authorization in-place.
 
-        Locked independent phones must reauthorize the same account; this helper never
-        silently falls back to the global GitHub identity. For global authorization,
-        ``force_new_account`` opens a fresh login so the user can switch to an account
-        that actually owns/administers the target repository.
+        This never creates a phone-specific credential. The active global account is
+        preserved and `gh auth refresh` is used only to add manager-required scopes.
+        Once upgraded, every phone that uses global GitHub immediately shares it.
         """
+        expected_account = self.tools.github_account().strip()
+        if not expected_account:
+            messagebox.showerror(APP_NAME, "当前没有可升级的全局 GitHub 登录，请先完成全局 GitHub 授权。", parent=self.root)
+            return
+
         self._show_github_login_dialog()
         status_var = getattr(self, "_github_login_status_var", None)
-        independent = bool(getattr(cfg, "github_independent", False))
-        locked = bool(getattr(cfg, "github_independent_locked", False))
-        expected_account = self._github_account_for(cfg) if independent and locked else ""
         if status_var:
-            target = f"独立 GitHub @{expected_account}" if expected_account else ("独立 GitHub" if independent else "全局 GitHub")
-            action = "切换/重新授权" if force_new_account and not independent else "重新授权"
-            status_var.set(f"正在{action} {target}；不会自动打开浏览器")
+            status_var.set(
+                f"正在升级全局 GitHub @{expected_account} 的删除权限；账号不变，所有全局手机共享生效"
+            )
 
         def work() -> tuple[bool, str, str, str]:
-            if independent:
-                ok, detail, account, token = self.tools.github_login_isolated()
-                if ok and expected_account and account.lower() != expected_account.lower():
-                    return (
-                        False,
-                        f"此手机已锁定独立 GitHub @{expected_account}，不能改绑 @{account}。请重新授权 @{expected_account}。",
-                        "",
-                        "",
-                    )
-                return ok, detail, account, token
-
-            ok, detail = self.tools.github_login(force_new_account=force_new_account)
+            ok, detail = self.tools.github_login(force_new_account=False)
             if not ok:
                 return False, detail, "", ""
-            account = self.tools.github_account()
-            token = self.tools.github_auth_token()
+            account = self.tools.github_account().strip()
+            token = self.tools.github_auth_token().strip()
+            if not account or not token:
+                return False, "全局 GitHub 授权完成但没有读取到账号或 Token", "", ""
+            if account.lower() != expected_account.lower():
+                return (
+                    False,
+                    f"全局 GitHub 账号发生变化：原 @{expected_account}，当前 @{account}。权限升级已停止。",
+                    "",
+                    "",
+                )
+            scopes = self.tools.github_token_scopes(token)
+            if scopes and "delete_repo" not in scopes:
+                return False, "全局 GitHub 授权仍缺少 delete_repo，请再次完成 GitHub 授权。", "", ""
+            return True, detail, account, token
+
+        def done(result: tuple[bool, str, str, str]) -> None:
+            ok, detail, account, token = result
+            current_status = getattr(self, "_github_login_status_var", None)
+            if current_status:
+                current_status.set("全局权限升级完成" if ok else detail)
+            if not ok:
+                self.log(f"全局 GitHub 权限升级失败 · {detail}")
+                return
+
+            self.var_token.set(token)
+            self.var_github_status.set(f"GitHub: 已登录 @{account}")
+            self._github_auth_invalid = False
+            self._github_auth_last_alert = 0.0
+            self._github_auth_last_check = time.time()
+            self.log(
+                f"全局 GitHub @{account} 权限已升级；所有使用全局 GitHub 的手机立即共享生效"
+            )
+            if on_success:
+                self.root.after(400, on_success)
+
+        self.bg("升级全局 GitHub 权限", work, done)
+
+    def _switch_global_github_account(
+        self,
+        on_success: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Switch the shared global GitHub account after an explicit warning."""
+        previous_account = self.tools.github_account().strip()
+        self._show_github_login_dialog()
+        status_var = getattr(self, "_github_login_status_var", None)
+        if status_var:
+            status_var.set(
+                "正在切换全局 GitHub 账号；切换后所有未使用独立 GitHub 的手机都会使用新账号"
+            )
+
+        def work() -> tuple[bool, str, str, str]:
+            ok, detail = self.tools.github_login(force_new_account=True)
+            if not ok:
+                return False, detail, "", ""
+            account = self.tools.github_account().strip()
+            token = self.tools.github_auth_token().strip()
             if not account or not token:
                 return False, "GitHub 授权完成但没有读取到账号或 Token", "", ""
             return True, detail, account, token
 
         def done(result: tuple[bool, str, str, str]) -> None:
             ok, detail, account, token = result
-            self.log(f"{cfg.phone_name}: GitHub 重新授权 · {detail}")
+            current_status = getattr(self, "_github_login_status_var", None)
+            if current_status:
+                current_status.set("全局账号切换完成" if ok else detail)
+            if not ok:
+                self.log(f"全局 GitHub 账号切换失败 · {detail}")
+                return
+
+            self.var_token.set(token)
+            self.var_github_status.set(f"GitHub: 已登录 @{account}")
+            self._github_auth_invalid = False
+            self._github_auth_last_alert = 0.0
+            self._github_auth_last_check = time.time()
+            before = f"@{previous_account}" if previous_account else "未登录"
+            self.log(
+                f"全局 GitHub 已从 {before} 切换为 @{account}；所有全局 GitHub 手机立即使用新账号"
+            )
+            if on_success:
+                self.root.after(400, on_success)
+
+        self.bg("切换全局 GitHub 账号", work, done)
+
+    def _reauthorize_profile_github(
+        self,
+        cfg: AppConfig,
+        on_success: Optional[Callable[[], None]] = None,
+        force_new_account: bool = False,
+    ) -> None:
+        """Reauthorize the GitHub identity configured for this phone.
+
+        Global GitHub is never turned into a phone-specific authorization here: scope
+        upgrades and account switches are delegated to the one shared global login.
+        Independent GitHub stays isolated and, once locked, must keep the same account.
+        """
+        independent = bool(getattr(cfg, "github_independent", False))
+        if not independent:
+            if force_new_account:
+                self._switch_global_github_account(on_success)
+            else:
+                self._upgrade_global_github_permissions(on_success)
+            return
+
+        self._show_github_login_dialog()
+        status_var = getattr(self, "_github_login_status_var", None)
+        locked = bool(getattr(cfg, "github_independent_locked", False))
+        expected_account = self._github_account_for(cfg) if locked else ""
+        if status_var:
+            target = f"独立 GitHub @{expected_account}" if expected_account else "独立 GitHub"
+            status_var.set(f"正在重新授权 {target}；不会自动打开浏览器")
+
+        def work() -> tuple[bool, str, str, str]:
+            ok, detail, account, token = self.tools.github_login_isolated()
+            if ok and expected_account and account.lower() != expected_account.lower():
+                return (
+                    False,
+                    f"此手机已锁定独立 GitHub @{expected_account}，不能改绑 @{account}。请重新授权 @{expected_account}。",
+                    "",
+                    "",
+                )
+            return ok, detail, account, token
+
+        def done(result: tuple[bool, str, str, str]) -> None:
+            ok, detail, account, token = result
+            self.log(f"{cfg.phone_name}: 独立 GitHub 重新授权 · {detail}")
             current_status = getattr(self, "_github_login_status_var", None)
             if current_status:
                 current_status.set("授权完成" if ok else detail)
             if not ok:
                 return
 
-            if independent:
-                self.global_secrets.save_github_profile(cfg.profile_id, account, token)
-                cfg.github_account = account
-                self.store.upsert(cfg)
-            else:
-                self.var_token.set(token)
-                self.var_github_status.set(f"GitHub: 已登录 @{account}")
-                self._github_auth_invalid = False
-                self._github_auth_last_alert = 0.0
-
+            self.global_secrets.save_github_profile(cfg.profile_id, account, token)
+            cfg.github_account = account
+            self.store.upsert(cfg)
             if on_success:
                 self.root.after(400, on_success)
 
-        self.bg(f"{cfg.phone_name} GitHub 重新授权", work, done)
+        self.bg(f"{cfg.phone_name} 独立 GitHub 重新授权", work, done)
 
     def refresh_github_auth(self) -> None:
         if self._github_auth_checking:
@@ -3347,6 +3445,9 @@ class CloudPhoneGUI:
                 account = out.strip()
                 token = self.tools.github_auth_token()
                 if token:
+                    scopes = self.tools.github_token_scopes(token)
+                    if scopes and "delete_repo" not in scopes:
+                        return account, token, True, "valid_limited", "缺少 delete_repo"
                     return account, token, True, "valid", ""
                 return account, "", True, "invalid", "GitHub token 不可用"
 
@@ -3367,12 +3468,13 @@ class CloudPhoneGUI:
             self._github_auth_checking = False
             self._github_auth_last_check = time.time()
             account, token, has_cli, state, detail = result
-            if state == "valid" and account and token:
+            if state in ("valid", "valid_limited") and account and token:
                 was_invalid = self._github_auth_invalid
                 self._github_auth_invalid = False
                 self._github_auth_last_alert = 0.0
                 self.var_token.set(token)
-                self.var_github_status.set(f"GitHub: 已登录 @{account}")
+                suffix = " · 删除权限待升级" if state == "valid_limited" else ""
+                self.var_github_status.set(f"GitHub: 已登录 @{account}{suffix}")
                 if was_invalid:
                     self.log("GitHub 授权已恢复")
                 return
@@ -5122,18 +5224,32 @@ class CloudPhoneGUI:
                 self._set_card(profile_id, "run", f"完全删除失败：{err}")
                 if err.startswith("DELETE_AUTH_CHANGED|"):
                     detail = err.split("|", 1)[1]
+                    if independent:
+                        retry = messagebox.askyesno(
+                            APP_NAME,
+                            "GitHub 仓库没有删除成功，因此本地手机配置和凭据仍保留。\n\n"
+                            + detail
+                            + "\n\n是否重新授权这台手机的独立 GitHub？授权后会重新检查权限。",
+                            parent=self.root,
+                        )
+                        if retry:
+                            self._reauthorize_profile_github(
+                                cfg,
+                                lambda pid=profile_id: self.delete_profile_completely(pid),
+                            )
+                        return
+
                     retry = messagebox.askyesno(
                         APP_NAME,
                         "GitHub 仓库没有删除成功，因此本地手机配置和凭据仍保留。\n\n"
                         + detail
-                        + "\n\n是否立即重新授权这个 GitHub 身份？授权完成后会重新检查权限。",
+                        + "\n\n是否重新验证/升级共享的全局 GitHub 权限？这不会创建手机独立授权，"
+                        "所有使用全局 GitHub 的手机仍共享同一套账号和权限。",
                         parent=self.root,
                     )
                     if retry:
-                        self._reauthorize_profile_github(
-                            cfg,
-                            lambda pid=profile_id: self.delete_profile_completely(pid),
-                            force_new_account=not independent,
+                        self._upgrade_global_github_permissions(
+                            lambda pid=profile_id: self.delete_profile_completely(pid)
                         )
                     return
                 messagebox.showerror(
@@ -5177,20 +5293,38 @@ class CloudPhoneGUI:
 
             if not has_delete_scope:
                 self._set_operation_progress(profile_id, "完全删除：GitHub 授权缺少 delete_repo", 5.0, True)
-                self._set_card(profile_id, "run", "完全删除：需要重新授权 GitHub")
+                self._set_card(profile_id, "run", "完全删除：需要升级 GitHub 删除权限")
+                if independent:
+                    retry = messagebox.askyesno(
+                        APP_NAME,
+                        (
+                            f"这台手机的独立 GitHub @{account} 可以访问 {cfg.repo}，"
+                            "但独立 Token 缺少 delete_repo 权限。\n\n"
+                            "是否重新授权这台手机的独立 GitHub？授权后只影响这台手机。"
+                        ),
+                        parent=self.root,
+                    )
+                    if retry:
+                        self._reauthorize_profile_github(
+                            cfg,
+                            lambda pid=profile_id: self.delete_profile_completely(pid),
+                        )
+                    return
+
                 retry = messagebox.askyesno(
                     APP_NAME,
                     (
-                        f"当前 {auth_mode} @{account} 可以访问 {cfg.repo}，但授权 Token 缺少 delete_repo 权限。\n\n"
-                        "这是旧授权常见情况，不是仓库本身损坏。\n"
-                        "是否立即重新授权？授权成功后会重新检查删除权限。"
+                        f"当前全局 GitHub @{account} 账号本身正确，并且对 {cfg.repo} 有访问权限，"
+                        "只是旧的全局 Token 缺少 delete_repo 权限。\n\n"
+                        "只需要升级一次全局 GitHub 权限。升级成功后，所有未勾选“独立 GitHub”的手机都会立即共享新权限，"
+                        "以后完全删除其他全局手机不需要再次授权。\n\n"
+                        "是否现在升级全局 GitHub 删除权限？"
                     ),
                     parent=self.root,
                 )
                 if retry:
-                    self._reauthorize_profile_github(
-                        cfg,
-                        lambda pid=profile_id: self.delete_profile_completely(pid),
+                    self._upgrade_global_github_permissions(
+                        lambda pid=profile_id: self.delete_profile_completely(pid)
                     )
                 return
 
@@ -5210,20 +5344,35 @@ class CloudPhoneGUI:
                     )
                     return
 
+                if independent:
+                    retry = messagebox.askyesno(
+                        APP_NAME,
+                        (
+                            f"当前独立 GitHub @{account} 对仓库 {cfg.repo} 没有 Admin 权限。\n\n"
+                            "是否重新授权这台尚未锁定的独立 GitHub？"
+                        ),
+                        parent=self.root,
+                    )
+                    if retry:
+                        self._reauthorize_profile_github(
+                            cfg,
+                            lambda pid=profile_id: self.delete_profile_completely(pid),
+                        )
+                    return
+
                 retry = messagebox.askyesno(
                     APP_NAME,
                     (
-                        f"当前 {auth_mode} @{account} 对仓库 {cfg.repo} 没有 Admin 权限。\n\n"
-                        "GitHub 只有仓库管理员才能永久删除仓库。\n"
-                        "是否立即重新授权/切换到有 Admin 权限的 GitHub 账号？"
+                        f"当前全局 GitHub @{account} 对仓库 {cfg.repo} 没有 Admin 权限。\n\n"
+                        "如果切换全局 GitHub 账号，所有未勾选“独立 GitHub”的手机都会一起改用新账号。\n"
+                        "只有确认要整体切换全局账号时才继续。\n\n"
+                        "是否切换全局 GitHub 到有该仓库 Admin 权限的账号？"
                     ),
                     parent=self.root,
                 )
                 if retry:
-                    self._reauthorize_profile_github(
-                        cfg,
-                        lambda pid=profile_id: self.delete_profile_completely(pid),
-                        force_new_account=not independent,
+                    self._switch_global_github_account(
+                        lambda pid=profile_id: self.delete_profile_completely(pid)
                     )
                 return
 
