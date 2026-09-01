@@ -41,6 +41,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 APP_NAME = "Cloud Android Manager"
 CONFIG_PATH = Path.home() / ".cloud_android_manager.json"
 GLOBAL_SECRET_PATH = Path.home() / ".cloud_android_manager_secrets.json"
+HEALTH_LOG_DIR = Path.home() / ".cloud_android_manager_health"
 DEFAULT_PACKAGE = "com.temperaturecoin"
 DEFAULT_APK_URL = (
     "https://github.com/usdt19908888286-bit/android-test/releases/download/"
@@ -2252,6 +2253,136 @@ class CloudPhoneGUI:
         self.log_text.insert("end", f"[{stamp}] {text}\n")
         self.log_text.see("end")
 
+    @staticmethod
+    def _health_log_path(cfg: AppConfig) -> Path:
+        return HEALTH_LOG_DIR / f"{cfg.profile_id}.log"
+
+    @staticmethod
+    def _health_flag(value: Any) -> str:
+        return "OK" if bool(value) else "异常"
+
+    def _append_health_log(self, cfg: AppConfig, event: str, data: Optional[dict[str, Any]] = None) -> Path:
+        """Append one compact persistent health record for a phone."""
+        payload = dict(data or {})
+        path = self._health_log_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        event = str(event or "check")
+
+        if event == "check":
+            processes = payload.get("processes") if isinstance(payload.get("processes"), dict) else {}
+            process_text = ", ".join(
+                f"{pkg}={'运行' if bool(running) else '未运行'}"
+                for pkg, running in processes.items()
+            ) or "-"
+            whitelist = payload.get("whitelist") if isinstance(payload.get("whitelist"), dict) else {}
+            whitelist_text = ", ".join(
+                f"{pkg}={'OK' if bool(present) else '缺失'}"
+                for pkg, present in whitelist.items()
+            ) or "-"
+            repairs: list[str] = []
+            if payload.get("freezer_repaired"):
+                repairs.append("cached_apps_freezer")
+            repairs.extend(f"白名单:{pkg}" for pkg in (payload.get("whitelist_repaired") or []))
+            issues = [str(item) for item in (payload.get("issues") or []) if str(item).strip()]
+            verdict = "健康" if bool(payload.get("ok")) else "异常"
+            line = (
+                f"[{stamp}] 巡检 {verdict} | ADB={self._health_flag(payload.get('adb'))}"
+                f" | 进程={process_text}"
+                f" | Frozen={'是' if payload.get('bicoin_frozen') else '否'}"
+                f" | Net={payload.get('netpolicy') or 'UNKNOWN'}"
+                f" | Freezer={payload.get('freezer') or 'UNKNOWN'}"
+                f" | 白名单={whitelist_text}"
+                f" | 通知权限={self._health_flag(payload.get('notification_listener'))}"
+                f" | listenerConnected={self._health_flag(payload.get('listener_connected'))}"
+            )
+            if repairs:
+                line += " | 修复=" + ", ".join(repairs)
+            if issues:
+                line += " | 原因=" + "；".join(issues)
+        elif event == "bootstrap":
+            started = [str(item) for item in (payload.get("started") or []) if str(item).strip()]
+            errors = [str(item) for item in (payload.get("errors") or []) if str(item).strip()]
+            line = f"[{stamp}] 上线初始化 {'成功' if bool(payload.get('ok')) else '部分异常'}"
+            if started:
+                line += " | 启动缺失进程=" + ", ".join(started)
+            if errors:
+                line += " | 错误=" + "；".join(errors)
+        else:
+            line = f"[{stamp}] {event}"
+            if payload:
+                line += " | " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(line + "\n")
+
+        # Keep the log useful without allowing it to grow forever.
+        try:
+            if path.stat().st_size > 2_000_000:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                path.write_text("\n".join(lines[-1500:]) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        return path
+
+    def open_health_log(self, profile_id: str) -> None:
+        cfg = self.store.get(profile_id)
+        if not cfg:
+            return
+        path = self._health_log_path(cfg)
+        win = tk.Toplevel(self.root)
+        win.title(f"健康日志 · {cfg.phone_name}")
+        win.geometry("820x520")
+        win.minsize(680, 420)
+        win.transient(self.root)
+
+        outer = ttk.Frame(win, padding=10)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        ttk.Label(outer, text=str(path), font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", pady=(0, 7))
+
+        text = tk.Text(outer, wrap="none", font=("Consolas", 9))
+        text.grid(row=1, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(outer, orient="vertical", command=text.yview)
+        yscroll.grid(row=1, column=1, sticky="ns")
+        text.configure(yscrollcommand=yscroll.set)
+
+        def refresh_log() -> None:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else "暂无健康检查记录。\n"
+            except Exception as exc:
+                content = f"读取日志失败：{exc}\n"
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", content)
+            text.see("end")
+            text.configure(state="disabled")
+
+        def copy_log() -> None:
+            content = text.get("1.0", "end-1c")
+            self._copy_to_clipboard(content)
+            self.log(f"{cfg.phone_name}: 健康日志已复制")
+
+        def clear_log() -> None:
+            if not messagebox.askyesno(APP_NAME, "清空这台手机的健康日志？", parent=win):
+                return
+            try:
+                path.unlink(missing_ok=True)
+            except TypeError:
+                if path.exists():
+                    path.unlink()
+            refresh_log()
+            self.log(f"{cfg.phone_name}: 健康日志已清空")
+
+        actions = ttk.Frame(outer)
+        actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(actions, text="刷新", command=refresh_log).pack(side="left")
+        ttk.Button(actions, text="复制全部", command=copy_log).pack(side="left", padx=(6, 0))
+        ttk.Button(actions, text="清空", command=clear_log).pack(side="left", padx=(6, 0))
+        ttk.Button(actions, text="关闭", command=win.destroy).pack(side="left", padx=(6, 0))
+        refresh_log()
+
 
     def _emit_notification(
         self,
@@ -4064,6 +4195,10 @@ class CloudPhoneGUI:
             if bootstrap_key:
                 # One attempt per ADB-online generation. Runtime health checks never restart apps.
                 self._health_bootstrap_done[profile_id] = bootstrap_key
+                try:
+                    self._append_health_log(cfg, "bootstrap", bootstrap)
+                except Exception as exc:
+                    self.log(f"{cfg.phone_name}: 健康日志写入失败 · {exc}")
                 started = list(bootstrap.get("started") or [])
                 errors = list(bootstrap.get("errors") or [])
                 if started:
@@ -4118,6 +4253,10 @@ class CloudPhoneGUI:
         cfg.health_last_ts = now
         self._last_health[cfg.profile_id] = now
         previous = cfg.health_last_status
+        try:
+            self._append_health_log(cfg, "check", local_health)
+        except Exception as exc:
+            self.log(f"{cfg.phone_name}: 健康日志写入失败 · {exc}")
 
         repaired: list[str] = []
         if local_health.get("freezer_repaired"):
@@ -4583,6 +4722,7 @@ class CloudPhoneGUI:
         health_actions = ttk.Frame(health_box)
         health_actions.grid(row=3, column=0, columnspan=4, sticky="e", pady=(7, 0))
         ttk.Button(health_actions, text="查看规则", command=show_health_rules).pack(side="left")
+        ttk.Button(health_actions, text="健康日志", command=lambda pid=profile_id: self.open_health_log(pid)).pack(side="left", padx=(6, 0))
         ttk.Button(health_actions, text="立即检查", command=check_health_now).pack(side="left", padx=(6, 0))
         ttk.Button(health_actions, text="保存", command=save_health_monitor).pack(side="left", padx=(6, 0))
 
