@@ -1805,17 +1805,25 @@ class LocalTools:
         return code == 0, f"{rendered}\n{text}".strip()
 
     def github_auth_token(self) -> str:
-        """Read the already-authorized gh token into process memory only."""
+        """Read the token for gh's currently active, explicitly authorized account.
+
+        Ignore inherited GH_TOKEN/GITHUB_TOKEN variables so a stale process or
+        machine-level token cannot override the account selected by `gh auth login`.
+        """
         if not self.gh:
             return ""
         try:
+            env = os.environ.copy()
+            env.pop("GH_TOKEN", None)
+            env.pop("GITHUB_TOKEN", None)
             cp = subprocess.run(
-                [self.gh, "auth", "token"],
+                [self.gh, "auth", "token", "--hostname", "github.com"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=10,
+                env=env,
                 creationflags=CREATE_NO_WINDOW,
             )
             if cp.returncode == 0:
@@ -1913,17 +1921,34 @@ class LocalTools:
             return False, f"GitHub CLI 自动安装失败：{exc}；winget 信息：{winget_detail}"
 
     def github_account(self) -> str:
+        """Return gh's active authenticated account without env-token override."""
         if not self.gh:
             return ""
-        code, out, _ = self.run([self.gh, "api", "user", "--jq", ".login"], timeout=15)
-        return out.strip() if code == 0 else ""
+        try:
+            env = os.environ.copy()
+            env.pop("GH_TOKEN", None)
+            env.pop("GITHUB_TOKEN", None)
+            cp = subprocess.run(
+                [self.gh, "api", "user", "--jq", ".login"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return cp.stdout.strip() if cp.returncode == 0 else ""
+        except Exception:
+            return ""
 
     def github_login(self) -> tuple[bool, str]:
-        """Run GitHub device authorization without opening a browser automatically.
+        """Run GitHub device authorization without inherited token override.
 
         GitHub CLI generates the one-time code and copies it to the clipboard. The
         GUI shows https://github.com/login/device and lets the user decide whether
-        to open/copy it.
+        to open/copy it. Any inherited GH_TOKEN/GITHUB_TOKEN is removed so the
+        account authorized in this flow becomes the account used by the manager.
         """
         installed_now = False
         if not self.gh:
@@ -1932,14 +1957,14 @@ class LocalTools:
                 return False, detail
             installed_now = True
         try:
-            # gh normally opens the browser during --web login. Route that request
-            # into a no-op batch file instead; the GUI exposes the login URL.
             helper_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CloudAndroidManager"
             helper_dir.mkdir(parents=True, exist_ok=True)
             helper = helper_dir / "no_browser.cmd"
             helper.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
 
             env = os.environ.copy()
+            env.pop("GH_TOKEN", None)
+            env.pop("GITHUB_TOKEN", None)
             env["GH_BROWSER"] = f'cmd.exe /d /c "{helper}"'
             cp = subprocess.run(
                 [
@@ -1963,10 +1988,11 @@ class LocalTools:
                 creationflags=CREATE_NO_WINDOW,
             )
             account = self.github_account()
-            if cp.returncode == 0 and account:
+            token = self.github_auth_token()
+            if cp.returncode == 0 and account and token:
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
-                return True, prefix + f"已登录 @{account}"
-            return False, "GitHub 授权未完成或已取消"
+                return True, prefix + f"已登录 @{account}；后续操作将使用此账号"
+            return False, "GitHub 授权未完成、未切换到新账号或已取消"
         except subprocess.TimeoutExpired:
             return False, "GitHub 授权超时"
         except Exception as exc:
@@ -1975,10 +2001,23 @@ class LocalTools:
     def github_logout(self) -> tuple[bool, str]:
         if not self.gh:
             return False, "未找到 GitHub CLI (gh.exe)"
-        code, out, err = self.run(
-            [self.gh, "auth", "logout", "--hostname", "github.com"], timeout=30
-        )
-        return code == 0, out or err or "已退出 GitHub"
+        try:
+            env = os.environ.copy()
+            env.pop("GH_TOKEN", None)
+            env.pop("GITHUB_TOKEN", None)
+            cp = subprocess.run(
+                [self.gh, "auth", "logout", "--hostname", "github.com"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return cp.returncode == 0, cp.stdout or cp.stderr or "已退出 GitHub"
+        except Exception as exc:
+            return False, str(exc)
 
     def set_github_secret(
         self,
@@ -2575,12 +2614,13 @@ class CloudPhoneGUI:
 
     # ------------------------- GitHub auth -------------------------
     def _token(self) -> str:
-        token = (
-            os.environ.get("GH_TOKEN")
-            or os.environ.get("GITHUB_TOKEN")
-            or self.var_token.get().strip()
-            or self.tools.github_auth_token()
-        )
+        """Return the token for the account authorized inside this manager.
+
+        Do not read GH_TOKEN/GITHUB_TOKEN from the parent environment here. Those
+        variables may belong to an old shell/account and must never override the
+        account selected by the GUI's GitHub device-login flow.
+        """
+        token = self.var_token.get().strip() or self.tools.github_auth_token()
         if not token:
             raise RuntimeError("请先完成 GitHub 授权登录")
         self.var_token.set(token)
@@ -2599,7 +2639,28 @@ class CloudPhoneGUI:
             if not found:
                 return "", "", False, "missing", "GitHub CLI 未安装"
             self.tools.gh = found
-            code, out, err = self.tools.run([found, "api", "user", "--jq", ".login"], timeout=15)
+
+            # Always inspect gh's explicitly authorized active account. Inherited
+            # GH_TOKEN/GITHUB_TOKEN may belong to an old shell/account and must not
+            # override the account selected through the GUI login flow.
+            env = os.environ.copy()
+            env.pop("GH_TOKEN", None)
+            env.pop("GITHUB_TOKEN", None)
+            try:
+                cp = subprocess.run(
+                    [found, "api", "user", "--jq", ".login"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                    env=env,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                code, out, err = cp.returncode, cp.stdout, cp.stderr
+            except subprocess.TimeoutExpired:
+                return "", "", True, "network", "GitHub 授权验证超时"
+
             detail = (err or out or "").strip()
             if code == 0 and out.strip():
                 account = out.strip()
