@@ -11,7 +11,7 @@ on:
       apk_url:
         description: APK URL installed automatically after boot
         required: false
-        default: 'https://bcoin666.com/app-release.apk'
+        default: 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk'
         type: string
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
-      APK_URL: ${{ inputs.apk_url || 'https://bcoin666.com/app-release.apk' }}
+      APK_URL: ${{ inputs.apk_url || 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,7 +123,9 @@ jobs:
               "$APK_URL" -o /tmp/app-release.apk
             test -s /tmp/app-release.apk
             unzip -tq /tmp/app-release.apk >/dev/null
-            echo "APK_SHA256=$(sha256sum /tmp/app-release.apk | awk '{print $1}')"
+            APK_SHA256=$(sha256sum /tmp/app-release.apk | awk '{print $1}')
+            echo "APK_SHA256=$APK_SHA256"
+            test "$APK_SHA256" = "e8d17669d0f5802bec9b0d0e90e5cab2fb92796c7d275cae624b530b0ddb6e05"
             echo "APK_SIZE=$(stat -c%s /tmp/app-release.apk)"
 
             adb install -r -g /tmp/app-release.apk
