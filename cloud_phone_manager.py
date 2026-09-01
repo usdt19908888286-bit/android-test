@@ -72,13 +72,14 @@ class AppConfig:
     auto_refresh: bool = True
     refresh_seconds: int = 8
 
-    # Automatic phone rotation. The GUI requests a cold full-AVD backup from
-    # the old Runner, waits until GitHub confirms the backup was saved, then
-    # starts a fresh Runner in restore mode with the same phone_id.
+    # Automatic phone rotation. Multiple rules can coexist, for example:
+    # ["time:04:00", "time:12:30", "hours:4"]. The earliest upcoming
+    # occurrence wins. Legacy single-rule fields are retained for migration.
     auto_rotate: bool = False
-    rotate_mode: str = "interval"  # interval | daily
-    rotate_interval_hours: int = 4
-    rotate_daily_time: str = "04:00"
+    rotate_rules: list[str] = field(default_factory=list)
+    rotate_mode: str = "interval"  # legacy: interval | daily
+    rotate_interval_hours: int = 4  # legacy
+    rotate_daily_time: str = "04:00"  # legacy
     rotate_next_ts: float = 0.0
     rotate_last_ts: float = 0.0
     rotation_phase: str = ""  # "" | waiting_backup
@@ -91,7 +92,6 @@ class AppConfig:
         cfg = cls()
         valid = set(asdict(cfg))
         for key, value in data.items():
-            # migration from the previous single-phone configuration
             if key in valid:
                 setattr(cfg, key, value)
         if not cfg.profile_id:
@@ -102,14 +102,39 @@ class AppConfig:
             cfg.package_history.insert(0, cfg.package_name)
         if DEFAULT_PACKAGE not in cfg.package_history:
             cfg.package_history.append(DEFAULT_PACKAGE)
+
         if cfg.rotate_mode not in ("interval", "daily"):
             cfg.rotate_mode = "interval"
         try:
-            cfg.rotate_interval_hours = max(1, int(cfg.rotate_interval_hours))
+            cfg.rotate_interval_hours = max(1, min(168, int(cfg.rotate_interval_hours)))
         except Exception:
             cfg.rotate_interval_hours = 4
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(cfg.rotate_daily_time)):
             cfg.rotate_daily_time = "04:00"
+
+        raw_rules = cfg.rotate_rules if isinstance(cfg.rotate_rules, list) else []
+        clean_rules: list[str] = []
+        for raw in raw_rules:
+            rule = str(raw).strip().lower()
+            if re.fullmatch(r"time:(?:[01]\d|2[0-3]):[0-5]\d", rule):
+                if rule not in clean_rules:
+                    clean_rules.append(rule)
+                continue
+            match = re.fullmatch(r"hours:(\d{1,3})", rule)
+            if match:
+                hours = int(match.group(1))
+                if 1 <= hours <= 168:
+                    normalized = f"hours:{hours}"
+                    if normalized not in clean_rules:
+                        clean_rules.append(normalized)
+
+        # Migrate the previous single-rule scheduler automatically.
+        if not clean_rules:
+            if cfg.rotate_mode == "daily":
+                clean_rules = [f"time:{cfg.rotate_daily_time}"]
+            else:
+                clean_rules = [f"hours:{cfg.rotate_interval_hours}"]
+        cfg.rotate_rules = clean_rules
         return cfg
 
     def to_dict(self) -> dict[str, Any]:
@@ -1024,29 +1049,56 @@ class CloudPhoneGUI:
 
     def _next_rotation_ts(self, cfg: AppConfig, now_ts: Optional[float] = None) -> float:
         now_ts = float(now_ts or time.time())
-        if cfg.rotate_mode == "daily":
-            match = re.fullmatch(r"(\d{2}):(\d{2})", cfg.rotate_daily_time or "")
-            hour = int(match.group(1)) if match else 4
-            minute = int(match.group(2)) if match else 0
-            now_local = dt.datetime.fromtimestamp(now_ts)
-            target = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target.timestamp() <= now_ts + 1:
-                target += dt.timedelta(days=1)
-            return target.timestamp()
-        hours = max(1, int(cfg.rotate_interval_hours or 1))
-        return now_ts + hours * 3600
+        candidates: list[float] = []
+        now_local = dt.datetime.fromtimestamp(now_ts)
+
+        rules = list(cfg.rotate_rules or [])
+        if not rules:
+            rules = [f"time:{cfg.rotate_daily_time}"] if cfg.rotate_mode == "daily" else [f"hours:{cfg.rotate_interval_hours}"]
+
+        for rule in rules:
+            if rule.startswith("time:"):
+                value = rule.split(":", 1)[1]
+                match = re.fullmatch(r"(\d{2}):(\d{2})", value)
+                if not match:
+                    continue
+                hour, minute = int(match.group(1)), int(match.group(2))
+                target = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target.timestamp() <= now_ts + 1:
+                    target += dt.timedelta(days=1)
+                candidates.append(target.timestamp())
+                continue
+
+            match = re.fullmatch(r"hours:(\d{1,3})", rule)
+            if match:
+                hours = int(match.group(1))
+                if 1 <= hours <= 168:
+                    candidates.append(now_ts + hours * 3600)
+
+        return min(candidates) if candidates else now_ts + 4 * 3600
 
     def _rotation_text(self, cfg: AppConfig) -> str:
         if cfg.rotation_phase == "waiting_backup" and cfg.rotation_run_id:
             return f"换机中 · 等待旧 Run {cfg.rotation_run_id} 备份完成"
         if cfg.auto_rotate:
+            labels: list[str] = []
+            times: list[str] = []
+            intervals: list[int] = []
+            for rule in cfg.rotate_rules or []:
+                if rule.startswith("time:"):
+                    times.append(rule.split(":", 1)[1])
+                else:
+                    match = re.fullmatch(r"hours:(\d{1,3})", rule)
+                    if match:
+                        intervals.append(int(match.group(1)))
+            if times:
+                labels.append("每天 " + "/".join(times))
+            if intervals:
+                labels.extend(f"每 {hours} 小时" for hours in intervals)
+            rule_text = " + ".join(labels) if labels else "未配置规则"
             if not cfg.rotate_next_ts:
-                return "自动换机已开启 · 等待计算时间"
-            if cfg.rotate_mode == "daily":
-                rule = f"每天 {cfg.rotate_daily_time}"
-            else:
-                rule = f"每 {cfg.rotate_interval_hours} 小时"
-            return f"自动换机 · {rule} · 下次 {self._format_local_ts(cfg.rotate_next_ts)}"
+                return f"自动换机 · {rule_text} · 等待计算时间"
+            return f"自动换机 · {rule_text} · 下次 {self._format_local_ts(cfg.rotate_next_ts)}"
         if cfg.rotation_last_error:
             return f"自动换机关闭 · 上次错误: {cfg.rotation_last_error[:70]}"
         return "自动换机关闭"
@@ -1274,9 +1326,9 @@ class CloudPhoneGUI:
         v_auto = tk.BooleanVar(value=draft.auto_refresh)
         v_interval = tk.IntVar(value=draft.refresh_seconds)
         v_rotate = tk.BooleanVar(value=draft.auto_rotate)
-        v_rotate_mode = tk.StringVar(value="每天指定时间" if draft.rotate_mode == "daily" else "每 N 小时")
-        v_rotate_hours = tk.IntVar(value=max(1, int(draft.rotate_interval_hours or 4)))
-        v_rotate_time = tk.StringVar(value=draft.rotate_daily_time or "04:00")
+        rotation_rules = list(draft.rotate_rules or [])
+        v_rule_type = tk.StringVar(value="每天时间点")
+        v_rule_value = tk.StringVar(value="04:00")
         v_repo_status = tk.StringVar(value="内置工作流将在启动/恢复前自动同步到目标仓库")
         v_rotate_status = tk.StringVar(value=self._rotation_text(draft))
 
@@ -1347,26 +1399,85 @@ class CloudPhoneGUI:
 
         rotation = ttk.LabelFrame(body, text="定时自动换机", padding=10)
         rotation.pack(fill="x", pady=(10, 0))
-        rotation.columnconfigure(5, weight=1)
+        rotation.columnconfigure(0, weight=1)
         ttk.Checkbutton(rotation, text="启用定时自动换机", variable=v_rotate).grid(row=0, column=0, sticky="w")
-        ttk.Label(rotation, text="方式").grid(row=0, column=1, sticky="e", padx=(14, 4))
-        ttk.Combobox(
-            rotation,
-            textvariable=v_rotate_mode,
-            values=["每 N 小时", "每天指定时间"],
+
+        rules_box = ttk.Frame(rotation)
+        rules_box.grid(row=1, column=0, sticky="ew", pady=(8, 4))
+        rules_box.columnconfigure(0, weight=1)
+        rules_list = tk.Listbox(rules_box, height=4, exportselection=False)
+        rules_list.grid(row=0, column=0, columnspan=5, sticky="ew")
+
+        def rule_label(rule: str) -> str:
+            if rule.startswith("time:"):
+                return f"每天 {rule.split(':', 1)[1]}"
+            match = re.fullmatch(r"hours:(\d{1,3})", rule)
+            return f"每 {int(match.group(1))} 小时" if match else rule
+
+        def render_rules() -> None:
+            rules_list.delete(0, "end")
+            for item in rotation_rules:
+                rules_list.insert("end", rule_label(item))
+            preview = AppConfig.from_dict({
+                **draft.to_dict(),
+                "auto_rotate": bool(v_rotate.get()),
+                "rotate_rules": list(rotation_rules),
+            })
+            preview.rotate_next_ts = self._next_rotation_ts(preview) if preview.auto_rotate and preview.rotate_rules else 0.0
+            v_rotate_status.set(self._rotation_text(preview))
+
+        def add_rule() -> None:
+            kind = v_rule_type.get()
+            value = v_rule_value.get().strip()
+            if kind == "每天时间点":
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                    messagebox.showerror(APP_NAME, "时间格式必须是 HH:MM，例如 04:30")
+                    return
+                rule = f"time:{value}"
+            else:
+                try:
+                    hours = int(value)
+                except Exception:
+                    messagebox.showerror(APP_NAME, "间隔小时必须是 1 到 168 的整数")
+                    return
+                if not 1 <= hours <= 168:
+                    messagebox.showerror(APP_NAME, "间隔小时必须是 1 到 168")
+                    return
+                rule = f"hours:{hours}"
+            if rule not in rotation_rules:
+                rotation_rules.append(rule)
+            render_rules()
+
+        def remove_rule() -> None:
+            selected = list(rules_list.curselection())
+            if not selected:
+                return
+            rotation_rules.pop(int(selected[0]))
+            render_rules()
+
+        def rule_type_changed(_event=None) -> None:
+            v_rule_value.set("04:00" if v_rule_type.get() == "每天时间点" else "4")
+
+        type_combo = ttk.Combobox(
+            rules_box,
+            textvariable=v_rule_type,
+            values=["每天时间点", "每 N 小时"],
             state="readonly",
             width=14,
-        ).grid(row=0, column=2, sticky="w")
-        ttk.Label(rotation, text="间隔小时").grid(row=0, column=3, sticky="e", padx=(14, 4))
-        ttk.Spinbox(rotation, from_=1, to=168, textvariable=v_rotate_hours, width=7).grid(row=0, column=4, sticky="w")
-        ttk.Label(rotation, text="每天时间").grid(row=0, column=5, sticky="e", padx=(14, 4))
-        ttk.Entry(rotation, textvariable=v_rotate_time, width=8).grid(row=0, column=6, sticky="w")
+        )
+        type_combo.grid(row=1, column=0, sticky="w", pady=(7, 0))
+        type_combo.bind("<<ComboboxSelected>>", rule_type_changed)
+        ttk.Entry(rules_box, textvariable=v_rule_value, width=12).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(7, 0))
+        ttk.Button(rules_box, text="＋ 添加规则", command=add_rule).grid(row=1, column=2, padx=(6, 0), pady=(7, 0))
+        ttk.Button(rules_box, text="删除选中", command=remove_rule).grid(row=1, column=3, padx=(6, 0), pady=(7, 0))
+
         ttk.Label(
             rotation,
-            text="执行顺序：备份旧机 → 等 GitHub 确认完整 AVD 已保存 → 用最新备份恢复新 Runner → 旧 Runner 结束。",
+            text="可以同时添加多个每天时间点和小时规则；程序每次选择最近到期的一条执行。执行顺序：备份旧机 → 确认完整 AVD 已保存 → 恢复新 Runner。",
             wraplength=760,
-        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 2))
-        ttk.Label(rotation, textvariable=v_rotate_status, wraplength=760).grid(row=2, column=0, columnspan=7, sticky="w", pady=(2, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(rotation, textvariable=v_rotate_status, wraplength=760).grid(row=3, column=0, sticky="w", pady=(2, 0))
+        render_rules()
 
         note = ttk.LabelFrame(body, text="仓库部署", padding=10)
         note.pack(fill="x", pady=(10, 0))
@@ -1401,14 +1512,22 @@ class CloudPhoneGUI:
             if not v_ram.get().strip().isdigit() or int(v_ram.get()) < 1024:
                 raise ValueError("内存至少 1024 MB")
 
-            rotate_mode = "daily" if v_rotate_mode.get() == "每天指定时间" else "interval"
-            try:
-                rotate_hours = max(1, int(v_rotate_hours.get()))
-            except Exception as exc:
-                raise ValueError("换机间隔小时必须是正整数") from exc
-            rotate_time = v_rotate_time.get().strip()
-            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", rotate_time):
-                raise ValueError("每天换机时间格式必须是 HH:MM，例如 04:30")
+            clean_rules: list[str] = []
+            for raw_rule in rotation_rules:
+                rule = str(raw_rule).strip().lower()
+                if re.fullmatch(r"time:(?:[01]\d|2[0-3]):[0-5]\d", rule):
+                    if rule not in clean_rules:
+                        clean_rules.append(rule)
+                    continue
+                match = re.fullmatch(r"hours:(\d{1,3})", rule)
+                if match and 1 <= int(match.group(1)) <= 168:
+                    normalized = f"hours:{int(match.group(1))}"
+                    if normalized not in clean_rules:
+                        clean_rules.append(normalized)
+                    continue
+                raise ValueError(f"无效换机规则: {raw_rule}")
+            if bool(v_rotate.get()) and not clean_rules:
+                raise ValueError("启用自动换机时至少添加一条换机规则")
 
             for other in self.store.profiles:
                 if other.profile_id != draft.profile_id and other.repo.lower() == repo.lower() and other.phone_id == phone_id:
@@ -1419,9 +1538,7 @@ class CloudPhoneGUI:
                 raise ValueError("当前正在自动换机，完成后再修改仓库或 Phone ID")
             schedule_changed = (
                 draft.auto_rotate != bool(v_rotate.get())
-                or draft.rotate_mode != rotate_mode
-                or int(draft.rotate_interval_hours or 0) != rotate_hours
-                or draft.rotate_daily_time != rotate_time
+                or list(draft.rotate_rules or []) != clean_rules
             )
 
             draft.repo = repo
@@ -1442,9 +1559,17 @@ class CloudPhoneGUI:
             except Exception:
                 draft.refresh_seconds = 8
             draft.auto_rotate = bool(v_rotate.get())
-            draft.rotate_mode = rotate_mode
-            draft.rotate_interval_hours = rotate_hours
-            draft.rotate_daily_time = rotate_time
+            draft.rotate_rules = clean_rules
+            # Keep old fields in sync so older configuration files/versions can still read the first rule.
+            if clean_rules:
+                first_rule = clean_rules[0]
+                if first_rule.startswith("time:"):
+                    draft.rotate_mode = "daily"
+                    draft.rotate_daily_time = first_rule.split(":", 1)[1]
+                else:
+                    draft.rotate_mode = "interval"
+                    match = re.fullmatch(r"hours:(\d{1,3})", first_rule)
+                    draft.rotate_interval_hours = int(match.group(1)) if match else 4
             draft.package_history = [package] + [x for x in draft.package_history if x != package]
             draft.package_history = draft.package_history[:40]
 
