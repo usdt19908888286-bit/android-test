@@ -2280,6 +2280,12 @@ class CloudPhoneGUI:
         self._last_health: dict[str, float] = {}
         self._last_push_health: dict[str, float] = {}
         self._push_health_fail_count: dict[str, int] = {}
+        # Normal background status refresh may run every few seconds for local
+        # ADB/resource display, but GitHub's latest-run API is capped at one fetch
+        # per phone every 30 seconds. Explicit user refreshes bypass this cache.
+        self._github_run_cache: dict[str, tuple[tuple[str, str, str, str], Optional[dict[str, Any]]]] = {}
+        self._github_run_last_fetch: dict[str, float] = {}
+        self._github_run_poll_interval = 30.0
         self._health_bootstrap_done: dict[str, str] = {}
         self._health_online: dict[str, bool] = {}
         self._last_rotation_poll: dict[str, float] = {}
@@ -3992,6 +3998,10 @@ class CloudPhoneGUI:
 
         def done(result: tuple[list[str], int]) -> None:
             notes, previous_run_id = result
+            # A new workflow was just dispatched, so the next background refresh
+            # must fetch GitHub immediately instead of reusing the previous run.
+            self._github_run_cache.pop(profile_id, None)
+            self._github_run_last_fetch.pop(profile_id, None)
             self._set_card(profile_id, "run", f"{action}：已触发，等待 Runner")
             self._set_operation_progress(profile_id, f"{action} 5% · 已触发，等待 GitHub Runner", 5.0, True)
             self.log(f"{cfg.phone_name}: " + "；".join(notes))
@@ -4496,7 +4506,22 @@ class CloudPhoneGUI:
 
         def work() -> dict[str, Any]:
             api = self.api_for(cfg)
-            run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+            now = time.time()
+            lookup_key = (cfg.repo, cfg.branch, cfg.phone_name, cfg.phone_id)
+            cached = self._github_run_cache.get(profile_id)
+            last_fetch = float(self._github_run_last_fetch.get(profile_id, 0.0))
+            use_cached = bool(
+                quiet
+                and cached is not None
+                and cached[0] == lookup_key
+                and now - last_fetch < self._github_run_poll_interval
+            )
+            if use_cached:
+                run = cached[1]
+            else:
+                run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+                self._github_run_cache[profile_id] = (lookup_key, run)
+                self._github_run_last_fetch[profile_id] = now
             result: dict[str, Any] = {
                 "run": run,
                 "ip": "",
