@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import glob
+import hashlib
 import io
 import json
 import os
@@ -20,6 +21,8 @@ import secrets
 import shlex
 import shutil
 import socket
+import ssl
+import struct
 import subprocess
 import threading
 import time
@@ -137,7 +140,7 @@ REAL_DEVICE_CATALOG: list[dict[str, str]] = [{'name': 'Samsung Galaxy S25 Ultra 
   'resolution': '1440x3216'}]
 
 class GlobalSecretStore:
-    """Persist global credentials with Windows DPAPI (current-user scope)."""
+    """Persist global credentials/settings with Windows DPAPI (current-user scope)."""
 
     def __init__(self, path: Path = GLOBAL_SECRET_PATH):
         self.path = Path(path)
@@ -169,7 +172,7 @@ class GlobalSecretStore:
             None,
             None,
             None,
-            0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+            0x01,
             ctypes.byref(out_blob),
         )
         if not ok:
@@ -220,11 +223,30 @@ class GlobalSecretStore:
             if out_blob.pbData:
                 kernel32.LocalFree(out_blob.pbData)
 
-    def load(self) -> tuple[str, str]:
+    def _read_raw(self) -> dict[str, Any]:
         try:
             if not self.path.is_file():
-                return "", ""
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+                return {"version": 2}
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {"version": 2}
+        except Exception:
+            return {"version": 2}
+
+    def _write_raw(self, payload: dict[str, Any]) -> None:
+        payload = dict(payload)
+        payload["version"] = 2
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
+        try:
+            os.chmod(self.path, 0o600)
+        except Exception:
+            pass
+
+    def load(self) -> tuple[str, str]:
+        try:
+            data = self._read_raw()
             client_id = self._unprotect(str(data.get("ts_api_client_id") or ""))
             client_secret = self._unprotect(str(data.get("ts_api_client_secret") or ""))
             return client_id, client_secret
@@ -236,19 +258,70 @@ class GlobalSecretStore:
         client_secret = str(client_secret or "").strip()
         if not client_id or not client_secret:
             raise ValueError("TS_API_CLIENT_ID 和 TS_API_CLIENT_SECRET 都不能为空")
-        payload = {
-            "version": 1,
-            "ts_api_client_id": self._protect(client_id),
-            "ts_api_client_secret": self._protect(client_secret),
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        payload = self._read_raw()
+        payload["ts_api_client_id"] = self._protect(client_id)
+        payload["ts_api_client_secret"] = self._protect(client_secret)
+        self._write_raw(payload)
+
+    def clear_tailscale(self) -> None:
+        payload = self._read_raw()
+        payload.pop("ts_api_client_id", None)
+        payload.pop("ts_api_client_secret", None)
+        if len(payload) <= 1:
+            self.clear()
+        else:
+            self._write_raw(payload)
+
+    def load_notifications(self) -> dict[str, Any]:
+        data = self._read_raw()
         try:
-            os.chmod(self.path, 0o600)
+            webhook_url = self._unprotect(str(data.get("notify_webhook_url") or ""))
         except Exception:
-            pass
+            webhook_url = ""
+        try:
+            wss_url = self._unprotect(str(data.get("notify_wss_url") or ""))
+        except Exception:
+            wss_url = ""
+        try:
+            bearer_token = self._unprotect(str(data.get("notify_bearer_token") or ""))
+        except Exception:
+            bearer_token = ""
+        return {
+            "enabled": bool(data.get("notify_enabled", False)),
+            "webhook_url": webhook_url,
+            "wss_url": wss_url,
+            "bearer_token": bearer_token,
+        }
+
+    def save_notifications(
+        self,
+        enabled: bool,
+        webhook_url: str = "",
+        wss_url: str = "",
+        bearer_token: str = "",
+    ) -> None:
+        webhook_url = str(webhook_url or "").strip()
+        wss_url = str(wss_url or "").strip()
+        bearer_token = str(bearer_token or "").strip()
+        if webhook_url and not webhook_url.lower().startswith(("http://", "https://")):
+            raise ValueError("Webhook 地址必须以 http:// 或 https:// 开头")
+        if wss_url and not wss_url.lower().startswith(("ws://", "wss://")):
+            raise ValueError("WSS 地址必须以 ws:// 或 wss:// 开头")
+        payload = self._read_raw()
+        payload["notify_enabled"] = bool(enabled)
+        payload["notify_webhook_url"] = self._protect(webhook_url) if webhook_url else ""
+        payload["notify_wss_url"] = self._protect(wss_url) if wss_url else ""
+        payload["notify_bearer_token"] = self._protect(bearer_token) if bearer_token else ""
+        self._write_raw(payload)
+
+    def clear_notifications(self) -> None:
+        payload = self._read_raw()
+        for key in ("notify_enabled", "notify_webhook_url", "notify_wss_url", "notify_bearer_token"):
+            payload.pop(key, None)
+        if len(payload) <= 1:
+            self.clear()
+        else:
+            self._write_raw(payload)
 
     def clear(self) -> None:
         try:
@@ -260,6 +333,152 @@ class GlobalSecretStore:
     def configured(self) -> bool:
         client_id, client_secret = self.load()
         return bool(client_id and client_secret)
+
+
+class NotificationSender:
+    """Send one JSON event to HTTP webhook and/or ws/wss using stdlib only."""
+
+    WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    @staticmethod
+    def _headers(token: str = "") -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "cloud-android-manager/3.0",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    @classmethod
+    def send_webhook(cls, url: str, payload: dict[str, Any], token: str = "") -> None:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=cls._headers(token), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if int(getattr(resp, "status", 200)) >= 400:
+                    raise RuntimeError(f"Webhook HTTP {resp.status}")
+                resp.read(1024)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"Webhook HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Webhook 网络错误: {exc.reason}") from exc
+
+    @staticmethod
+    def _read_http_headers(sock: socket.socket) -> bytes:
+        data = bytearray()
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > 65536:
+                raise RuntimeError("WSS 握手响应过大")
+        return bytes(data)
+
+    @staticmethod
+    def _masked_frame(text: str) -> bytes:
+        payload = text.encode("utf-8")
+        mask = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            head = bytes((0x81, 0x80 | length))
+        elif length <= 65535:
+            head = bytes((0x81, 0xFE)) + struct.pack("!H", length)
+        else:
+            head = bytes((0x81, 0xFF)) + struct.pack("!Q", length)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        return head + mask + masked
+
+    @classmethod
+    def send_wss(cls, url: str, payload: dict[str, Any], token: str = "") -> None:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("ws", "wss"):
+            raise ValueError("WSS 地址必须以 ws:// 或 wss:// 开头")
+        host = parsed.hostname or ""
+        if not host:
+            raise ValueError("WSS 地址缺少主机名")
+        port = int(parsed.port or (443 if scheme == "wss" else 80))
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        raw_sock = socket.create_connection((host, port), timeout=10)
+        sock: socket.socket = raw_sock
+        try:
+            if scheme == "wss":
+                context = ssl.create_default_context()
+                sock = context.wrap_socket(raw_sock, server_hostname=host)
+            sock.settimeout(10)
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            host_header = host if port in (80, 443) else f"{host}:{port}"
+            lines = [
+                f"GET {path} HTTP/1.1",
+                f"Host: {host_header}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {key}",
+                "Sec-WebSocket-Version: 13",
+                "User-Agent: cloud-android-manager/3.0",
+            ]
+            if token:
+                lines.append(f"Authorization: Bearer {token}")
+            request = "\r\n".join(lines) + "\r\n\r\n"
+            sock.sendall(request.encode("ascii"))
+            response = cls._read_http_headers(sock)
+            header_text = response.decode("iso-8859-1", errors="replace")
+            status_line = header_text.split("\r\n", 1)[0]
+            if " 101 " not in f" {status_line} ":
+                raise RuntimeError(f"WSS 握手失败: {status_line}")
+            headers: dict[str, str] = {}
+            for line in header_text.split("\r\n")[1:]:
+                if ":" in line:
+                    name, value = line.split(":", 1)
+                    headers[name.strip().lower()] = value.strip()
+            expected = base64.b64encode(
+                hashlib.sha1((key + cls.WS_GUID).encode("ascii")).digest()
+            ).decode("ascii")
+            if headers.get("sec-websocket-accept", "") != expected:
+                raise RuntimeError("WSS 握手校验失败")
+
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            sock.sendall(cls._masked_frame(text))
+            mask = os.urandom(4)
+            close_payload = struct.pack("!H", 1000)
+            masked_close = bytes(value ^ mask[index % 4] for index, value in enumerate(close_payload))
+            sock.sendall(bytes((0x88, 0x80 | len(close_payload))) + mask + masked_close)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if sock is not raw_sock:
+                try:
+                    raw_sock.close()
+                except Exception:
+                    pass
+
+    @classmethod
+    def send_all(cls, settings: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+        if not bool(settings.get("enabled", False)):
+            return []
+        token = str(settings.get("bearer_token") or "")
+        errors: list[str] = []
+        webhook_url = str(settings.get("webhook_url") or "").strip()
+        wss_url = str(settings.get("wss_url") or "").strip()
+        if webhook_url:
+            try:
+                cls.send_webhook(webhook_url, payload, token)
+            except Exception as exc:
+                errors.append(f"Webhook: {exc}")
+        if wss_url:
+            try:
+                cls.send_wss(wss_url, payload, token)
+            except Exception as exc:
+                errors.append(f"WSS: {exc}")
+        return errors
 
 
 @dataclass
@@ -314,10 +533,10 @@ class AppConfig:
     # Runtime health monitoring is observation-only. It checks whether the Runner,
     # Android/ADB and selected App look healthy, then records/logs unhealthy streaks.
     health_monitor_enabled: bool = True
-    health_check_seconds: int = 30
+    health_check_seconds: int = 300
     health_require_app: bool = True
-    health_packages: list[str] = field(default_factory=list)
-    health_fail_threshold: int = 3
+    health_packages: list[str] = field(default_factory=lambda: ["com.temperaturecoin", "com.kolmonitor"])
+    health_fail_threshold: int = 1
     health_fail_count: int = 0
     health_last_status: str = "未检测"
     health_last_reason: str = ""
@@ -421,23 +640,19 @@ class AppConfig:
                 }
             )
         cfg.adb_tasks = clean_tasks
+        # BiCoin/Monitor are built-in health presets. Extra valid package names are
+        # preserved after them and receive process-liveness monitoring only.
+        preset_packages = ["com.temperaturecoin", "com.kolmonitor"]
         raw_health_packages = cfg.health_packages if isinstance(cfg.health_packages, list) else []
-        clean_health_packages: list[str] = []
+        clean_health_packages = list(preset_packages)
         for raw_pkg in raw_health_packages:
             pkg = str(raw_pkg or "").strip()
             if PKG_RE.match(pkg) and pkg not in clean_health_packages:
                 clean_health_packages.append(pkg)
-        if not clean_health_packages and PKG_RE.match(cfg.package_name):
-            clean_health_packages = [cfg.package_name]
         cfg.health_packages = clean_health_packages
-        try:
-            cfg.health_check_seconds = max(10, min(600, int(cfg.health_check_seconds)))
-        except Exception:
-            cfg.health_check_seconds = 30
-        try:
-            cfg.health_fail_threshold = max(1, min(20, int(cfg.health_fail_threshold)))
-        except Exception:
-            cfg.health_fail_threshold = 3
+        cfg.health_check_seconds = 300
+        cfg.health_require_app = True
+        cfg.health_fail_threshold = 1
         try:
             cfg.health_fail_count = max(0, int(cfg.health_fail_count))
         except Exception:
@@ -740,6 +955,84 @@ class GitHubAPI:
             payload["sha"] = sha
         self._request("PUT", f"/contents/{safe}", payload)
         return "已更新内置工作流" if sha else "已上传内置工作流"
+
+
+    def action_caches(self, key_prefix: str = "") -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "per_page": 100,
+            "sort": "created_at",
+            "direction": "desc",
+        }
+        if key_prefix:
+            params["key"] = key_prefix
+        data = self._request("GET", f"/actions/caches?{urllib.parse.urlencode(params)}") or {}
+        items = data.get("actions_caches", []) if isinstance(data, dict) else []
+        return [item for item in items if isinstance(item, dict)]
+
+    def prune_phone_caches(
+        self,
+        phone_id: str,
+        keep_run_id: int = 0,
+        keep: int = 1,
+    ) -> dict[str, Any]:
+        """Delete older managed AVD caches only after the new cache is visible."""
+        prefix = f"managed-avd-{phone_id}-"
+        expected_key = f"{prefix}{int(keep_run_id)}" if keep_run_id else ""
+        caches: list[dict[str, Any]] = []
+        for attempt in range(6):
+            caches = [
+                item
+                for item in self.action_caches()
+                if str(item.get("key") or "").startswith(prefix)
+            ]
+            if not expected_key or any(str(item.get("key") or "") == expected_key for item in caches):
+                break
+            if attempt < 5:
+                time.sleep(2)
+
+        if expected_key and not any(str(item.get("key") or "") == expected_key for item in caches):
+            return {
+                "deleted": 0,
+                "kept": [str(item.get("key") or "") for item in caches],
+                "reason": "new_cache_not_indexed",
+            }
+
+        caches.sort(
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                int(item.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        keep = max(1, min(10, int(keep or 1)))
+        keep_ids: set[int] = set()
+        if expected_key:
+            for item in caches:
+                if str(item.get("key") or "") == expected_key:
+                    keep_ids.add(int(item.get("id") or 0))
+                    break
+        for item in caches:
+            cache_id = int(item.get("id") or 0)
+            if cache_id and len(keep_ids) < keep:
+                keep_ids.add(cache_id)
+
+        deleted_keys: list[str] = []
+        kept_keys: list[str] = []
+        for item in caches:
+            cache_id = int(item.get("id") or 0)
+            key = str(item.get("key") or "")
+            if cache_id in keep_ids:
+                kept_keys.append(key)
+                continue
+            if cache_id:
+                self._request("DELETE", f"/actions/caches/{cache_id}")
+                deleted_keys.append(key)
+        return {
+            "deleted": len(deleted_keys),
+            "deleted_keys": deleted_keys,
+            "kept": kept_keys,
+            "reason": "ok",
+        }
 
     def open_issues(self) -> list[dict[str, Any]]:
         data = self._request("GET", "/issues?state=open&per_page=100") or []
@@ -1096,6 +1389,224 @@ class LocalTools:
             states[pkg] = "运行中" if pcode == 0 and pout.strip() else "已安装/未运行"
         return states
 
+
+    def bicoin_health_bootstrap(self, address: str) -> dict[str, Any]:
+        """One-shot Android initialization for first boot or ADB reconnection."""
+        bicoin = "com.temperaturecoin"
+        monitor = "com.kolmonitor"
+        listener = "com.kolmonitor/com.kolmonitor.monitor.BicoinNotificationListener"
+        result: dict[str, Any] = {"ok": False, "started": [], "errors": []}
+
+        ok, detail = self.adb_connect(address)
+        if not ok:
+            result["errors"].append(f"adb connect: {detail}")
+            return result
+        code, out, err = self.adb_cmd(address, ["wait-for-device"], timeout=60)
+        if code != 0:
+            result["errors"].append(f"wait-for-device: {(out or err).strip()}")
+            return result
+
+        setup_commands = [
+            ["shell", "cmd", "deviceidle", "disable", "all"],
+            ["shell", "settings", "put", "global", "app_standby_enabled", "0"],
+            ["shell", "settings", "put", "global", "adaptive_battery_management_enabled", "0"],
+            ["shell", "settings", "put", "global", "cached_apps_freezer", "disabled"],
+            ["shell", "dumpsys", "deviceidle", "whitelist", f"+{bicoin}"],
+            ["shell", "dumpsys", "deviceidle", "whitelist", f"+{monitor}"],
+            ["shell", "cmd", "notification", "allow_listener", listener],
+        ]
+        for args in setup_commands:
+            c, o, e = self.adb_cmd(address, args, timeout=25)
+            if c != 0:
+                result["errors"].append(f"{' '.join(args[1:])}: {(o or e).strip()}")
+
+        for pkg, activity in (
+            (bicoin, "com.temperaturecoin/.mvp.activity.main.WelcomActivity"),
+            (monitor, "com.kolmonitor/.MainActivity"),
+        ):
+            c, o, _ = self.adb_cmd(address, ["shell", "pidof", pkg], timeout=10)
+            if c != 0 or not o.strip():
+                scode, sout, serr = self.adb_cmd(address, ["shell", "am", "start", "-n", activity], timeout=25)
+                if scode == 0:
+                    result["started"].append(pkg)
+                else:
+                    result["errors"].append(f"启动 {pkg}: {(sout or serr).strip()}")
+
+        # Put both apps in background without force-stop, task removal, or data clearing.
+        hcode, hout, herr = self.adb_cmd(address, ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
+        if hcode != 0:
+            result["errors"].append(f"KEYCODE_HOME: {(hout or herr).strip()}")
+        result["ok"] = not result["errors"]
+        return result
+
+    @staticmethod
+    def _process_context(text: str, package: str, after: int = 8) -> str:
+        lines = text.splitlines()
+        chunks: list[str] = []
+        for index, line in enumerate(lines):
+            if package in line:
+                chunks.extend(lines[index : min(len(lines), index + after + 1)])
+        return "\n".join(chunks)
+
+    def bicoin_health_check(self, address: str, packages: Optional[list[str]] = None) -> dict[str, Any]:
+        """Five-minute local Android health check. It never force-stops/restarts apps."""
+        bicoin = "com.temperaturecoin"
+        monitor = "com.kolmonitor"
+        listener = "com.kolmonitor/com.kolmonitor.monitor.BicoinNotificationListener"
+        monitored = [bicoin, monitor]
+        for raw_pkg in packages or []:
+            pkg = str(raw_pkg or "").strip()
+            if PKG_RE.match(pkg) and pkg not in monitored:
+                monitored.append(pkg)
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "adb": False,
+            "bicoin_process": False,
+            "monitor_process": False,
+            "processes": {},
+            "bicoin_frozen": False,
+            "netpolicy": "UNKNOWN",
+            "whitelist": {bicoin: False, monitor: False},
+            "notification_listener": False,
+            "listener_connected": False,
+            "freezer": "UNKNOWN",
+            "freezer_repaired": False,
+            "whitelist_repaired": [],
+            "issues": [],
+        }
+
+        ok, _ = self.adb_connect(address)
+        if not ok:
+            result["issues"].append("ADB 连接失败")
+            return result
+        code, out, _ = self.adb_cmd(address, ["get-state"], timeout=12)
+        adb_ok = code == 0 and out.strip() == "device"
+        result["adb"] = adb_ok
+        if not adb_ok:
+            result["issues"].append(f"ADB 状态异常: {out.strip() or 'unknown'}")
+            return result
+
+        # All preset + custom package names receive process-liveness monitoring.
+        # Runtime monitoring is observation-only; it never auto-restarts a process.
+        for pkg in monitored:
+            pcode, pout, _ = self.adb_cmd(address, ["shell", "pidof", pkg], timeout=10)
+            running = pcode == 0 and bool(pout.strip())
+            result["processes"][pkg] = running
+            if pkg == bicoin:
+                result["bicoin_process"] = running
+            elif pkg == monitor:
+                result["monitor_process"] = running
+            if not running:
+                result["issues"].append(f"{pkg} 主进程不存在")
+
+        # Freezer is an auto-repair setting, not a standalone health criterion.
+        fcode, fout, _ = self.adb_cmd(
+            address, ["shell", "settings", "get", "global", "cached_apps_freezer"], timeout=10
+        )
+        freezer = fout.strip() if fcode == 0 else "UNKNOWN"
+        result["freezer"] = freezer
+        if freezer != "disabled":
+            rcode, _, _ = self.adb_cmd(
+                address, ["shell", "settings", "put", "global", "cached_apps_freezer", "disabled"], timeout=10
+            )
+            if rcode == 0:
+                result["freezer"] = "disabled"
+                result["freezer_repaired"] = True
+
+        # Frozen state: inspect the BiCoin process context only.
+        acode, activity_text, _ = self.adb_cmd(address, ["shell", "dumpsys", "activity", "processes"], timeout=35)
+        if acode == 0:
+            context = self._process_context(activity_text, bicoin, 8)
+            frozen = bool(re.search(r"\bisFrozen\s*=\s*true\b", context, flags=re.IGNORECASE))
+            result["bicoin_frozen"] = frozen
+            if frozen:
+                result["issues"].append("BiCoin isFrozen=true")
+        else:
+            result["issues"].append("无法读取 BiCoin 冻结状态")
+
+        # Device-idle whitelist: preset packages only, matching the requested policy.
+        wcode, whitelist_text, _ = self.adb_cmd(address, ["shell", "dumpsys", "deviceidle", "whitelist"], timeout=20)
+        if wcode == 0:
+            for pkg in (bicoin, monitor):
+                present = pkg in whitelist_text
+                if not present:
+                    rcode, _, _ = self.adb_cmd(
+                        address, ["shell", "dumpsys", "deviceidle", "whitelist", f"+{pkg}"], timeout=15
+                    )
+                    if rcode == 0:
+                        present = True
+                        result["whitelist_repaired"].append(pkg)
+                result["whitelist"][pkg] = present
+                if not present:
+                    result["issues"].append(f"白名单缺少 {pkg}")
+        else:
+            result["issues"].append("无法读取 deviceidle 白名单")
+
+        # Notification listener permission is Monitor-specific.
+        ncode, listeners, _ = self.adb_cmd(
+            address, ["shell", "settings", "get", "secure", "enabled_notification_listeners"], timeout=10
+        )
+        listener_ok = ncode == 0 and listener in listeners
+        result["notification_listener"] = listener_ok
+        if not listener_ok:
+            result["issues"].append("Monitor 通知监听权限缺失")
+
+        # Monitor's own persisted debug state. run-as failure is treated as unreadable/abnormal.
+        lcode, relay_state, _ = self.adb_cmd(
+            address,
+            ["shell", "run-as", monitor, "cat", "shared_prefs/relay_debug_state.xml"],
+            timeout=15,
+        )
+        listener_connected = False
+        if lcode == 0:
+            listener_connected = bool(
+                re.search(r"listenerConnected[^>]{0,120}(?:value=)?[\"']?true[\"']?", relay_state, re.IGNORECASE)
+                or re.search(r"listenerConnected.{0,120}>\s*true\s*<", relay_state, re.IGNORECASE | re.DOTALL)
+            )
+        result["listener_connected"] = listener_connected
+        if not listener_connected:
+            result["issues"].append("Monitor listenerConnected!=true")
+
+        # BiCoin network policy. Healthy target is effective=NONE; APP_BACKGROUND is explicitly abnormal.
+        ucode, uid_text, _ = self.adb_cmd(
+            address, ["shell", "cmd", "package", "list", "packages", "-U", bicoin], timeout=15
+        )
+        uid_match = re.search(r"uid:(\d+)", uid_text) if ucode == 0 else None
+        if uid_match:
+            uid = uid_match.group(1)
+            npcode, netpolicy_text, _ = self.adb_cmd(address, ["shell", "dumpsys", "netpolicy"], timeout=35)
+            if npcode == 0:
+                uid_re = re.compile(rf"\buid={re.escape(uid)}\b", re.IGNORECASE)
+                matches = [line.strip() for line in netpolicy_text.splitlines() if uid_re.search(line)]
+                joined = "\n".join(matches)
+                joined_upper = joined.upper()
+                if "EFFECTIVE=APP_BACKGROUND" in joined_upper:
+                    result["netpolicy"] = "APP_BACKGROUND"
+                    result["issues"].append("BiCoin 后台联网 effective=APP_BACKGROUND")
+                elif "EFFECTIVE=NONE" in joined_upper:
+                    result["netpolicy"] = "NONE"
+                else:
+                    result["netpolicy"] = "UNKNOWN"
+                    result["issues"].append("无法确认 BiCoin 后台联网 effective=NONE")
+            else:
+                result["issues"].append("无法读取 BiCoin netpolicy")
+        else:
+            result["issues"].append("无法取得 BiCoin UID")
+
+        all_processes_ok = all(bool(result["processes"].get(pkg, False)) for pkg in monitored)
+        result["ok"] = bool(
+            result["adb"]
+            and all_processes_ok
+            and not result["bicoin_frozen"]
+            and result["netpolicy"] == "NONE"
+            and result["whitelist"].get(bicoin)
+            and result["whitelist"].get(monitor)
+            and result["notification_listener"]
+            and result["listener_connected"]
+        )
+        return result
+
     def start_package(self, address: str, package: str) -> tuple[bool, str]:
         if not PKG_RE.match(package):
             return False, "包名格式无效"
@@ -1136,8 +1647,6 @@ class LocalTools:
         if first in ("adb", "adb.exe"):
             tokens = tokens[1:]
         if len(tokens) >= 2 and tokens[0] == "-s":
-            # Tasks belong to one phone profile, so always use that profile's
-            # current ADB address even if the saved text contains an old IP.
             tokens = tokens[2:]
         if not tokens:
             raise ValueError("ADB 命令缺少参数")
@@ -1185,8 +1694,8 @@ class LocalTools:
             if len(tokens) < 3 or tokens[2].lower() not in {"keyevent", "tap", "swipe", "text", "motionevent", "keycombination"}:
                 raise ValueError("input 子命令不受支持")
         if program == "am":
-            if len(tokens) < 3 or tokens[2].lower() not in {"start", "startservice", "start-foreground-service", "force-stop", "broadcast"}:
-                raise ValueError("am 只允许 start / service / force-stop / broadcast")
+            if len(tokens) < 3 or tokens[2].lower() not in {"start", "startservice", "start-foreground-service", "broadcast"}:
+                raise ValueError("自动任务中的 am 只允许 start / service / broadcast；禁止 force-stop")
         return tokens, rendered
 
     def run_safe_adb_command(self, address: str, command: str, package: str = "") -> tuple[bool, str]:
@@ -1466,6 +1975,8 @@ class CloudPhoneGUI:
         self._refreshing: set[str] = set()
         self._last_auto: dict[str, float] = {}
         self._last_health: dict[str, float] = {}
+        self._health_bootstrap_done: dict[str, str] = {}
+        self._health_online: dict[str, bool] = {}
         self._last_rotation_poll: dict[str, float] = {}
         self._rotating: set[str] = set()
         self._adb_task_running: set[str] = set()
@@ -1625,6 +2136,7 @@ class CloudPhoneGUI:
         ttk.Button(actions, text="▶ 启动新机", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=(0, 5))
         ttk.Button(actions, text="↺ 恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="复制地址", command=lambda pid=cfg.profile_id: self.copy_scrcpy_address(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="备份", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=5)
@@ -1739,6 +2251,49 @@ class CloudPhoneGUI:
         stamp = time.strftime("%H:%M:%S")
         self.log_text.insert("end", f"[{stamp}] {text}\n")
         self.log_text.see("end")
+
+
+    def _emit_notification(
+        self,
+        event: str,
+        cfg: Optional[AppConfig],
+        level: str,
+        message: str,
+        extra: Optional[dict[str, Any]] = None,
+        settings_override: Optional[dict[str, Any]] = None,
+    ) -> None:
+        settings = dict(settings_override or self.global_secrets.load_notifications())
+        if not bool(settings.get("enabled", False)):
+            return
+        if not str(settings.get("webhook_url") or "").strip() and not str(settings.get("wss_url") or "").strip():
+            return
+        payload: dict[str, Any] = {
+            "version": 1,
+            "event": str(event or "event"),
+            "level": str(level or "info"),
+            "message": str(message or ""),
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "source": "cloud-android-manager",
+        }
+        if cfg is not None:
+            payload["phone"] = {
+                "name": cfg.phone_name,
+                "id": cfg.phone_id,
+                "repo": cfg.repo,
+                "branch": cfg.branch,
+                "run_id": int(cfg.last_run_id or 0),
+                "device": cfg.last_device,
+                "health": cfg.health_last_status,
+            }
+        if extra:
+            payload["data"] = dict(extra)
+
+        def worker() -> None:
+            errors = NotificationSender.send_all(settings, payload)
+            if errors:
+                self.q.put(("err", ("全局通知", "；".join(errors), None)))
+
+        threading.Thread(target=worker, daemon=True, name="cloud-phone-notify").start()
 
     def bg(
         self,
@@ -1961,78 +2516,184 @@ class CloudPhoneGUI:
 
     def open_global_settings(self) -> None:
         client_id, client_secret = self.global_secrets.load()
+        notify = self.global_secrets.load_notifications()
+
         win = tk.Toplevel(self.root)
         win.title("全局设置")
-        win.geometry("620x330")
-        win.resizable(False, False)
+        win.geometry("760x590")
+        win.minsize(700, 540)
         win.transient(self.root)
         win.grab_set()
 
+        outer = ttk.Frame(win, padding=14)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+
+        # ------------------------- Tailscale -------------------------
+        ts_box = ttk.LabelFrame(outer, text="Tailscale OAuth（全局一次设置）", padding=10)
+        ts_box.grid(row=0, column=0, sticky="ew")
+        ts_box.columnconfigure(1, weight=1)
         v_client_id = tk.StringVar(value=client_id)
         v_client_secret = tk.StringVar(value=client_secret)
-        v_show = tk.BooleanVar(value=False)
-        v_status = tk.StringVar(
-            value="已安全保存，可自动补到新/现有仓库" if client_id and client_secret else "尚未配置 Tailscale OAuth"
+        v_show_ts = tk.BooleanVar(value=False)
+        v_ts_status = tk.StringVar(
+            value="已安全保存，可自动补到新/现有仓库" if client_id and client_secret else "尚未配置"
         )
 
-        frame = ttk.Frame(win, padding=18)
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(1, weight=1)
-        ttk.Label(frame, text="Tailscale OAuth（全局一次设置）", font=("Segoe UI", 12, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w"
+        ttk.Label(ts_box, text="TS_API_CLIENT_ID").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ts_box, textvariable=v_client_id).grid(row=0, column=1, columnspan=2, sticky="ew", padx=(10, 0))
+        ttk.Label(ts_box, text="TS_API_CLIENT_SECRET").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ts_secret_entry = ttk.Entry(ts_box, textvariable=v_client_secret, show="•")
+        ts_secret_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(8, 0))
+
+        def toggle_ts_secret() -> None:
+            ts_secret_entry.configure(show="" if v_show_ts.get() else "•")
+
+        ttk.Checkbutton(ts_box, text="显示", variable=v_show_ts, command=toggle_ts_secret).grid(
+            row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0)
         )
-        ttk.Label(
-            frame,
-            text="保存后，程序在创建仓库或启动手机前发现仓库缺少 Secret 时，会自动写入。凭据使用 Windows DPAPI 当前用户加密保存。",
-            wraplength=570,
-            justify="left",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 14))
+        ttk.Label(ts_box, textvariable=v_ts_status).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ts_actions = ttk.Frame(ts_box)
+        ts_actions.grid(row=2, column=2, sticky="e", pady=(8, 0))
 
-        ttk.Label(frame, text="TS_API_CLIENT_ID").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=v_client_id).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0))
-        ttk.Label(frame, text="TS_API_CLIENT_SECRET").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        secret_entry = ttk.Entry(frame, textvariable=v_client_secret, show="•")
-        secret_entry.grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=(10, 0))
-
-        def toggle_secret() -> None:
-            secret_entry.configure(show="" if v_show.get() else "•")
-
-        ttk.Checkbutton(frame, text="显示", variable=v_show, command=toggle_secret).grid(
-            row=3, column=2, sticky="w", padx=(8, 0), pady=(10, 0)
-        )
-        ttk.Label(frame, textvariable=v_status, wraplength=570).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(14, 0)
-        )
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(22, 0))
-
-        def save_global() -> None:
+        def save_tailscale() -> None:
             try:
                 self.global_secrets.save(v_client_id.get(), v_client_secret.get())
             except Exception as exc:
-                messagebox.showerror(APP_NAME, f"保存全局 Tailscale 凭据失败：{exc}", parent=win)
+                messagebox.showerror(APP_NAME, f"保存 Tailscale 凭据失败：{exc}", parent=win)
                 return
             self._refresh_tailscale_global_status()
+            v_ts_status.set("已安全保存，可自动补到新/现有仓库")
             self.log("全局 Tailscale OAuth 已使用 Windows DPAPI 安全保存")
-            messagebox.showinfo(
-                APP_NAME,
-                "已保存。以后创建仓库或启动手机时，会自动补齐缺少的 Tailscale GitHub Secrets。",
-                parent=win,
-            )
-            win.destroy()
 
-        def clear_global() -> None:
-            if not messagebox.askyesno(APP_NAME, "清除本机保存的全局 Tailscale 凭据？", parent=win):
+        def clear_tailscale() -> None:
+            if not messagebox.askyesno(APP_NAME, "清除本机保存的 Tailscale OAuth？", parent=win):
                 return
-            self.global_secrets.clear()
+            self.global_secrets.clear_tailscale()
+            v_client_id.set("")
+            v_client_secret.set("")
+            v_ts_status.set("尚未配置")
             self._refresh_tailscale_global_status()
             self.log("已清除本机全局 Tailscale OAuth")
-            win.destroy()
 
-        ttk.Button(buttons, text="清除本机凭据", command=clear_global).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="取消", command=win.destroy).pack(side="right")
-        ttk.Button(buttons, text="保存", command=save_global).pack(side="right", padx=(0, 8))
-        win.bind("<Control-s>", lambda _e: save_global())
+        ttk.Button(ts_actions, text="清除", command=clear_tailscale).pack(side="left")
+        ttk.Button(ts_actions, text="保存", command=save_tailscale).pack(side="left", padx=(6, 0))
+
+        # ------------------------- Notification center -------------------------
+        notify_box = ttk.LabelFrame(outer, text="全局监控通知（所有手机共用）", padding=10)
+        notify_box.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        notify_box.columnconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        v_notify_enabled = tk.BooleanVar(value=bool(notify.get("enabled", False)))
+        v_webhook = tk.StringVar(value=str(notify.get("webhook_url") or ""))
+        v_wss = tk.StringVar(value=str(notify.get("wss_url") or ""))
+        v_bearer = tk.StringVar(value=str(notify.get("bearer_token") or ""))
+        v_show_bearer = tk.BooleanVar(value=False)
+        v_notify_status = tk.StringVar(value="Webhook / WSS 可同时启用；异常、备份、换机会统一推送 JSON")
+
+        ttk.Checkbutton(notify_box, text="启用全局通知", variable=v_notify_enabled).grid(
+            row=0, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(
+            notify_box,
+            text="通知事件不包含 GitHub Token、Tailscale Secret 等敏感值。Webhook 使用 HTTP POST JSON；WSS 建立安全 WebSocket 后发送同一份 JSON。",
+            wraplength=700,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 10))
+
+        ttk.Label(notify_box, text="Webhook URL").grid(row=2, column=0, sticky="w")
+        ttk.Entry(notify_box, textvariable=v_webhook).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0))
+        ttk.Label(notify_box, text="WSS URL").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(notify_box, textvariable=v_wss).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(8, 0))
+        ttk.Label(notify_box, text="Bearer Token（可选）").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        bearer_entry = ttk.Entry(notify_box, textvariable=v_bearer, show="•")
+        bearer_entry.grid(row=4, column=1, sticky="ew", padx=(10, 0), pady=(8, 0))
+
+        def toggle_bearer() -> None:
+            bearer_entry.configure(show="" if v_show_bearer.get() else "•")
+
+        ttk.Checkbutton(notify_box, text="显示", variable=v_show_bearer, command=toggle_bearer).grid(
+            row=4, column=2, sticky="w", padx=(8, 0), pady=(8, 0)
+        )
+        ttk.Label(notify_box, textvariable=v_notify_status, wraplength=700).grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(10, 0)
+        )
+        notify_actions = ttk.Frame(notify_box)
+        notify_actions.grid(row=6, column=0, columnspan=3, sticky="e", pady=(12, 0))
+
+        def notification_values(force_enabled: bool = False) -> dict[str, Any]:
+            settings = {
+                "enabled": True if force_enabled else bool(v_notify_enabled.get()),
+                "webhook_url": v_webhook.get().strip(),
+                "wss_url": v_wss.get().strip(),
+                "bearer_token": v_bearer.get().strip(),
+            }
+            if settings["webhook_url"] and not settings["webhook_url"].lower().startswith(("http://", "https://")):
+                raise ValueError("Webhook 地址必须以 http:// 或 https:// 开头")
+            if settings["wss_url"] and not settings["wss_url"].lower().startswith(("ws://", "wss://")):
+                raise ValueError("WSS 地址必须以 ws:// 或 wss:// 开头")
+            if settings["enabled"] and not settings["webhook_url"] and not settings["wss_url"]:
+                raise ValueError("启用通知时至少填写 Webhook 或 WSS 地址")
+            return settings
+
+        def save_notifications() -> None:
+            try:
+                settings = notification_values(False)
+                self.global_secrets.save_notifications(
+                    settings["enabled"], settings["webhook_url"], settings["wss_url"], settings["bearer_token"]
+                )
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, f"保存通知设置失败：{exc}", parent=win)
+                return
+            v_notify_status.set("通知设置已使用 Windows DPAPI 安全保存")
+            self.log("全局监控通知设置已保存")
+
+        def test_notifications() -> None:
+            try:
+                settings = notification_values(True)
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
+                return
+            v_notify_status.set("正在发送测试通知…")
+            payload = {
+                "version": 1,
+                "event": "test",
+                "level": "info",
+                "message": "Cloud Android Manager 全局通知测试",
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "source": "cloud-android-manager",
+            }
+
+            def work() -> list[str]:
+                return NotificationSender.send_all(settings, payload)
+
+            def done(errors: list[str]) -> None:
+                if errors:
+                    v_notify_status.set("测试部分失败：" + "；".join(errors))
+                else:
+                    v_notify_status.set("测试通知发送成功")
+
+            self.bg("测试全局通知", work, done, lambda err: v_notify_status.set(f"测试失败：{err}"))
+
+        def clear_notifications() -> None:
+            if not messagebox.askyesno(APP_NAME, "清除本机保存的 Webhook / WSS 通知设置？", parent=win):
+                return
+            self.global_secrets.clear_notifications()
+            v_notify_enabled.set(False)
+            v_webhook.set("")
+            v_wss.set("")
+            v_bearer.set("")
+            v_notify_status.set("通知设置已清除")
+            self.log("已清除全局监控通知设置")
+
+        ttk.Button(notify_actions, text="清除通知", command=clear_notifications).pack(side="left")
+        ttk.Button(notify_actions, text="测试", command=test_notifications).pack(side="left", padx=(6, 0))
+        ttk.Button(notify_actions, text="保存通知", command=save_notifications).pack(side="left", padx=(6, 0))
+
+        footer = ttk.Frame(outer)
+        footer.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right")
 
     def _sync_tailscale_repo_secrets(
         self,
@@ -2778,7 +3439,7 @@ class CloudPhoneGUI:
                 close = steps.get("Close consumed backup command", {})
 
                 if str(close.get("status")) == "completed" and str(close.get("conclusion")) == "success":
-                    self.q.put(("progress", (profile_id, "备份 100% · 已保存到 GitHub", 100.0)))
+                    self.q.put(("progress", (profile_id, "备份 100% · 已保存，正在清理旧备份", 100.0)))
                 elif str(save.get("status")) == "in_progress":
                     self.q.put(("progress", (profile_id, "备份 85% · 正在上传 GitHub Cache", 85.0)))
                 elif str(save.get("status")) == "completed":
@@ -2795,9 +3456,13 @@ class CloudPhoneGUI:
                 status = str(run.get("status") or "")
                 conclusion = str(run.get("conclusion") or "")
                 if status == "completed":
-                    if conclusion == "success":
-                        return "备份完成 · 已保存到 GitHub"
-                    raise RuntimeError(f"GitHub Run 结束：{conclusion or 'unknown'}")
+                    if conclusion != "success":
+                        raise RuntimeError(f"GitHub Run 结束：{conclusion or 'unknown'}")
+                    cleanup = api.prune_phone_caches(cfg.phone_id, run_id, keep=1)
+                    deleted = int(cleanup.get("deleted") or 0)
+                    if str(cleanup.get("reason") or "") == "new_cache_not_indexed":
+                        return "备份完成 · 新备份已保存 · Cache API 尚未索引，旧备份暂时保留"
+                    return f"备份完成 · 已保存到 GitHub · 已清理 {deleted} 个旧备份"
                 time.sleep(3)
             raise RuntimeError("备份等待超过 60 分钟")
 
@@ -2806,12 +3471,27 @@ class CloudPhoneGUI:
             self._finish_operation_progress(profile_id, text)
             self._set_card(profile_id, "run", f"备份完成 · Run {run_id}")
             self.log(f"{cfg.phone_name}: {text} · Run {run_id}")
+            self._emit_notification(
+                "backup_success",
+                cfg,
+                "info",
+                text,
+                {"run_id": run_id},
+            )
             self.root.after(1200, lambda: self.refresh_profile(profile_id, quiet=True))
 
         def failed(err: str) -> None:
             self._backup_tracking.discard(profile_id)
             self._set_operation_progress(profile_id, f"备份失败 · {err}", 100.0, True)
             self._set_card(profile_id, "run", f"备份失败：{err}")
+            self.log(f"{cfg.phone_name}: 备份失败 · {err}")
+            self._emit_notification(
+                "backup_failed",
+                cfg,
+                "error",
+                f"备份失败：{err}",
+                {"run_id": run_id},
+            )
 
         self.bg(f"{cfg.phone_name} 备份进度", work, done, failed)
 
@@ -2956,7 +3636,7 @@ class CloudPhoneGUI:
 
         self._rotating.add(profile_id)
         self._set_card(profile_id, "rotation", "正在开始换机…")
-        self._set_card(profile_id, "run", "换机：正在检查旧手机…")
+        self._set_card(profile_id, "run", "换机：关机 / 备份流程准备中…")
 
         def work() -> dict[str, Any]:
             self._prepare_repository(cfg)
@@ -2976,14 +3656,20 @@ class CloudPhoneGUI:
                     "issue": int(issue.get("number") or 0),
                 }
 
-            # If the old phone is already offline, restore directly from the latest
-            # encrypted cache. This also covers the natural 5-hour auto-backup case.
+            # Old Runner is already offline: keep only the newest existing backup,
+            # then restore it. No cache is deleted unless at least one cache exists.
+            cleanup = api.prune_phone_caches(cfg.phone_id, keep_run_id=0, keep=1)
             api.dispatch(
                 Path(BUILTIN_WORKFLOW_PATH).name,
                 cfg.branch,
                 self._workflow_inputs(cfg, "restore"),
             )
-            return {"state": "restore_dispatched", "run_id": 0, "issue": 0}
+            return {
+                "state": "restore_dispatched",
+                "run_id": 0,
+                "issue": 0,
+                "cleanup_deleted": int(cleanup.get("deleted") or 0),
+            }
 
         def done(result: dict[str, Any]) -> None:
             self._rotating.discard(profile_id)
@@ -2997,11 +3683,22 @@ class CloudPhoneGUI:
                 self._set_card(
                     profile_id,
                     "rotation",
-                    f"换机中 · 旧 Run {cfg.rotation_run_id} 正在备份 · Issue #{issue_no}",
+                    f"换机中 · 旧 Run {cfg.rotation_run_id} 正在关机备份 · Issue #{issue_no}",
                 )
-                self._set_card(profile_id, "run", f"换机：等待旧 Run {cfg.rotation_run_id} 完成备份")
+                self._set_card(
+                    profile_id,
+                    "run",
+                    f"换机：关机 → 备份 → 清理旧备份 → 恢复启动 · Run {cfg.rotation_run_id}",
+                )
                 self.log(
-                    f"{cfg.phone_name}: 换机已开始，先完整备份旧 Run {cfg.rotation_run_id}，备份成功后自动恢复新 Runner"
+                    f"{cfg.phone_name}: 换机开始 · 关机 → 完整备份 → 只保留最新备份 → 恢复启动"
+                )
+                self._emit_notification(
+                    "rotation_started",
+                    cfg,
+                    "info",
+                    "换机开始：关机 → 备份 → 清理旧备份 → 恢复启动",
+                    {"old_run_id": cfg.rotation_run_id, "automatic": bool(automatic)},
                 )
             else:
                 cfg.rotation_phase = ""
@@ -3009,8 +3706,16 @@ class CloudPhoneGUI:
                 cfg.rotation_started_ts = 0.0
                 cfg.rotate_last_ts = now_ts
                 self._reschedule_rotation(cfg, now_ts)
-                self._set_card(profile_id, "run", "换机：旧机已离线，已直接从最新备份启动新 Runner")
-                self.log(f"{cfg.phone_name}: 旧机已离线，已直接触发最新备份恢复")
+                deleted = int(result.get("cleanup_deleted") or 0)
+                self._set_card(profile_id, "run", "换机：旧机已离线，已从最新备份启动新 Runner")
+                self.log(f"{cfg.phone_name}: 旧机已离线 · 清理旧备份 {deleted} 个 · 已触发恢复启动")
+                self._emit_notification(
+                    "rotation_restore_dispatched",
+                    cfg,
+                    "info",
+                    "旧机已离线，已从最新备份触发恢复启动",
+                    {"deleted_old_caches": deleted, "automatic": bool(automatic)},
+                )
                 self.root.after(2200, lambda: self.refresh_profile(profile_id))
             self.store.save()
 
@@ -3022,6 +3727,14 @@ class CloudPhoneGUI:
             self.store.save()
             self._set_card(profile_id, "rotation", self._rotation_text(cfg))
             self._set_card(profile_id, "run", f"换机启动失败：{err}")
+            self.log(f"{cfg.phone_name}: 换机启动失败 · {err}")
+            self._emit_notification(
+                "rotation_failed",
+                cfg,
+                "error",
+                f"换机启动失败：{err}",
+                {"automatic": bool(automatic)},
+            )
 
         self.bg(
             f"{cfg.phone_name} {'自动' if automatic else '立即'}换机",
@@ -3060,12 +3773,17 @@ class CloudPhoneGUI:
             if "MANAGED_BACKUP_SAVED" not in logs:
                 return {"state": "failed", "error": f"旧 Run {old_run_id} 已结束，但日志未确认 MANAGED_BACKUP_SAVED"}
 
+            cleanup = api.prune_phone_caches(cfg.phone_id, old_run_id, keep=1)
             api.dispatch(
                 Path(BUILTIN_WORKFLOW_PATH).name,
                 cfg.branch,
                 self._workflow_inputs(cfg, "restore"),
             )
-            return {"state": "restored"}
+            return {
+                "state": "restored",
+                "cleanup_deleted": int(cleanup.get("deleted") or 0),
+                "cleanup_reason": str(cleanup.get("reason") or ""),
+            }
 
         def done(result: dict[str, Any]) -> None:
             self._rotating.discard(profile_id)
@@ -3085,9 +3803,18 @@ class CloudPhoneGUI:
                 self._set_card(profile_id, "rotation", self._rotation_text(cfg))
                 self._set_card(profile_id, "run", f"换机失败：{cfg.rotation_last_error}")
                 self.log(f"{cfg.phone_name}: {cfg.rotation_last_error}")
+                self._emit_notification(
+                    "rotation_failed",
+                    cfg,
+                    "error",
+                    cfg.rotation_last_error,
+                    {"old_run_id": old_run_id},
+                )
                 return
 
             now_done = time.time()
+            deleted = int(result.get("cleanup_deleted") or 0)
+            cleanup_reason = str(result.get("cleanup_reason") or "")
             cfg.rotation_phase = ""
             cfg.rotation_run_id = 0
             cfg.rotation_started_ts = 0.0
@@ -3096,8 +3823,21 @@ class CloudPhoneGUI:
             self._reschedule_rotation(cfg, now_done)
             self.store.save()
             self._set_card(profile_id, "rotation", self._rotation_text(cfg))
-            self._set_card(profile_id, "run", "旧机备份成功 · 新 Runner 已从备份启动")
-            self.log(f"{cfg.phone_name}: 旧机完整备份已保存，新的 Runner 已从该备份恢复启动")
+            self._set_card(profile_id, "run", "旧机已关机备份 · 旧备份已清理 · 新 Runner 已启动")
+            if cleanup_reason == "new_cache_not_indexed":
+                cleanup_text = "新备份已保存，Cache API 尚未索引，旧备份暂时保留"
+            else:
+                cleanup_text = f"已删除 {deleted} 个旧备份，只保留最新一份"
+            self.log(
+                f"{cfg.phone_name}: 关机备份成功 · {cleanup_text} · 新 Runner 已从最新备份恢复启动"
+            )
+            self._emit_notification(
+                "rotation_success",
+                cfg,
+                "info",
+                f"换机完成：{cleanup_text}，新 Runner 已启动",
+                {"old_run_id": old_run_id, "deleted_old_caches": deleted},
+            )
             self.root.after(2200, lambda: self.refresh_profile(profile_id))
 
         def failed(err: str) -> None:
@@ -3151,28 +3891,67 @@ class CloudPhoneGUI:
                 "host": "",
                 "health": {},
                 "runner": {},
-                "health_apps": {},
+                "local_health": {},
+                "bootstrap": {},
+                "bootstrap_key": "",
+                "adb_online": False,
             }
             if not run:
                 return result
             rid = int(run["id"])
+            now = time.time()
+            same_run = int(cfg.last_run_id or 0) == rid
+            health_due = bool(
+                cfg.health_monitor_enabled
+                and same_run
+                and float(cfg.health_last_ts or 0) > 0
+                and now - float(cfg.health_last_ts or 0) >= 300
+            )
             ip, host = self.tools.discover_phone(cfg.phone_id, rid, cfg.phone_name)
             result["ip"] = ip
             result["host"] = host
-            if ip:
-                result["runner"] = self.tools.runner_status(ip)
-                address = f"{ip}:5555"
-                if self.tools.port_open(ip, 5555, 1.2):
-                    result["health"] = self.tools.device_health(address, cfg.package_name)
-                    if cfg.health_monitor_enabled and cfg.health_require_app:
-                        targets = list(cfg.health_packages or [cfg.package_name])
-                        result["health_apps"] = self.tools.package_states(address, targets)
+            if not ip:
+                if health_due:
+                    result["local_health"] = {"ok": False, "adb": False, "issues": ["ADB 地址不可用"]}
+                return result
+
+            result["runner"] = self.tools.runner_status(ip)  # display only, never part of health verdict
+            address = f"{ip}:5555"
+            if not self.tools.port_open(ip, 5555, 1.2):
+                if health_due:
+                    result["local_health"] = {"ok": False, "adb": False, "issues": ["ADB 连接失败"]}
+                return result
+
+            basic = self.tools.device_health(address, cfg.package_name)
+            result["health"] = basic
+            ready = str(basic.get("boot") or "") == "1" and str(basic.get("adb") or "") == "已连接"
+            result["adb_online"] = ready
+            if not cfg.health_monitor_enabled:
+                return result
+            if not ready:
+                if health_due and bool(self._health_online.get(profile_id, False)):
+                    result["local_health"] = {"ok": False, "adb": False, "issues": ["ADB 未就绪"]}
+                return result
+
+            bootstrap_key = f"{rid}:{address}"
+            was_online = bool(self._health_online.get(profile_id, False))
+            need_bootstrap = (
+                self._health_bootstrap_done.get(profile_id, "") != bootstrap_key
+                or not was_online
+            )
+            if need_bootstrap:
+                result["bootstrap"] = self.tools.bicoin_health_bootstrap(address)
+                result["bootstrap_key"] = bootstrap_key
+
+            if need_bootstrap or health_due or not float(cfg.health_last_ts or 0):
+                result["local_health"] = self.tools.bicoin_health_check(address, cfg.health_packages)
             return result
 
         def done(result: dict[str, Any]) -> None:
             self._refreshing.discard(profile_id)
             run = result.get("run") or {}
             if not run:
+                self._health_online[profile_id] = False
                 cfg.last_run_id = 0
                 cfg.last_run_status = "-"
                 cfg.last_device = ""
@@ -3182,20 +3961,32 @@ class CloudPhoneGUI:
                 self._set_card(profile_id, "server", "云 CPU - · 内存 -\nQEMU CPU - · RAM -")
                 self._set_card(profile_id, "android", "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n未检测")
-                self._update_health_state(cfg, "", {}, {}, {})
+                self._update_health_state(cfg, "", {})
                 self.store.save()
                 return
 
             rid = int(run["id"])
             status = str(run.get("status") or "?")
             conclusion = str(run.get("conclusion") or "")
+            previous_run_id = int(cfg.last_run_id or 0)
+            previous_run_status = str(cfg.last_run_status or "")
+            if previous_run_id != rid:
+                cfg.health_last_ts = 0.0
+                cfg.health_fail_count = 0
+                cfg.health_last_status = "启动中" if status in ("queued", "in_progress") else "未检测"
+                cfg.health_last_reason = ""
+                self._last_health.pop(profile_id, None)
+                self._health_online[profile_id] = False
+                self._health_bootstrap_done.pop(profile_id, None)
             cfg.last_run_id = rid
             cfg.last_run_status = f"{status}/{conclusion or '-'}"
             ip = str(result.get("ip") or "")
             host = str(result.get("host") or "")
             health = result.get("health") or {}
             runner = result.get("runner") or {}
-            health_apps = result.get("health_apps") or {}
+            local_health = result.get("local_health") or {}
+            adb_online = bool(result.get("adb_online", False))
+            self._health_online[profile_id] = adb_online
 
             if ip:
                 cfg.last_device = f"{ip}:5555"
@@ -3221,6 +4012,19 @@ class CloudPhoneGUI:
             else:
                 state = status
             self._set_card(profile_id, "run", f"{state} · Run {rid}")
+            if (
+                status == "completed"
+                and conclusion == "failure"
+                and (previous_run_id != rid or previous_run_status != cfg.last_run_status)
+            ):
+                self._emit_notification(
+                    "run_failed",
+                    cfg,
+                    "error",
+                    f"GitHub Run {rid} 运行失败",
+                    {"run_id": rid},
+                )
+
 
             if ip:
                 adb_text = cfg.last_device
@@ -3255,14 +4059,27 @@ class CloudPhoneGUI:
                 self._set_card(profile_id, "android", "等待 Android / ADB 就绪" if status == "in_progress" else "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n等待检测" if status == "in_progress" else "未运行")
 
-            self._update_health_state(cfg, status, health, runner, health_apps)
-            if status == "in_progress" and cfg.health_monitor_enabled:
-                if cfg.health_last_status == "健康":
-                    health_label = "健康"
-                elif cfg.health_last_status in ("警告", "异常"):
-                    health_label = f"{cfg.health_last_status} {cfg.health_fail_count}/{cfg.health_fail_threshold}"
+            bootstrap_key = str(result.get("bootstrap_key") or "")
+            bootstrap = result.get("bootstrap") or {}
+            if bootstrap_key:
+                # One attempt per ADB-online generation. Runtime health checks never restart apps.
+                self._health_bootstrap_done[profile_id] = bootstrap_key
+                started = list(bootstrap.get("started") or [])
+                errors = list(bootstrap.get("errors") or [])
+                if started:
+                    self.log(f"{cfg.phone_name} · 上线初始化：仅启动缺失进程 {', '.join(started)}")
+                if errors:
+                    self.log(f"{cfg.phone_name} · 上线初始化部分失败：{'；'.join(errors)}")
                 else:
-                    health_label = cfg.health_last_status
+                    self.log(f"{cfg.phone_name} · 上线初始化完成")
+
+            if local_health:
+                self._update_health_state(cfg, status, local_health)
+            elif status != "in_progress":
+                self._update_health_state(cfg, status, {})
+
+            if status == "in_progress" and cfg.health_monitor_enabled:
+                health_label = cfg.health_last_status
                 self._set_card(profile_id, "run", f"{state} · Run {rid} · {health_label}")
 
             if status == "in_progress" and boot == "1" and adb == "已连接":
@@ -3281,82 +4098,62 @@ class CloudPhoneGUI:
         self,
         cfg: AppConfig,
         run_status: str,
-        health: dict[str, Any],
-        runner: dict[str, Any],
-        app_states: dict[str, str],
+        local_health: dict[str, Any],
     ) -> None:
         if not cfg.health_monitor_enabled:
             return
-
-        now = time.time()
-        interval = max(10, int(cfg.health_check_seconds or 30))
-        if (
-            run_status == "in_progress"
-            and cfg.health_last_status in ("健康", "警告", "异常")
-            and cfg.health_last_ts
-            and now - cfg.health_last_ts < interval
-        ):
-            return
-
-        cfg.health_last_ts = now
-        self._last_health[cfg.profile_id] = now
 
         if run_status != "in_progress":
             cfg.health_fail_count = 0
             cfg.health_last_status = "未运行"
             cfg.health_last_reason = ""
             return
-
-        boot = str(health.get("boot") or "")
-        adb = str(health.get("adb") or "")
-        runner_ready = any(
-            str(runner.get(key) or "-") != "-"
-            for key in ("host_cpu", "host_mem", "qemu")
-        )
-        system_ready = boot == "1" and adb == "已连接"
-        if not system_ready and cfg.health_last_status not in ("健康", "警告", "异常"):
-            cfg.health_last_status = "启动中"
-            cfg.health_last_reason = "等待 Android / ADB 就绪"
+        if not local_health:
+            if cfg.health_last_status not in ("健康", "异常"):
+                cfg.health_last_status = "启动中"
+                cfg.health_last_reason = "等待本机 Android 健康检查"
             return
 
-        reasons: list[str] = []
-        if not system_ready:
-            reasons.append("Android/ADB 不可用")
-        elif not runner_ready:
-            reasons.append("Runner 状态服务不可用")
-        elif cfg.health_require_app:
-            targets = list(cfg.health_packages or [cfg.package_name])
-            bad_apps: list[str] = []
-            for pkg in targets:
-                state = str(app_states.get(pkg) or "状态未知")
-                if state != "运行中":
-                    bad_apps.append(f"{pkg}={state}")
-            if bad_apps:
-                reasons.append("App异常: " + ", ".join(bad_apps))
+        now = time.time()
+        cfg.health_last_ts = now
+        self._last_health[cfg.profile_id] = now
+        previous = cfg.health_last_status
 
-        if not reasons:
-            was_bad = cfg.health_last_status in ("警告", "异常")
+        repaired: list[str] = []
+        if local_health.get("freezer_repaired"):
+            repaired.append("cached_apps_freezer")
+        for pkg in local_health.get("whitelist_repaired") or []:
+            repaired.append(f"白名单:{pkg}")
+        if repaired:
+            self.log(f"{cfg.phone_name} · 健康检查自动修复：{', '.join(repaired)}")
+
+        if bool(local_health.get("ok", False)):
             cfg.health_fail_count = 0
             cfg.health_last_status = "健康"
-            if cfg.health_require_app:
-                count = len(cfg.health_packages or [cfg.package_name])
-                cfg.health_last_reason = f"Android / ADB / {count}个App 正常"
-            else:
-                cfg.health_last_reason = "Android / ADB 正常"
-            if was_bad:
-                self.log(f"{cfg.phone_name} · 健康监控：已恢复正常")
+            cfg.health_last_reason = "ADB / BiCoin / Monitor / 通知监听 / 后台联网正常"
+            if previous == "异常":
+                self.log(f"{cfg.phone_name} · 本机 Android 健康已恢复")
+                self._emit_notification(
+                    "health_recovered",
+                    cfg,
+                    "info",
+                    cfg.health_last_reason,
+                    {"health": dict(local_health)},
+                )
             return
 
-        cfg.health_fail_count = int(cfg.health_fail_count or 0) + 1
-        reason = "；".join(reasons)
-        cfg.health_last_reason = reason
-        threshold = max(1, int(cfg.health_fail_threshold or 3))
-        previous = cfg.health_last_status
-        cfg.health_last_status = "异常" if cfg.health_fail_count >= threshold else "警告"
-        if cfg.health_fail_count == 1 or (cfg.health_last_status == "异常" and previous != "异常"):
-            self.log(
-                f"{cfg.phone_name} · 健康监控：{cfg.health_last_status} "
-                f"({cfg.health_fail_count}/{threshold}) · {reason}"
+        cfg.health_fail_count = 1
+        cfg.health_last_status = "异常"
+        issues = [str(item) for item in (local_health.get("issues") or []) if str(item).strip()]
+        cfg.health_last_reason = "；".join(issues) if issues else "本机 Android 健康检查异常"
+        if previous != "异常":
+            self.log(f"{cfg.phone_name} · 本机 Android 健康异常：{cfg.health_last_reason}")
+            self._emit_notification(
+                "health_error",
+                cfg,
+                "error",
+                cfg.health_last_reason,
+                {"health": dict(local_health)},
             )
 
     def refresh_all(self) -> None:
@@ -3678,123 +4475,116 @@ class CloudPhoneGUI:
         type_combo.bind("<<ComboboxSelected>>", rotation_type_changed)
         render_rotation_rules()
 
-        # ------------------------- 健康监控 -------------------------
-        health_box = ttk.LabelFrame(outer, text="健康监控", padding=9)
+        # ------------------------- BiCoin 本机健康预设 -------------------------
+        health_box = ttk.LabelFrame(outer, text="本机 Android 健康", padding=9)
         health_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        health_box.columnconfigure(10, weight=1)
+        health_box.columnconfigure(3, weight=1)
 
+        preset_health_packages = ["com.temperaturecoin", "com.kolmonitor"]
+        custom_health_packages = [pkg for pkg in cfg.health_packages if pkg not in preset_health_packages]
         v_health_enabled = tk.BooleanVar(value=cfg.health_monitor_enabled)
-        v_health_interval = tk.IntVar(value=cfg.health_check_seconds)
-        v_health_require_app = tk.BooleanVar(value=cfg.health_require_app)
-        v_health_threshold = tk.IntVar(value=cfg.health_fail_threshold)
-        selected_health_packages = list(cfg.health_packages or [cfg.package_name])
-        v_health_targets = tk.StringVar()
+        v_health_custom = tk.StringVar(value=", ".join(custom_health_packages))
         v_health_status = tk.StringVar(
             value=f"{cfg.health_last_status}"
             + (f" · {cfg.health_last_reason}" if cfg.health_last_reason else "")
         )
 
-        def update_health_targets_text() -> None:
-            if not v_health_require_app.get():
-                v_health_targets.set("仅系统")
-            elif not selected_health_packages:
-                v_health_targets.set("未选择 App")
-            elif len(selected_health_packages) == 1:
-                v_health_targets.set(selected_health_packages[0])
-            else:
-                v_health_targets.set(f"{len(selected_health_packages)} 个 App")
-
         ttk.Checkbutton(health_box, text="启用", variable=v_health_enabled).grid(row=0, column=0, sticky="w")
-        ttk.Label(health_box, text="每").grid(row=0, column=1, sticky="e", padx=(10, 3))
-        ttk.Spinbox(health_box, from_=10, to=600, textvariable=v_health_interval, width=5).grid(row=0, column=2, sticky="w")
-        ttk.Label(health_box, text="秒").grid(row=0, column=3, sticky="w", padx=(3, 10))
-        ttk.Checkbutton(health_box, text="检查 App", variable=v_health_require_app, command=update_health_targets_text).grid(row=0, column=4, sticky="w")
-        ttk.Label(health_box, text="监控:").grid(row=0, column=5, sticky="e", padx=(10, 3))
-        ttk.Label(health_box, textvariable=v_health_targets).grid(row=0, column=6, sticky="w")
-        ttk.Button(health_box, text="选择 App", command=lambda: select_health_apps()).grid(row=0, column=7, sticky="w", padx=(6, 10))
-        ttk.Label(health_box, text="连续").grid(row=0, column=8, sticky="e")
-        ttk.Spinbox(health_box, from_=1, to=20, textvariable=v_health_threshold, width=4).grid(row=0, column=9, sticky="w", padx=(3, 3))
-        ttk.Label(health_box, text="次报警").grid(row=0, column=10, sticky="w")
-        ttk.Button(health_box, text="保存", command=lambda: save_health_monitor()).grid(row=0, column=11, sticky="e", padx=(8, 0))
-        ttk.Label(health_box, textvariable=v_health_status).grid(row=1, column=0, columnspan=12, sticky="w", pady=(6, 0))
+        ttk.Label(health_box, text="每 5 分钟").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(
+            health_box,
+            text="预设: com.temperaturecoin + com.kolmonitor",
+        ).grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(health_box, textvariable=v_health_status).grid(row=0, column=3, sticky="w", padx=(12, 0))
 
-        def select_health_apps() -> None:
-            if not cfg.last_device:
-                messagebox.showinfo(APP_NAME, "这台手机还没有可用的 ADB 地址，手机启动后再读取已安装 App。", parent=dlg)
-                return
-            v_health_status.set("正在读取已安装 App…")
+        ttk.Label(health_box, text="自定义包名").grid(row=1, column=0, sticky="w", pady=(7, 0))
+        ttk.Entry(health_box, textvariable=v_health_custom).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(7, 0)
+        )
+        ttk.Label(
+            health_box,
+            text="多个包名用逗号或空格分隔；自定义 App 只检查主进程，不自动启动。",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
-            def loaded(packages: list[str]) -> None:
-                if not packages:
-                    v_health_status.set("没有读取到第三方 App")
-                    return
-                chooser = tk.Toplevel(dlg)
-                chooser.title("选择健康监控 App")
-                chooser.geometry("560x420")
-                chooser.minsize(460, 340)
-                chooser.transient(dlg)
+        def parse_custom_health_packages() -> list[str]:
+            clean: list[str] = []
+            for raw in re.split(r"[,;\s]+", v_health_custom.get().strip()):
+                pkg = raw.strip()
+                if not pkg:
+                    continue
+                if not PKG_RE.match(pkg):
+                    raise ValueError(f"无效包名: {pkg}")
+                if pkg not in preset_health_packages and pkg not in clean:
+                    clean.append(pkg)
+            return clean
 
-                body = ttk.Frame(chooser, padding=10)
-                body.pack(fill="both", expand=True)
-                body.columnconfigure(0, weight=1)
-                body.rowconfigure(1, weight=1)
-                ttk.Label(body, text="可多选。健康监控会要求所选 App 都保持运行。", wraplength=520).grid(row=0, column=0, sticky="w", pady=(0, 7))
-                app_list = tk.Listbox(body, selectmode="extended", exportselection=False)
-                app_list.grid(row=1, column=0, sticky="nsew")
-                scroll = ttk.Scrollbar(body, orient="vertical", command=app_list.yview)
-                scroll.grid(row=1, column=1, sticky="ns")
-                app_list.configure(yscrollcommand=scroll.set)
-                for idx, pkg in enumerate(packages):
-                    app_list.insert("end", pkg)
-                    if pkg in selected_health_packages:
-                        app_list.selection_set(idx)
-
-                actions = ttk.Frame(body)
-                actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
-
-                def apply_selection() -> None:
-                    selected = [packages[int(i)] for i in app_list.curselection()]
-                    selected_health_packages[:] = selected
-                    update_health_targets_text()
-                    v_health_status.set(f"已选择 {len(selected)} 个 App，点“保存”生效")
-                    chooser.destroy()
-
-                ttk.Button(actions, text="取消", command=chooser.destroy).pack(side="right")
-                ttk.Button(actions, text="确定", command=apply_selection).pack(side="right", padx=(0, 6))
-
-            self.bg(
-                f"读取健康监控App {cfg.phone_name}",
-                lambda: self.tools.list_third_party_packages(cfg.last_device),
-                loaded,
-                lambda err: v_health_status.set(f"读取 App 失败：{err}"),
+        def show_health_rules() -> None:
+            messagebox.showinfo(
+                "本机 Android 健康规则",
+                "预设 App: com.temperaturecoin、com.kolmonitor。\n"
+                "可追加自定义包名，自定义 App 仅检查主进程是否存在。\n\n"
+                "上线初始化（只在开机/ADB重新上线时执行一次）:\n"
+                "• adb connect + wait-for-device\n"
+                "• 关闭 deviceidle / app standby / adaptive battery / cached freezer\n"
+                "• BiCoin + Monitor 加 deviceidle 白名单\n"
+                "• 授权 Monitor NotificationListener\n"
+                "• 仅当预设 App 主进程不存在时启动 BiCoin / Monitor\n"
+                "• 最后回 HOME，不 force-stop、不划掉后台\n\n"
+                "每 5 分钟健康检查:\n"
+                "• ADB get-state 必须是 device\n"
+                "• 预设 + 自定义 App 主进程必须存在\n"
+                "• cached_apps_freezer 非 disabled 时自动修复\n"
+                "• BiCoin isFrozen=true 判异常\n"
+                "• BiCoin + Monitor 白名单缺失时自动补\n"
+                "• Monitor NotificationListener 权限必须存在\n"
+                "• relay_debug_state.xml 中 listenerConnected=true\n"
+                "• BiCoin netpolicy 必须 effective=NONE；APP_BACKGROUND 判异常\n\n"
+                "不检查 ping/pong，也不因为几分钟没有新通知判异常；运行巡检不会为了保活反复重启 App。",
+                parent=dlg,
             )
 
         def save_health_monitor() -> None:
             try:
-                interval = max(10, min(600, int(v_health_interval.get())))
-                threshold = max(1, min(20, int(v_health_threshold.get())))
-            except Exception:
-                messagebox.showerror(APP_NAME, "健康检查间隔或异常次数格式无效", parent=dlg)
-                return
-            if v_health_require_app.get() and not selected_health_packages:
-                messagebox.showerror(APP_NAME, "启用 App 健康检查时至少选择一个 App。", parent=dlg)
+                custom = parse_custom_health_packages()
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=dlg)
                 return
             cfg.health_monitor_enabled = bool(v_health_enabled.get())
-            cfg.health_check_seconds = interval
-            cfg.health_require_app = bool(v_health_require_app.get())
-            cfg.health_packages = list(selected_health_packages)
-            cfg.health_fail_threshold = threshold
+            cfg.health_check_seconds = 300
+            cfg.health_require_app = True
+            cfg.health_packages = preset_health_packages + custom
+            cfg.health_fail_threshold = 1
             cfg.health_fail_count = 0
             cfg.health_last_ts = 0.0
             cfg.health_last_status = "未检测" if cfg.health_monitor_enabled else "已关闭"
             cfg.health_last_reason = ""
             self._last_health.pop(cfg.profile_id, None)
+            if cfg.health_monitor_enabled:
+                self._health_bootstrap_done.pop(cfg.profile_id, None)
+                self._health_online[cfg.profile_id] = False
             self.store.upsert(cfg)
-            app_text = f"{len(cfg.health_packages)}个App" if cfg.health_require_app else "仅系统"
-            v_health_status.set(f"已保存 · 每 {interval} 秒 · {app_text}")
-            self.log(f"{cfg.phone_name}: 健康监控设置已保存")
+            extra = f" + {len(custom)}个自定义App" if custom else ""
+            v_health_status.set(f"已保存 · 2个预设{extra} · 每5分钟巡检")
+            self.log(f"{cfg.phone_name}: 本机 Android 健康设置已保存 · {len(cfg.health_packages)} 个包")
 
-        update_health_targets_text()
+        def check_health_now() -> None:
+            try:
+                custom = parse_custom_health_packages()
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=dlg)
+                return
+            cfg.health_packages = preset_health_packages + custom
+            cfg.health_last_ts = 0.0
+            self._last_health.pop(cfg.profile_id, None)
+            self.store.save()
+            v_health_status.set("正在执行本机 Android 健康检查…")
+            self.refresh_profile(profile_id, quiet=True)
+
+        health_actions = ttk.Frame(health_box)
+        health_actions.grid(row=3, column=0, columnspan=4, sticky="e", pady=(7, 0))
+        ttk.Button(health_actions, text="查看规则", command=show_health_rules).pack(side="left")
+        ttk.Button(health_actions, text="立即检查", command=check_health_now).pack(side="left", padx=(6, 0))
+        ttk.Button(health_actions, text="保存", command=save_health_monitor).pack(side="left", padx=(6, 0))
 
         # ------------------------- 统一自定义脚本 -------------------------
         script_box = ttk.LabelFrame(outer, text="启动 / 定时脚本", padding=9)
@@ -4107,6 +4897,15 @@ class CloudPhoneGUI:
             lambda: self.tools.launch_scrcpy(cfg.last_device),
             lambda r: self.log(f"{cfg.phone_name}: {r[1]}"),
         )
+
+
+    def copy_scrcpy_address(self, profile_id: str) -> None:
+        cfg = self.store.get(profile_id)
+        if not cfg or not cfg.last_device:
+            messagebox.showinfo(APP_NAME, "还没有可用的 ADB / scrcpy 地址，请先刷新这台手机。")
+            return
+        self._copy_to_clipboard(cfg.last_device)
+        self.log(f"{cfg.phone_name}: 已复制 scrcpy 地址 {cfg.last_device}")
 
     def _choose_app_and_execute(self, profile_id: str, action: str) -> None:
         cfg = self.store.get(profile_id)
