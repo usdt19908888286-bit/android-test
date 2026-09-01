@@ -28,9 +28,14 @@ on:
         default: 'com.temperaturecoin'
         type: string
       apk_url:
-        description: Optional APK reference only; managed phone creation does not auto-install APKs
+        description: Legacy optional APK reference retained for compatibility
         required: false
         default: 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk'
+        type: string
+      new_phone_apk_urls_b64:
+        description: Base64 JSON list of APK URLs to install only for brand-new phones
+        required: false
+        default: ''
         type: string
       api_level:
         description: Android API level
@@ -108,6 +113,7 @@ env:
   DEVICE_BRAND: ${{ inputs.device_brand || '' }}
   DEVICE_MODEL: ${{ inputs.device_model || '' }}
   USE_S5: ${{ inputs.use_s5 || 'false' }}
+  NEW_PHONE_APK_URLS_B64: ${{ inputs.new_phone_apk_urls_b64 || '' }}
 
 jobs:
   phone:
@@ -557,16 +563,69 @@ jobs:
           adb shell wm size 720x1600 || true
           adb shell wm density 280 || true
 
-          # Phone creation/restoration is intentionally APK-neutral. The GUI may
-          # remember a package name for monitoring, but this workflow never downloads,
-          # installs, or auto-launches an APK.
+          # Optional new-phone-only APK installation. Restore mode deliberately skips
+          # this block so backed-up application/data state is never overwritten.
+          if [ "${PHONE_MODE:-}" = 'new' ] && [ -n "${NEW_PHONE_APK_URLS_B64:-}" ]; then
+            python3 - <<'PY' >/tmp/new-phone-apk-urls.txt
+          import base64
+          import json
+          import os
+          from urllib.parse import urlparse
+
+          raw = os.environ.get('NEW_PHONE_APK_URLS_B64', '')
+          try:
+              urls = json.loads(base64.b64decode(raw).decode('utf-8'))
+          except Exception as exc:
+              raise SystemExit(f'invalid new-phone APK URL payload: {exc}')
+          if not isinstance(urls, list) or len(urls) > 20:
+              raise SystemExit('new-phone APK URL payload must be a list with at most 20 entries')
+          seen = set()
+          for item in urls:
+              url = str(item or '').strip()
+              parsed = urlparse(url)
+              if not url or len(url) > 2048 or parsed.scheme.lower() not in ('http', 'https') or not parsed.netloc:
+                  raise SystemExit('invalid new-phone APK URL')
+              if url in seen:
+                  continue
+              seen.add(url)
+              print(url)
+          PY
+
+            APP_INDEX=0
+            while IFS= read -r APP_URL || [ -n "$APP_URL" ]; do
+              [ -n "$APP_URL" ] || continue
+              APP_INDEX=$((APP_INDEX + 1))
+              APP_FILE="/tmp/managed-auto-app-${APP_INDEX}.apk"
+              echo "AUTO_APP_DOWNLOAD_START index=${APP_INDEX}"
+              if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 300 "$APP_URL" -o "$APP_FILE"; then
+                echo "::error::AUTO_APP_DOWNLOAD_FAILED index=${APP_INDEX}"
+                exit 1
+              fi
+              if ! unzip -tq "$APP_FILE" >/dev/null 2>&1; then
+                echo "::error::AUTO_APP_INVALID_APK index=${APP_INDEX}"
+                exit 1
+              fi
+              echo "AUTO_APP_INSTALL_START index=${APP_INDEX}"
+              if ! adb install -r "$APP_FILE"; then
+                echo "::error::AUTO_APP_INSTALL_FAILED index=${APP_INDEX}"
+                exit 1
+              fi
+              rm -f "$APP_FILE"
+              echo "AUTO_APP_INSTALL_OK index=${APP_INDEX}"
+            done </tmp/new-phone-apk-urls.txt
+            echo "AUTO_APP_INSTALL_COMPLETE count=${APP_INDEX}"
+          elif [ "${PHONE_MODE:-}" = 'restore' ]; then
+            echo 'RESTORE_SKIPS_AUTO_APP_INSTALL'
+          else
+            echo 'NEW_PHONE_AUTO_APP_INSTALL_NONE'
+          fi
+
           DEFAULT_PACKAGE="$PACKAGE_NAME"
           if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then
             echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"
           else
             echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"
           fi
-          echo 'MANAGED_PHONE_APK_NEUTRAL'
 
           adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true
           adb shell settings put global auto_update_system_apps 0 || true
