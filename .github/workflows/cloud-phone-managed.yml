@@ -1,5 +1,5 @@
 name: Managed Android Cloud Phone
-run-name: Managed Phone ${{ inputs.phone_id || '001' }} / ${{ inputs.mode || 'new' }}
+run-name: ${{ inputs.phone_name || 'Managed Phone' }} · ${{ inputs.phone_id || '001' }} / ${{ inputs.mode || 'new' }}
 
 on:
   workflow_dispatch:
@@ -17,10 +17,50 @@ on:
         required: true
         default: '001'
         type: string
+      phone_name:
+        description: Friendly phone name shown in GitHub and the local GUI
+        required: false
+        default: 'BICOIN-001'
+        type: string
+      package_name:
+        description: Default Android package to install/launch
+        required: false
+        default: 'com.temperaturecoin'
+        type: string
       apk_url:
         description: APK URL used for a new phone or restore fallback
         required: false
         default: 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk'
+        type: string
+      api_level:
+        description: Android API level
+        required: false
+        default: '35'
+        type: string
+      target:
+        description: Android system image target
+        required: false
+        default: 'google_apis'
+        type: string
+      arch:
+        description: Android emulator architecture
+        required: false
+        default: 'x86_64'
+        type: string
+      profile:
+        description: Android device profile
+        required: false
+        default: 'pixel_6'
+        type: string
+      cores:
+        description: Emulator CPU cores
+        required: false
+        default: '4'
+        type: string
+      ram_mb:
+        description: Emulator RAM in MiB
+        required: false
+        default: '8192'
         type: string
 
 permissions:
@@ -36,6 +76,8 @@ env:
   DISPLAY: :99
   APK_URL: ${{ inputs.apk_url || 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk' }}
   PHONE_ID: ${{ inputs.phone_id || '001' }}
+  PHONE_NAME: ${{ inputs.phone_name || 'BICOIN-001' }}
+  PACKAGE_NAME: ${{ inputs.package_name || 'com.temperaturecoin' }}
   AVD_NAME: managed-phone-${{ inputs.phone_id || '001' }}
 
 jobs:
@@ -56,6 +98,7 @@ jobs:
             ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
           esac
           [ -n "${APK_URL:-}" ] || { echo '::error::apk_url is empty'; exit 1; }
+          [[ "${PACKAGE_NAME:-}" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]] || { echo '::error::package_name is invalid'; exit 1; }
           if [ "${{ inputs.mode }}" = 'restore' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then
             echo '::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.'
             exit 1
@@ -65,13 +108,23 @@ jobs:
           fi
           echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"
 
+      - name: Prepare phone identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          SLUG=$(printf '%s' "${PHONE_NAME:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-35)
+          [ -n "$SLUG" ] || SLUG="managed-phone${PHONE_ID}"
+          echo "ts_hostname=${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"
+
       - name: Join Tailscale
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
           tags: tag:github-phone
-          hostname: managed-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
+          hostname: ${{ steps.identity.outputs.ts_hostname }}
           version: latest
 
       - name: Enable KVM and install runtime dependencies
@@ -253,8 +306,8 @@ jobs:
             echo 'APK_INSTALL_SUCCESS'
           fi
 
-          # Default BICOIN package; restored phones keep all other packages/data too.
-          DEFAULT_PACKAGE='com.temperaturecoin'
+          # Default package is configurable from the GUI. Restored phones keep all other packages/data too.
+          DEFAULT_PACKAGE="$PACKAGE_NAME"
           if ! adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then
             curl -fL --retry 3 --connect-timeout 20 --max-time 240 "$APK_URL" -o /tmp/app-release.apk
             adb install -r -g /tmp/app-release.apk
@@ -337,13 +390,13 @@ jobs:
           PHONE_MODE: ${{ inputs.mode }}
           GH_TOKEN: ${{ github.token }}
         with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
+          api-level: ${{ inputs.api_level }}
+          target: ${{ inputs.target }}
+          arch: ${{ inputs.arch }}
+          profile: ${{ inputs.profile }}
           avd-name: managed-phone-${{ inputs.phone_id || '001' }}
-          cores: 4
-          ram-size: 8192M
+          cores: ${{ inputs.cores }}
+          ram-size: ${{ format('{0}M', inputs.ram_mb) }}
           force-avd-creation: ${{ inputs.mode == 'new' }}
           disable-animations: false
           emulator-options: >-

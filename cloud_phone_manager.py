@@ -49,11 +49,18 @@ class AppConfig:
     repo: str = "usdt19908888286-bit/android-test"
     branch: str = "main"
     phone_id: str = "001"
+    phone_name: str = "BICOIN-001"
     create_workflow: str = "cloud-phone-managed.yml"
     managed_workflow: str = "cloud-phone-managed.yml"
     apk_url: str = DEFAULT_APK_URL
     package_name: str = DEFAULT_PACKAGE
     package_history: list[str] = field(default_factory=lambda: [DEFAULT_PACKAGE])
+    api_level: str = "35"
+    target: str = "google_apis"
+    arch: str = "x86_64"
+    profile: str = "pixel_6"
+    cores: str = "4"
+    ram_mb: str = "8192"
     last_device: str = ""
     auto_refresh: bool = True
     refresh_seconds: int = 5
@@ -164,6 +171,30 @@ class GitHubAPI:
         except RuntimeError:
             # Some fine-grained tokens can dispatch workflows but cannot list secret metadata.
             return None
+
+    def user_repos(self) -> list[str]:
+        url = (
+            "https://api.github.com/user/repos?per_page=100&sort=updated&"
+            "affiliation=owner,collaborator,organization_member"
+        )
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "cloud-android-manager/2.0",
+            "Authorization": f"Bearer {self.token}",
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return [item.get("full_name", "") for item in data if item.get("full_name")]
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GitHub API {exc.code}: {detail}") from exc
+
+    def workflows(self) -> list[str]:
+        data = self._request("GET", "/actions/workflows?per_page=100") or {}
+        return [item.get("path", "").split("/")[-1] for item in data.get("workflows", []) if item.get("path")]
 
     def open_issues(self) -> list[dict[str, Any]]:
         data = self._request("GET", "/issues?state=open&per_page=100") or []
@@ -285,18 +316,25 @@ class LocalTools:
             nodes.extend(v for v in peer.values() if isinstance(v, dict))
         return nodes
 
-    def discover_phone(self, phone_id: str, run_id: Optional[int] = None) -> tuple[str, str]:
+    def discover_phone(
+        self, phone_id: str, run_id: Optional[int] = None, phone_name: str = ""
+    ) -> tuple[str, str]:
         candidates: list[tuple[int, str, str]] = []
+        slug = re.sub(r"[^a-z0-9-]+", "-", phone_name.lower()).strip("-")
         for node in self.tailscale_nodes():
             host = str(node.get("HostName") or node.get("DNSName") or "").rstrip(".")
             ips = node.get("TailscaleIPs") or []
             ip = next((x for x in ips if isinstance(x, str) and ":" not in x), "")
             if not host or not ip:
                 continue
-            if f"phone{phone_id}-" not in host:
-                continue
-            if run_id is not None and str(run_id) not in host:
-                continue
+            if run_id is not None:
+                if str(run_id) not in host:
+                    continue
+            else:
+                id_match = f"phone{phone_id}-" in host
+                name_match = bool(slug and slug in host.lower())
+                if not (id_match or name_match):
+                    continue
             match = RUN_ID_RE.search(host)
             score = int(match.group(1)) if match else 0
             candidates.append((score, ip, host))
@@ -444,6 +482,46 @@ class LocalTools:
             pass
         return ""
 
+    def github_account(self) -> str:
+        if not self.gh:
+            return ""
+        code, out, _ = self.run([self.gh, "api", "user", "--jq", ".login"], timeout=15)
+        return out.strip() if code == 0 else ""
+
+    def github_login(self) -> tuple[bool, str]:
+        if not self.gh:
+            return False, "未找到 GitHub CLI (gh.exe)"
+        try:
+            flags = 0x00000010 if os.name == "nt" else 0
+            cp = subprocess.run(
+                [
+                    self.gh,
+                    "auth",
+                    "login",
+                    "--hostname",
+                    "github.com",
+                    "--git-protocol",
+                    "https",
+                    "--web",
+                ],
+                timeout=300,
+                creationflags=flags,
+            )
+            account = self.github_account()
+            return cp.returncode == 0 and bool(account), account or "GitHub 授权未完成"
+        except subprocess.TimeoutExpired:
+            return False, "GitHub 授权超时"
+        except Exception as exc:
+            return False, str(exc)
+
+    def github_logout(self) -> tuple[bool, str]:
+        if not self.gh:
+            return False, "未找到 GitHub CLI (gh.exe)"
+        code, out, err = self.run(
+            [self.gh, "auth", "logout", "--hostname", "github.com"], timeout=30
+        )
+        return code == 0, out or err or "已退出 GitHub"
+
     def set_github_secret(self, repo: str, token: str, name: str = "AVD_BACKUP_KEY") -> tuple[bool, str]:
         if not self.gh:
             return False, "未找到 GitHub CLI (gh.exe)"
@@ -510,7 +588,7 @@ class CloudPhoneGUI:
         self.root = root
         self.root.title(APP_NAME)
         self.root.geometry("1180x820")
-        self.root.minsize(1000, 700)
+        self.root.minsize(1020, 720)
 
         self.cfg = AppConfig.load()
         self.tools = LocalTools()
@@ -521,19 +599,30 @@ class CloudPhoneGUI:
 
         env_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
         session_token = env_token or self.tools.github_auth_token()
-        self.var_token = tk.StringVar(value=session_token)
+        self.var_token = tk.StringVar(value=session_token)  # internal only; never displayed/saved
+        self.var_github_status = tk.StringVar(value="GitHub: 正在检查登录状态…")
         self.var_repo = tk.StringVar(value=self.cfg.repo)
         self.var_branch = tk.StringVar(value=self.cfg.branch)
         self.var_phone = tk.StringVar(value=self.cfg.phone_id)
-        self.var_create_wf = tk.StringVar(value=self.cfg.create_workflow)
-        self.var_managed_wf = tk.StringVar(value=self.cfg.managed_workflow)
+        self.var_phone_name = tk.StringVar(value=self.cfg.phone_name)
+        self.var_workflow = tk.StringVar(value=self.cfg.managed_workflow or self.cfg.create_workflow)
+        self.var_create_wf = self.var_workflow
+        self.var_managed_wf = self.var_workflow
         self.var_apk = tk.StringVar(value=self.cfg.apk_url)
         self.var_package = tk.StringVar(value=self.cfg.package_name)
+        self.var_api_level = tk.StringVar(value=self.cfg.api_level)
+        self.var_target = tk.StringVar(value=self.cfg.target)
+        self.var_arch = tk.StringVar(value=self.cfg.arch)
+        self.var_profile = tk.StringVar(value=self.cfg.profile)
+        self.var_cores = tk.StringVar(value=self.cfg.cores)
+        self.var_ram_mb = tk.StringVar(value=self.cfg.ram_mb)
         self.var_device = tk.StringVar(value=self.cfg.last_device)
         self.var_auto = tk.BooleanVar(value=self.cfg.auto_refresh)
         self.var_interval = tk.IntVar(value=self.cfg.refresh_seconds)
         self.var_run = tk.StringVar(value="Run: -")
         self.var_node = tk.StringVar(value="Tailscale: -")
+
+        # Detailed values retained for logging and future diagnostics.
         self.var_adb = tk.StringVar(value="ADB: -")
         self.var_boot = tk.StringVar(value="Boot: -")
         self.var_model = tk.StringVar(value="Model: -")
@@ -546,128 +635,187 @@ class CloudPhoneGUI:
         self.var_host_mem = tk.StringVar(value="Runner MEM: -")
         self.var_qemu = tk.StringVar(value="QEMU: -")
 
+        # Human-friendly dashboard cards.
+        self.var_card_cloud = tk.StringVar(value="未连接\n等待发现云机")
+        self.var_card_android = tk.StringVar(value="未检测\nAndroid 状态未知")
+        self.var_card_app = tk.StringVar(value=f"未检测\n{self.var_package.get()}")
+        self.var_card_runner = tk.StringVar(value="未检测\n云服务器资源未知")
+        self.var_card_qemu = tk.StringVar(value="未检测\n模拟器资源未知")
+
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(150, self._drain_queue)
+        self.root.after(400, self.refresh_github_auth)
         self.root.after(800, self._auto_tick)
         self.log(f"ADB: {self.tools.adb or '未找到'}")
         self.log(f"scrcpy: {self.tools.scrcpy or '未找到'}")
         self.log(f"Tailscale: {self.tools.tailscale or '未找到'}")
-        self.log(f"GitHub CLI: {self.tools.gh or '未找到（仅影响一键初始化备份密钥）'}")
-        self.log(f"GitHub 登录: {'已自动读取到会话凭证' if self.var_token.get().strip() else '未检测到，请在顶部填写 Token'}")
+        self.log(f"GitHub CLI: {self.tools.gh or '未找到'}")
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
 
-        cfg = ttk.LabelFrame(outer, text="GitHub / 云机配置", padding=8)
-        cfg.pack(fill="x")
-        for col in range(6):
-            cfg.columnconfigure(col, weight=1 if col in (1, 3, 5) else 0)
+        # GitHub authorization bar: no token textbox is exposed.
+        auth = ttk.Frame(outer)
+        auth.pack(fill="x", pady=(0, 10))
+        ttk.Label(auth, text="GitHub", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Label(auth, textvariable=self.var_github_status).pack(side="left", padx=(10, 14))
+        ttk.Button(auth, text="GitHub 授权登录", command=self.github_login).pack(side="left", padx=3)
+        ttk.Button(auth, text="刷新登录", command=self.refresh_github_auth).pack(side="left", padx=3)
+        ttk.Button(auth, text="退出登录", command=self.github_logout).pack(side="left", padx=3)
+        ttk.Label(auth, text="凭证由 GitHub CLI 安全保存，本程序不显示 Token").pack(side="right")
 
-        ttk.Label(cfg, text="GitHub Token").grid(row=0, column=0, sticky="w")
-        ttk.Entry(cfg, textvariable=self.var_token, show="*", width=34).grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Label(cfg, text="仓库").grid(row=0, column=2, sticky="w")
-        ttk.Entry(cfg, textvariable=self.var_repo, width=32).grid(row=0, column=3, sticky="ew", padx=5)
-        ttk.Label(cfg, text="分支").grid(row=0, column=4, sticky="w")
-        ttk.Entry(cfg, textvariable=self.var_branch, width=12).grid(row=0, column=5, sticky="ew", padx=5)
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True)
+        dashboard = ttk.Frame(notebook, padding=12)
+        config = ttk.Frame(notebook, padding=12)
+        apptab = ttk.Frame(notebook, padding=12)
+        logtab = ttk.Frame(notebook, padding=6)
+        notebook.add(dashboard, text="控制台")
+        notebook.add(config, text="手机配置")
+        notebook.add(apptab, text="App 控制")
+        notebook.add(logtab, text="运行日志")
 
-        ttk.Label(cfg, text="Phone ID").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(cfg, textvariable=self.var_phone, width=12).grid(row=1, column=1, sticky="w", padx=5, pady=(6, 0))
-        ttk.Label(cfg, text="创建工作流").grid(row=1, column=2, sticky="w", pady=(6, 0))
-        ttk.Entry(cfg, textvariable=self.var_create_wf).grid(row=1, column=3, sticky="ew", padx=5, pady=(6, 0))
-        ttk.Label(cfg, text="管理/恢复工作流").grid(row=1, column=4, sticky="w", pady=(6, 0))
-        ttk.Entry(cfg, textvariable=self.var_managed_wf).grid(row=1, column=5, sticky="ew", padx=5, pady=(6, 0))
+        # ---------------- Dashboard ----------------
+        header = ttk.Frame(dashboard)
+        header.pack(fill="x")
+        ttk.Label(header, textvariable=self.var_phone_name, font=("Segoe UI", 16, "bold")).pack(side="left")
+        ttk.Label(header, textvariable=self.var_run).pack(side="left", padx=(16, 8))
+        ttk.Label(header, textvariable=self.var_node).pack(side="left", padx=8)
 
-        ttk.Label(cfg, text="APK URL").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(cfg, textvariable=self.var_apk).grid(row=2, column=1, columnspan=5, sticky="ew", padx=5, pady=(6, 0))
-
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=8)
-        ttk.Button(actions, text="创建新手机", command=self.create_phone).pack(side="left", padx=3)
-        ttk.Button(actions, text="初始化备份密钥", command=self.init_backup_key).pack(side="left", padx=3)
-        ttk.Button(actions, text="从备份恢复", command=self.restore_phone).pack(side="left", padx=3)
-        ttk.Button(actions, text="备份当前手机", command=self.request_backup).pack(side="left", padx=3)
+        actions = ttk.Frame(dashboard)
+        actions.pack(fill="x", pady=(12, 10))
+        ttk.Button(actions, text="＋ 创建新手机", command=self.create_phone).pack(side="left", padx=3)
+        ttk.Button(actions, text="↺ 从备份恢复", command=self.restore_phone).pack(side="left", padx=3)
+        ttk.Button(actions, text="⬆ 备份当前手机", command=self.request_backup).pack(side="left", padx=3)
+        ttk.Button(actions, text="▶ 打开 scrcpy", command=self.open_scrcpy).pack(side="left", padx=3)
+        ttk.Button(actions, text="刷新状态", command=self.health_check).pack(side="left", padx=(14, 3))
         ttk.Button(actions, text="刷新 Run", command=self.refresh_run).pack(side="left", padx=3)
         ttk.Button(actions, text="取消 Run", command=self.cancel_run).pack(side="left", padx=3)
-        ttk.Checkbutton(actions, text="自动刷新", variable=self.var_auto).pack(side="left", padx=(16, 3))
-        ttk.Label(actions, text="秒").pack(side="right")
-        ttk.Spinbox(actions, from_=2, to=60, textvariable=self.var_interval, width=5).pack(side="right", padx=3)
 
-        status = ttk.LabelFrame(outer, text="云机状态", padding=8)
-        status.pack(fill="x")
-        top = ttk.Frame(status)
-        top.pack(fill="x")
-        ttk.Label(top, textvariable=self.var_run).pack(side="left", padx=(0, 18))
-        ttk.Label(top, textvariable=self.var_node).pack(side="left", padx=(0, 18))
+        cards = ttk.Frame(dashboard)
+        cards.pack(fill="x", pady=(2, 12))
+        for i in range(5):
+            cards.columnconfigure(i, weight=1, uniform="cards")
 
-        adbline = ttk.Frame(status)
-        adbline.pack(fill="x", pady=(7, 0))
-        ttk.Label(adbline, text="ADB 地址").pack(side="left")
-        ttk.Entry(adbline, textvariable=self.var_device, width=28).pack(side="left", padx=5)
-        ttk.Button(adbline, text="自动发现", command=self.discover_device).pack(side="left", padx=3)
-        ttk.Button(adbline, text="检测手机", command=self.health_check).pack(side="left", padx=3)
-        ttk.Button(adbline, text="打开 scrcpy", command=self.open_scrcpy).pack(side="left", padx=3)
+        def add_card(col: int, title: str, variable: tk.StringVar) -> None:
+            box = ttk.LabelFrame(cards, text=title, padding=(10, 12))
+            box.grid(row=0, column=col, sticky="nsew", padx=4)
+            ttk.Label(
+                box,
+                textvariable=variable,
+                justify="center",
+                anchor="center",
+                font=("Segoe UI", 10, "bold"),
+                wraplength=185,
+            ).pack(fill="both", expand=True)
 
-        grid = ttk.Frame(status)
-        grid.pack(fill="x", pady=(8, 0))
-        vars_ = [
-            self.var_adb,
-            self.var_boot,
-            self.var_model,
-            self.var_app,
-            self.var_app_cpu,
-            self.var_app_mem,
-            self.var_dev_cpu,
-            self.var_dev_mem,
-            self.var_host_cpu,
-            self.var_host_mem,
-            self.var_qemu,
+        add_card(0, "云机连接", self.var_card_cloud)
+        add_card(1, "Android", self.var_card_android)
+        add_card(2, "当前 App", self.var_card_app)
+        add_card(3, "云服务器", self.var_card_runner)
+        add_card(4, "QEMU 模拟器", self.var_card_qemu)
+
+        conn = ttk.LabelFrame(dashboard, text="连接", padding=10)
+        conn.pack(fill="x")
+        ttk.Label(conn, text="ADB 地址").pack(side="left")
+        ttk.Entry(conn, textvariable=self.var_device, width=28).pack(side="left", padx=6)
+        ttk.Button(conn, text="自动发现", command=self.discover_device).pack(side="left", padx=3)
+        ttk.Button(conn, text="检测手机", command=self.health_check).pack(side="left", padx=3)
+        ttk.Checkbutton(conn, text="自动刷新", variable=self.var_auto).pack(side="left", padx=(18, 3))
+        ttk.Spinbox(conn, from_=2, to=60, textvariable=self.var_interval, width=5).pack(side="left", padx=3)
+        ttk.Label(conn, text="秒").pack(side="left")
+
+        # ---------------- Configuration ----------------
+        ghbox = ttk.LabelFrame(config, text="GitHub / 工作流", padding=10)
+        ghbox.pack(fill="x")
+        ghbox.columnconfigure(1, weight=1)
+        ghbox.columnconfigure(3, weight=1)
+        ttk.Label(ghbox, text="仓库").grid(row=0, column=0, sticky="w")
+        self.repo_combo = ttk.Combobox(ghbox, textvariable=self.var_repo, width=42)
+        self.repo_combo.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(ghbox, text="读取我的仓库", command=self.load_repositories).grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(ghbox, text="分支").grid(row=0, column=3, sticky="e")
+        ttk.Entry(ghbox, textvariable=self.var_branch, width=18).grid(row=0, column=4, sticky="ew", padx=6)
+
+        ttk.Label(ghbox, text="工作流").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.workflow_combo = ttk.Combobox(ghbox, textvariable=self.var_workflow, width=42)
+        self.workflow_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Button(ghbox, text="读取工作流", command=self.load_workflows).grid(row=1, column=2, padx=(0, 12), pady=(8, 0))
+        ttk.Button(ghbox, text="初始化备份密钥", command=self.init_backup_key).grid(row=1, column=4, sticky="e", padx=6, pady=(8, 0))
+
+        phone = ttk.LabelFrame(config, text="手机身份", padding=10)
+        phone.pack(fill="x", pady=(10, 0))
+        for col in (1, 3, 5):
+            phone.columnconfigure(col, weight=1)
+        ttk.Label(phone, text="手机名称").grid(row=0, column=0, sticky="w")
+        ttk.Entry(phone, textvariable=self.var_phone_name).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(phone, text="Phone ID").grid(row=0, column=2, sticky="w")
+        ttk.Entry(phone, textvariable=self.var_phone, width=12).grid(row=0, column=3, sticky="ew", padx=6)
+        ttk.Label(phone, text="默认包名").grid(row=0, column=4, sticky="w")
+        ttk.Entry(phone, textvariable=self.var_package).grid(row=0, column=5, sticky="ew", padx=6)
+
+        apkbox = ttk.LabelFrame(config, text="APK", padding=10)
+        apkbox.pack(fill="x", pady=(10, 0))
+        apkbox.columnconfigure(1, weight=1)
+        ttk.Label(apkbox, text="APK URL").grid(row=0, column=0, sticky="w")
+        ttk.Entry(apkbox, textvariable=self.var_apk).grid(row=0, column=1, sticky="ew", padx=6)
+
+        advanced = ttk.LabelFrame(config, text="Android / 云机规格（高级）", padding=10)
+        advanced.pack(fill="x", pady=(10, 0))
+        for col in (1, 3, 5, 7):
+            advanced.columnconfigure(col, weight=1)
+        fields = [
+            ("Android API", self.var_api_level),
+            ("设备 Profile", self.var_profile),
+            ("CPU 核数", self.var_cores),
+            ("内存 MB", self.var_ram_mb),
+            ("Target", self.var_target),
+            ("架构", self.var_arch),
         ]
-        for i, var in enumerate(vars_):
-            ttk.Label(grid, textvariable=var).grid(row=i // 4, column=i % 4, sticky="w", padx=8, pady=3)
-            grid.columnconfigure(i % 4, weight=1)
+        for i, (label, variable) in enumerate(fields):
+            row = i // 4
+            pair = i % 4
+            col = pair * 2
+            ttk.Label(advanced, text=label).grid(row=row, column=col, sticky="w", pady=4)
+            ttk.Entry(advanced, textvariable=variable).grid(row=row, column=col + 1, sticky="ew", padx=6, pady=4)
 
-        appbox = ttk.LabelFrame(outer, text="App 控制（默认 BICOIN，可自定义包名并自动记忆）", padding=8)
-        appbox.pack(fill="x", pady=8)
+        ttk.Label(
+            config,
+            text="所有字段都会自动记忆。恢复完整 AVD 时建议保持 API / 架构 / Profile 与备份时一致。",
+        ).pack(anchor="w", pady=(10, 0))
+
+        # ---------------- App control ----------------
+        ttk.Label(apptab, text="App 控制", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            apptab,
+            text="默认 BICOIN：com.temperaturecoin。可以输入任何已安装 App 包名，历史包名会记住。",
+        ).pack(anchor="w", pady=(4, 12))
+        appbox = ttk.Frame(apptab)
+        appbox.pack(fill="x")
         ttk.Label(appbox, text="包名").pack(side="left")
         self.package_combo = ttk.Combobox(
             appbox,
             textvariable=self.var_package,
             values=self.cfg.package_history,
-            width=38,
+            width=46,
         )
-        self.package_combo.pack(side="left", padx=5)
+        self.package_combo.pack(side="left", padx=6)
         self.package_combo.bind("<<ComboboxSelected>>", lambda _e: self.remember_package())
-        ttk.Button(appbox, text="记住包名", command=self.remember_package).pack(side="left", padx=3)
+        ttk.Button(appbox, text="记住", command=self.remember_package).pack(side="left", padx=3)
         ttk.Button(appbox, text="读取已装 App", command=self.load_packages).pack(side="left", padx=3)
-        ttk.Button(appbox, text="启动 App", command=self.start_app).pack(side="left", padx=3)
-        ttk.Button(appbox, text="关闭 App", command=self.stop_app).pack(side="left", padx=3)
-        ttk.Button(appbox, text="重启 App", command=self.restart_app).pack(side="left", padx=3)
+        ttk.Button(appbox, text="启动", command=self.start_app).pack(side="left", padx=(14, 3))
+        ttk.Button(appbox, text="关闭", command=self.stop_app).pack(side="left", padx=3)
+        ttk.Button(appbox, text="重启", command=self.restart_app).pack(side="left", padx=3)
+        ttk.Button(appbox, text="打开 scrcpy", command=self.open_scrcpy).pack(side="left", padx=3)
 
-        notebook = ttk.Notebook(outer)
-        notebook.pack(fill="both", expand=True)
-        logtab = ttk.Frame(notebook, padding=5)
-        helptab = ttk.Frame(notebook, padding=10)
-        notebook.add(logtab, text="运行日志")
-        notebook.add(helptab, text="说明")
-
+        # ---------------- Logs ----------------
         self.log_text = tk.Text(logtab, wrap="word", height=18)
         scroll = ttk.Scrollbar(logtab, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-
-        help_text = (
-            "1. GitHub Token 只保存在当前程序内存，不写入配置文件。\n"
-            "2. 创建新手机：触发 create_workflow，默认 cloud-phone-managed.yml（mode=new）。\n"
-            "3. 从备份恢复：触发 managed_workflow，传 mode=restore。\n"
-            "4. 备份当前手机：向仓库写入 Cloud Phone Command Issue；配套 managed workflow 会在当前 Runner 内检测命令、正常停止模拟器并保存完整 AVD。\n"
-            "5. 自动发现：优先从本机 Tailscale status --json 匹配 phone_id + run_id，得到 Tailscale IPv4，然后使用 :5555。\n"
-            "6. App 控制：默认 com.temperaturecoin；可输入任何合法 Android 包名，点击“记住包名”后下次仍会显示。\n"
-            "7. CPU：Android CPU 是虚拟机内部值；后续 managed workflow 可增加宿主 Runner 指标接口，GUI 会继续接入。\n"
-        )
-        ttk.Label(helptab, text=help_text, justify="left", wraplength=1000).pack(anchor="nw")
 
     def log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -703,9 +851,15 @@ class CloudPhoneGUI:
         self.root.after(150, self._drain_queue)
 
     def api(self) -> GitHubAPI:
-        token = self.var_token.get().strip()
+        token = (
+            os.environ.get("GH_TOKEN")
+            or os.environ.get("GITHUB_TOKEN")
+            or self.var_token.get().strip()
+            or self.tools.github_auth_token()
+        )
         if not token:
-            raise RuntimeError("请填写 GitHub Token，或设置 GH_TOKEN 环境变量")
+            raise RuntimeError("请先点击“GitHub 授权登录”完成授权")
+        self.var_token.set(token)
         return GitHubAPI(self.var_repo.get(), token)
 
     def _phone_id(self) -> str:
@@ -724,10 +878,18 @@ class CloudPhoneGUI:
         self.cfg.repo = self.var_repo.get().strip()
         self.cfg.branch = self.var_branch.get().strip() or "main"
         self.cfg.phone_id = self.var_phone.get().strip() or "001"
-        self.cfg.create_workflow = self.var_create_wf.get().strip() or "cloud-phone-managed.yml"
-        self.cfg.managed_workflow = self.var_managed_wf.get().strip() or "cloud-phone-managed.yml"
+        self.cfg.phone_name = self.var_phone_name.get().strip() or f"Phone-{self.cfg.phone_id}"
+        workflow = self.var_workflow.get().strip() or "cloud-phone-managed.yml"
+        self.cfg.create_workflow = workflow
+        self.cfg.managed_workflow = workflow
         self.cfg.apk_url = self.var_apk.get().strip() or DEFAULT_APK_URL
         self.cfg.package_name = self.var_package.get().strip() or DEFAULT_PACKAGE
+        self.cfg.api_level = self.var_api_level.get().strip() or "35"
+        self.cfg.target = self.var_target.get().strip() or "google_apis"
+        self.cfg.arch = self.var_arch.get().strip() or "x86_64"
+        self.cfg.profile = self.var_profile.get().strip() or "pixel_6"
+        self.cfg.cores = self.var_cores.get().strip() or "4"
+        self.cfg.ram_mb = self.var_ram_mb.get().strip() or "8192"
         self.cfg.last_device = self.var_device.get().strip()
         self.cfg.auto_refresh = bool(self.var_auto.get())
         try:
@@ -749,55 +911,140 @@ class CloudPhoneGUI:
         self.save_config()
         self.log(f"已记住包名: {pkg}")
 
-    def init_backup_key(self) -> None:
-        token = self.var_token.get().strip()
-        repo = self.var_repo.get().strip()
-        if not token:
-            messagebox.showerror(APP_NAME, "请先填写 GitHub Token")
+    def refresh_github_auth(self) -> None:
+        def work() -> tuple[str, str]:
+            account = self.tools.github_account()
+            token = self.tools.github_auth_token() if account else ""
+            return account, token
+
+        def done(result: tuple[str, str]) -> None:
+            account, token = result
+            if account and token:
+                self.var_token.set(token)
+                self.var_github_status.set(f"GitHub: 已登录 @{account}")
+            else:
+                self.var_token.set("")
+                self.var_github_status.set("GitHub: 未登录")
+
+        self.bg("检查 GitHub 登录", work, done)
+
+    def github_login(self) -> None:
+        def work() -> tuple[bool, str]:
+            return self.tools.github_login()
+
+        def done(result: tuple[bool, str]) -> None:
+            ok, detail = result
+            self.log(f"GitHub 授权登录: {'成功' if ok else '未完成'} {detail}")
+            self.refresh_github_auth()
+            if ok:
+                self.load_repositories()
+
+        self.bg("GitHub 授权登录", work, done)
+
+    def github_logout(self) -> None:
+        if not messagebox.askyesno(APP_NAME, "确定退出当前 GitHub 授权吗？"):
             return
+
+        def work() -> tuple[bool, str]:
+            return self.tools.github_logout()
+
+        def done(result: tuple[bool, str]) -> None:
+            self.log(result[1])
+            self.refresh_github_auth()
+
+        self.bg("退出 GitHub", work, done)
+
+    def load_repositories(self) -> None:
+        def work() -> list[str]:
+            return self.api().user_repos()
+
+        def done(items: list[str]) -> None:
+            self.repo_combo["values"] = items
+            self.log(f"已读取 {len(items)} 个可访问仓库")
+
+        self.bg("读取仓库", work, done)
+
+    def load_workflows(self) -> None:
+        def work() -> list[str]:
+            return self.api().workflows()
+
+        def done(items: list[str]) -> None:
+            self.workflow_combo["values"] = items
+            self.log(f"已读取 {len(items)} 个工作流")
+
+        self.bg("读取工作流", work, done)
+
+    def _workflow_inputs(self, mode: str) -> dict[str, str]:
+        phone_id = self._phone_id()
+        package = self._package()
+        return {
+            "mode": mode,
+            "phone_id": phone_id,
+            "phone_name": self.var_phone_name.get().strip() or f"Phone-{phone_id}",
+            "apk_url": self.var_apk.get().strip() or DEFAULT_APK_URL,
+            "package_name": package,
+            "api_level": self.var_api_level.get().strip() or "35",
+            "target": self.var_target.get().strip() or "google_apis",
+            "arch": self.var_arch.get().strip() or "x86_64",
+            "profile": self.var_profile.get().strip() or "pixel_6",
+            "cores": self.var_cores.get().strip() or "4",
+            "ram_mb": self.var_ram_mb.get().strip() or "8192",
+        }
+
+    def init_backup_key(self) -> None:
+        repo = self.var_repo.get().strip()
+        token = (
+            os.environ.get("GH_TOKEN")
+            or os.environ.get("GITHUB_TOKEN")
+            or self.var_token.get().strip()
+            or self.tools.github_auth_token()
+        )
+        if not token:
+            messagebox.showerror(APP_NAME, "请先点击“GitHub 授权登录”")
+            return
+
         def work() -> tuple[bool, str]:
             return self.tools.set_github_secret(repo, token)
+
         def done(result: tuple[bool, str]) -> None:
             ok, text = result
             self.log(f"初始化备份密钥: {'成功' if ok else '失败'} {text}")
             if ok:
-                messagebox.showinfo(APP_NAME, "AVD_BACKUP_KEY 已安全写入 GitHub Actions Secret。密钥不会保存到本地配置。")
+                messagebox.showinfo(APP_NAME, "备份加密密钥已写入 GitHub Actions Secret。")
+
         self.bg("初始化备份密钥", work, done)
 
     def create_phone(self) -> None:
         self.save_config()
+
         def work() -> str:
             api = self.api()
-            wf = self.var_create_wf.get().strip()
-            inputs = {"phone_id": self._phone_id(), "apk_url": self.var_apk.get().strip() or DEFAULT_APK_URL}
+            wf = self.var_workflow.get().strip() or "cloud-phone-managed.yml"
+            inputs = self._workflow_inputs("new")
             notes = []
-            if "managed" in wf.lower():
-                inputs["mode"] = "new"
-                exists = api.repo_secret_exists("AVD_BACKUP_KEY")
-                if exists is False:
-                    ok, detail = self.tools.set_github_secret(
-                        self.var_repo.get().strip(), self.var_token.get().strip()
-                    )
-                    if ok:
-                        notes.append("备份密钥已自动初始化")
-                    else:
-                        notes.append(f"备份密钥自动初始化失败（新机仍继续创建）: {detail}")
-                elif exists is None:
-                    notes.append("无法读取 Secret 元数据；新机继续创建，备份前请确认密钥已初始化")
+            exists = api.repo_secret_exists("AVD_BACKUP_KEY")
+            if exists is False:
+                token = self.var_token.get().strip() or self.tools.github_auth_token()
+                ok, detail = self.tools.set_github_secret(self.var_repo.get().strip(), token)
+                if ok:
+                    notes.append("备份密钥已自动初始化")
+                else:
+                    notes.append(f"备份密钥初始化失败: {detail}")
             api.dispatch(wf, self.var_branch.get().strip() or "main", inputs)
             suffix = ("；" + "；".join(notes)) if notes else ""
-            return "GitHub workflow 已触发" + suffix
+            return f"已创建 {inputs['phone_name']}（Phone ID {inputs['phone_id']}）" + suffix
+
         self.bg("创建新手机", work, lambda v: (self.log(v), self.root.after(1500, self.refresh_run)))
 
     def restore_phone(self) -> None:
         self.save_config()
+
         def work() -> str:
-            self.api().dispatch(
-                self.var_managed_wf.get().strip(),
-                self.var_branch.get().strip() or "main",
-                {"mode": "restore", "phone_id": self._phone_id()},
-            )
-            return "恢复工作流已触发"
+            wf = self.var_workflow.get().strip() or "cloud-phone-managed.yml"
+            inputs = self._workflow_inputs("restore")
+            self.api().dispatch(wf, self.var_branch.get().strip() or "main", inputs)
+            return f"已触发恢复：{inputs['phone_name']}（Phone ID {inputs['phone_id']}）"
+
         self.bg("从备份恢复", work, lambda v: (self.log(v), self.root.after(1500, self.refresh_run)))
 
     def request_backup(self) -> None:
@@ -849,11 +1096,13 @@ class CloudPhoneGUI:
 
     def discover_device(self) -> None:
         phone = self.var_phone.get().strip() or "001"
+        phone_name = self.var_phone_name.get().strip()
         rid = self.latest_run_id
+
         def work() -> tuple[str, str]:
-            ip, host = self.tools.discover_phone(phone, rid)
+            ip, host = self.tools.discover_phone(phone, rid, phone_name)
             if not ip and rid:
-                # Fallback: finished run logs may contain TAILSCALE_ADB=x.x.x.x:5555.
+                # Fallback: run logs may contain TAILSCALE_ADB=x.x.x.x:5555.
                 try:
                     text = self.api().run_logs_text(rid)
                     match = re.search(r"TAILSCALE_ADB=(100(?:\.\d{1,3}){3}):5555", text)
@@ -867,14 +1116,17 @@ class CloudPhoneGUI:
             ip, host = data
             if not ip:
                 self.var_node.set("Tailscale: 未发现")
+                self.var_card_cloud.set("未发现\n请先刷新 Run")
                 return
             address = f"{ip}:5555"
             self.var_device.set(address)
             self.var_node.set(f"Tailscale: {host or ip}")
+            self.var_card_cloud.set(f"已发现\n{address}")
             self.cfg.last_device = address
             self.save_config()
             self.log(f"发现云机 {host}: {address}")
             self.health_check()
+
         self.bg("自动发现云机", work, done)
 
     def health_check(self) -> None:
@@ -893,17 +1145,38 @@ class CloudPhoneGUI:
         self.bg("检测手机", work, self._apply_health)
 
     def _apply_health(self, h: dict[str, str]) -> None:
-        self.var_adb.set(f"ADB: {h.get('adb', '-')}")
-        self.var_boot.set(f"Boot: {h.get('boot', '-')}")
-        self.var_model.set(f"Model: {h.get('model', '-')} / Android {h.get('android', '-')}")
-        self.var_app.set(f"App: {h.get('app', '-')}  PID {h.get('app_pid', '-')}")
-        self.var_app_cpu.set(f"App CPU: {h.get('app_cpu', '-')}")
-        self.var_app_mem.set(f"App MEM: {h.get('app_mem', '-')}")
+        adb_state = h.get("adb", "-")
+        boot = h.get("boot", "-")
+        model = h.get("model", "-")
+        android = h.get("android", "-")
+        app_state = h.get("app", "-")
+        app_pid = h.get("app_pid", "-")
+        app_cpu = h.get("app_cpu", "-")
+        app_mem = h.get("app_mem", "-")
+        host_cpu = h.get("host_cpu", "-")
+        host_mem = h.get("host_mem", "-")
+        qemu = h.get("qemu", "-")
+
+        self.var_adb.set(f"ADB: {adb_state}")
+        self.var_boot.set(f"Boot: {boot}")
+        self.var_model.set(f"Model: {model} / Android {android}")
+        self.var_app.set(f"App: {app_state}  PID {app_pid}")
+        self.var_app_cpu.set(f"App CPU: {app_cpu}")
+        self.var_app_mem.set(f"App MEM: {app_mem}")
         self.var_dev_cpu.set(f"Android CPU: {h.get('device_cpu', '-')}")
         self.var_dev_mem.set(f"Android MEM: {h.get('device_mem', '-')}")
-        self.var_host_cpu.set(f"Runner CPU: {h.get('host_cpu', '-')}")
-        self.var_host_mem.set(f"Runner MEM: {h.get('host_mem', '-')}")
-        self.var_qemu.set(f"QEMU: {h.get('qemu', '-')}")
+        self.var_host_cpu.set(f"Runner CPU: {host_cpu}")
+        self.var_host_mem.set(f"Runner MEM: {host_mem}")
+        self.var_qemu.set(f"QEMU: {qemu}")
+
+        addr = self.var_device.get().strip() or "未发现地址"
+        cloud_title = "已连接" if adb_state == "已连接" else adb_state
+        self.var_card_cloud.set(f"{cloud_title}\n{addr}")
+        android_title = "已启动" if boot == "1" else f"Boot {boot}"
+        self.var_card_android.set(f"{android_title}\nAndroid {android} · {model}")
+        self.var_card_app.set(f"{app_state} · PID {app_pid}\nCPU {app_cpu} · MEM {app_mem}")
+        self.var_card_runner.set(f"CPU {host_cpu}\n内存 {host_mem}")
+        self.var_card_qemu.set(qemu)
 
     def load_packages(self) -> None:
         address = self.var_device.get().strip()
