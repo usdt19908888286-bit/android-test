@@ -582,6 +582,12 @@ class LocalTools:
         return out.strip() if code == 0 else ""
 
     def github_login(self) -> tuple[bool, str]:
+        """Run GitHub device authorization without opening a browser automatically.
+
+        GitHub CLI generates the one-time code and copies it to the clipboard. The
+        GUI shows https://github.com/login/device and lets the user decide whether
+        to open/copy it.
+        """
         installed_now = False
         if not self.gh:
             ok, detail = self.ensure_github_cli()
@@ -589,7 +595,15 @@ class LocalTools:
                 return False, detail
             installed_now = True
         try:
-            flags = 0x00000010 if os.name == "nt" else 0
+            # gh normally opens the browser during --web login. Route that request
+            # into a no-op batch file instead; the GUI exposes the login URL.
+            helper_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CloudAndroidManager"
+            helper_dir.mkdir(parents=True, exist_ok=True)
+            helper = helper_dir / "no_browser.cmd"
+            helper.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env["GH_BROWSER"] = f'cmd.exe /d /c "{helper}"'
             cp = subprocess.run(
                 [
                     self.gh,
@@ -600,15 +614,22 @@ class LocalTools:
                     "--git-protocol",
                     "https",
                     "--web",
+                    "--clipboard",
                 ],
+                input="\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=300,
-                creationflags=flags,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
             )
             account = self.github_account()
             if cp.returncode == 0 and account:
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
                 return True, prefix + f"已登录 @{account}"
-            return False, "GitHub 授权未完成"
+            return False, "GitHub 授权未完成或已取消"
         except subprocess.TimeoutExpired:
             return False, "GitHub 授权超时"
         except Exception as exc:
@@ -1036,13 +1057,121 @@ class CloudPhoneGUI:
 
         self.bg("检查 GitHub 登录", work, done)
 
+    def _copy_to_clipboard(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception as exc:
+            self.log(f"复制到剪贴板失败: {exc}")
+
+    def _open_github_login_page(self) -> None:
+        url = "https://github.com/login/device"
+        try:
+            if os.name == "nt":
+                os.startfile(url)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", url])
+        except Exception as exc:
+            self.log(f"打开登录页面失败: {exc}")
+
+    def _poll_github_login_code(self) -> None:
+        win = getattr(self, "_github_login_dialog", None)
+        code_var = getattr(self, "_github_login_code_var", None)
+        if not win or not code_var:
+            return
+        try:
+            if not win.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            value = self.root.clipboard_get().strip()
+            if re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}", value):
+                code_var.set(value)
+        except Exception:
+            pass
+        self.root.after(350, self._poll_github_login_code)
+
+    def _show_github_login_dialog(self) -> None:
+        existing = getattr(self, "_github_login_dialog", None)
+        if existing:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(self.root)
+        win.title("GitHub 授权登录")
+        win.geometry("620x300")
+        win.resizable(False, False)
+        win.transient(self.root)
+        self._github_login_dialog = win
+        self._github_login_code_var = tk.StringVar(value="正在生成一次性验证码…")
+        self._github_login_status_var = tk.StringVar(value="正在准备 GitHub CLI；不会自动打开浏览器")
+        url = "https://github.com/login/device"
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="GitHub 设备授权", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="浏览器不会自动弹出。复制下面的地址，或由你手动点击打开，然后输入一次性验证码。",
+            wraplength=570,
+        ).pack(anchor="w", pady=(6, 14))
+
+        ttk.Label(body, text="登录地址").pack(anchor="w")
+        url_row = ttk.Frame(body)
+        url_row.pack(fill="x", pady=(4, 10))
+        url_entry = ttk.Entry(url_row)
+        url_entry.insert(0, url)
+        url_entry.configure(state="readonly")
+        url_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(url_row, text="复制链接", command=lambda: self._copy_to_clipboard(url)).pack(side="left", padx=(6, 0))
+        ttk.Button(url_row, text="手动打开", command=self._open_github_login_page).pack(side="left", padx=(6, 0))
+
+        ttk.Label(body, text="一次性验证码").pack(anchor="w")
+        code_row = ttk.Frame(body)
+        code_row.pack(fill="x", pady=(4, 10))
+        ttk.Label(
+            code_row,
+            textvariable=self._github_login_code_var,
+            font=("Consolas", 16, "bold"),
+        ).pack(side="left")
+        ttk.Button(
+            code_row,
+            text="复制验证码",
+            command=lambda: self._copy_to_clipboard(self._github_login_code_var.get()),
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Label(body, textvariable=self._github_login_status_var).pack(anchor="w", pady=(2, 10))
+        footer = ttk.Frame(body)
+        footer.pack(fill="x")
+        ttk.Button(footer, text="检查登录状态", command=self.refresh_github_auth).pack(side="left")
+        ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right")
+
+        self.root.after(350, self._poll_github_login_code)
+
     def github_login(self) -> None:
+        self._show_github_login_dialog()
+        status_var = getattr(self, "_github_login_status_var", None)
+        if status_var:
+            status_var.set("正在准备 GitHub CLI 和一次性验证码；不会自动打开浏览器")
+
         def work() -> tuple[bool, str]:
             return self.tools.github_login()
 
         def done(result: tuple[bool, str]) -> None:
             ok, detail = result
             self.log(f"GitHub 授权登录: {'成功' if ok else '未完成'} {detail}")
+            status = getattr(self, "_github_login_status_var", None)
+            if status:
+                status.set("授权完成" if ok else detail)
             self.refresh_github_auth()
             if ok:
                 self.load_repositories()
