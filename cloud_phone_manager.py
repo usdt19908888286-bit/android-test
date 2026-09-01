@@ -52,7 +52,7 @@ RUN_ID_RE = re.compile(r"-(\d+)$")
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 BUILTIN_WORKFLOW_PATH = ".github/workflows/cloud-phone-managed.yml"
-BUILTIN_MANAGED_WORKFLOW = 'name: Managed Android Cloud Phone\nrun-name: ${{ inputs.phone_name || \'Managed Phone\' }} · ${{ inputs.phone_id || \'001\' }} / ${{ inputs.mode || \'new\' }}\n\non:\n  workflow_dispatch:\n    inputs:\n      mode:\n        description: Create a new phone or restore the latest encrypted backup\n        required: true\n        default: new\n        type: choice\n        options:\n          - new\n          - restore\n      phone_id:\n        description: Logical phone ID (digits only, e.g. 001)\n        required: true\n        default: \'001\'\n        type: string\n      phone_name:\n        description: Friendly phone name shown in GitHub and the local GUI\n        required: false\n        default: \'BICOIN-001\'\n        type: string\n      package_name:\n        description: Android package used for GUI monitoring/launch only; it is not auto-installed\n        required: false\n        default: \'com.temperaturecoin\'\n        type: string\n      apk_url:\n        description: Optional APK reference only; managed phone creation does not auto-install APKs\n        required: false\n        default: \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\'\n        type: string\n      api_level:\n        description: Android API level\n        required: false\n        default: \'35\'\n        type: string\n      target:\n        description: Android system image target\n        required: false\n        default: \'google_apis\'\n        type: string\n      arch:\n        description: Android emulator architecture\n        required: false\n        default: \'x86_64\'\n        type: string\n      profile:\n        description: Android device profile\n        required: false\n        default: \'pixel_6\'\n        type: string\n      cores:\n        description: Emulator CPU cores\n        required: false\n        default: \'4\'\n        type: string\n      ram_mb:\n        description: Emulator RAM in MiB\n        required: false\n        default: \'8192\'\n        type: string\n      device_manufacturer:\n        description: Optional Android Build.MANUFACTURER value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_brand:\n        description: Optional Android Build.BRAND value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_model:\n        description: Optional Android Build.MODEL value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n\npermissions:\n  contents: read\n  actions: read\n  issues: write\n\nconcurrency:\n  group: managed-android-phone-${{ inputs.phone_id || \'001\' }}\n  cancel-in-progress: true\n\nenv:\n  DISPLAY: :99\n  APK_URL: ${{ inputs.apk_url || \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\' }}\n  PHONE_ID: ${{ inputs.phone_id || \'001\' }}\n  PHONE_NAME: ${{ inputs.phone_name || \'BICOIN-001\' }}\n  PACKAGE_NAME: ${{ inputs.package_name || \'com.temperaturecoin\' }}\n  AVD_NAME: managed-phone-${{ inputs.phone_id || \'001\' }}\n  DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || \'\' }}\n  DEVICE_BRAND: ${{ inputs.device_brand || \'\' }}\n  DEVICE_MODEL: ${{ inputs.device_model || \'\' }}\n\njobs:\n  phone:\n    runs-on: ubuntu-latest\n    timeout-minutes: 330\n    env:\n      AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v4\n\n      - name: Validate inputs and backup encryption key\n        shell: bash\n        run: |\n          set -euo pipefail\n          case "$PHONE_ID" in\n            \'\'|*[!0-9]*) echo \'::error::phone_id must contain digits only\'; exit 1 ;;\n          esac\n          printf \'%s\\n\' "${PACKAGE_NAME:-}" | grep -Eq \'^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$\' || { echo \'::error::package_name is invalid\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MANUFACTURER:-}" | grep -Eq \'^[A-Za-z0-9._+ -]*$\' || { echo \'::error::device_manufacturer contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_BRAND:-}" | grep -Eq \'^[A-Za-z0-9._+-]*$\' || { echo \'::error::device_brand contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MODEL:-}" | grep -Eq \'^[A-Za-z0-9._+() -]*$\' || { echo \'::error::device_model contains unsupported characters\'; exit 1; }\n          if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then\n            echo \'::error::device_model requires device_manufacturer and device_brand\'\n            exit 1\n          fi\n          if [ "${{ inputs.mode }}" = \'restore\' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.\'\n            exit 1\n          fi\n          if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.\'\n          fi\n          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"\n\n      - name: Prepare phone identity\n        id: identity\n        shell: bash\n        run: |\n          set -euo pipefail\n          SLUG=$(printf \'%s\' "${PHONE_NAME:-}" | tr \'[:upper:]\' \'[:lower:]\' | sed -E \'s/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//\' | cut -c1-35)\n          [ -n "$SLUG" ] || SLUG="managed-phone${PHONE_ID}"\n          echo "ts_hostname=${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"\n          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"\n\n      - name: Join Tailscale\n        uses: tailscale/github-action@v4\n        with:\n          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}\n          tags: tag:github-phone\n          hostname: ${{ steps.identity.outputs.ts_hostname }}\n          version: latest\n\n      - name: Enable KVM and install runtime dependencies\n        shell: bash\n        run: |\n          set -euo pipefail\n          echo \'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\' | sudo tee /etc/udev/rules.d/99-kvm4all.rules\n          sudo udevadm control --reload-rules\n          sudo udevadm trigger --name-match=kvm\n          test -e /dev/kvm\n          sudo apt-get update -qq\n          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq\n          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &\n          sleep 2\n\n      - name: Verify direct Internet\n        shell: bash\n        run: |\n          set -euo pipefail\n          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null\n          echo \'DIRECT_NETWORK_OK\'\n\n      - name: Restore latest encrypted AVD backup\n        if: inputs.mode == \'restore\'\n        id: cache-restore\n        uses: actions/cache/restore@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}\n          restore-keys: |\n            managed-avd-${{ inputs.phone_id }}-\n\n      - name: Decrypt restored AVD\n        if: inputs.mode == \'restore\'\n        shell: bash\n        run: |\n          set -euo pipefail\n          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {\n            echo \'::error::No encrypted AVD backup exists for this phone_id.\'\n            exit 1\n          }\n          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name \'*.enc\' | head -n1)\n          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]\n          mkdir -p "$HOME/.android"\n          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst\n          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"\n          rm -f /tmp/managed-avd.tar.zst\n          test -f "$HOME/.android/avd/${AVD_NAME}.ini"\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"\n          echo \'MANAGED_AVD_DECRYPT_RESTORE_OK\'\n\n      - name: Prepare runner status service\n        shell: bash\n        run: |\n          cat >/tmp/runner_status_server.py <<\'PY\'\n          import http.server, json, os, subprocess, time\n\n          RUN_ID = os.environ.get(\'GITHUB_RUN_ID\', \'\')\n          PHONE_ID = os.environ.get(\'PHONE_ID\', \'\')\n\n          def cpu_sample():\n              def snap():\n                  with open(\'/proc/stat\', \'r\', encoding=\'utf-8\') as f:\n                      vals = [int(x) for x in f.readline().split()[1:]]\n                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)\n                  return sum(vals), idle\n              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()\n              total = max(1, b_total - a_total)\n              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)\n\n          def mem_sample():\n              vals = {}\n              with open(\'/proc/meminfo\', \'r\', encoding=\'utf-8\') as f:\n                  for line in f:\n                      k, v = line.split(\':\', 1)\n                      vals[k] = int(v.strip().split()[0])\n              total = vals.get(\'MemTotal\', 0)\n              avail = vals.get(\'MemAvailable\', 0)\n              used = max(0, total - avail)\n              pct = round(100.0 * used / total, 1) if total else 0\n              return total, used, avail, pct\n\n          def qemu_sample():\n              cp = subprocess.run(\n                  [\'ps\', \'-C\', \'qemu-system-x86_64\', \'-o\', \'%cpu=,%mem=,rss=,pid=\', \'--sort=-%cpu\'],\n                  capture_output=True, text=True\n              )\n              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), \'\')\n              if not line:\n                  return {\'cpu_percent\': 0.0, \'mem_percent\': 0.0, \'rss_kib\': 0, \'pid\': None}\n              parts = line.split()\n              try:\n                  return {\n                      \'cpu_percent\': float(parts[0]),\n                      \'mem_percent\': float(parts[1]),\n                      \'rss_kib\': int(parts[2]),\n                      \'pid\': int(parts[3]),\n                  }\n              except Exception:\n                  return {\'raw\': line}\n\n          class Handler(http.server.BaseHTTPRequestHandler):\n              def do_GET(self):\n                  if self.path not in (\'/\', \'/status\'):\n                      self.send_response(404); self.end_headers(); return\n                  total, used, avail, pct = mem_sample()\n                  load = os.getloadavg()\n                  data = {\n                      \'ok\': True,\n                      \'run_id\': RUN_ID,\n                      \'phone_id\': PHONE_ID,\n                      \'cpu_percent\': cpu_sample(),\n                      \'load1\': round(load[0], 2),\n                      \'load5\': round(load[1], 2),\n                      \'load15\': round(load[2], 2),\n                      \'mem_total_kib\': total,\n                      \'mem_used_kib\': used,\n                      \'mem_available_kib\': avail,\n                      \'mem_percent\': pct,\n                      \'qemu\': qemu_sample(),\n                  }\n                  body = json.dumps(data).encode()\n                  self.send_response(200)\n                  self.send_header(\'Content-Type\', \'application/json\')\n                  self.send_header(\'Content-Length\', str(len(body)))\n                  self.end_headers(); self.wfile.write(body)\n              def log_message(self, *args):\n                  pass\n\n          http.server.ThreadingHTTPServer((\'127.0.0.1\', 8787), Handler).serve_forever()\n          PY\n          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &\n          sleep 1\n          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json\n          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787\n          echo \'RUNNER_STATUS_READY=8787\'\n\n      - name: Prepare managed Android bootstrap script\n        shell: bash\n        run: |\n          cat >/tmp/managed-phone.sh <<\'SCRIPT\'\n          #!/usr/bin/env bash\n          set -euo pipefail\n\n          wait_android_boot() {\n            adb wait-for-device\n            for _ in $(seq 1 180); do\n              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d \'\\r\')" = \'1\' ] && return 0\n              sleep 1\n            done\n            return 1\n          }\n\n          echo \'MANAGED_AVD_BOOT_WAIT\'\n          wait_android_boot\n          echo \'MANAGED_AVD_BOOT_COMPLETE\'\n\n          # Optional Build identity for emulator compatibility testing. Android Emulator\n          # does not allow arbitrary ro.product.* values through -prop, so use the\n          # writable-system/remount development path and verify after reboot.\n          if [ -n "${DEVICE_MODEL:-}" ]; then\n            echo "DEVICE_IDENTITY_TARGET=${DEVICE_MANUFACTURER}|${DEVICE_BRAND}|${DEVICE_MODEL}"\n            IDENTITY_READY=0\n            if adb root >/tmp/adb-root.log 2>&1; then\n              adb wait-for-device\n              sleep 2\n              if adb remount >/tmp/adb-remount.log 2>&1; then\n                IDENTITY_READY=1\n              else\n                adb disable-verity >/tmp/adb-disable-verity.log 2>&1 || true\n                adb reboot || true\n                if wait_android_boot; then\n                  adb root >/tmp/adb-root2.log 2>&1 || true\n                  adb wait-for-device\n                  sleep 2\n                  if adb remount >/tmp/adb-remount2.log 2>&1; then\n                    IDENTITY_READY=1\n                  fi\n                fi\n              fi\n            fi\n\n            if [ "$IDENTITY_READY" = \'1\' ]; then\n              cat >/tmp/patch-device-identity.sh <<\'DEVICEPATCH\'\n          #!/system/bin/sh\n          set -eu\n          patch_prop() {\n            key="$1"\n            value="$2"\n            file="$3"\n            [ -f "$file" ] || return 0\n            if grep -q "^${key}=" "$file" 2>/dev/null; then\n              sed -i "s|^${key}=.*|${key}=${value}|g" "$file"\n            fi\n          }\n          for file in             /system/build.prop /system/system/build.prop             /product/build.prop /system/product/build.prop             /vendor/build.prop /system/vendor/build.prop             /odm/build.prop /system/odm/build.prop             /system_ext/build.prop /system/system_ext/build.prop; do\n            for suffix in \'\' \'.system\' \'.product\' \'.vendor\' \'.odm\' \'.system_ext\'; do\n              patch_prop "ro.product${suffix}.manufacturer" "$TARGET_MANUFACTURER" "$file"\n              patch_prop "ro.product${suffix}.brand" "$TARGET_BRAND" "$file"\n              patch_prop "ro.product${suffix}.model" "$TARGET_MODEL" "$file"\n            done\n          done\n          sync\n          DEVICEPATCH\n              adb push /tmp/patch-device-identity.sh /data/local/tmp/patch-device-identity.sh >/dev/null\n              adb shell chmod 700 /data/local/tmp/patch-device-identity.sh\n              if adb shell "TARGET_MANUFACTURER=\'${DEVICE_MANUFACTURER}\' TARGET_BRAND=\'${DEVICE_BRAND}\' TARGET_MODEL=\'${DEVICE_MODEL}\' sh /data/local/tmp/patch-device-identity.sh"; then\n                adb reboot || true\n                wait_android_boot\n              fi\n            else\n              echo \'::warning::Could not remount emulator system; continuing with stock AVD identity.\'\n            fi\n\n            ACTUAL_MANUFACTURER=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_BRAND=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d \'\\r\')\n            echo "DEVICE_IDENTITY_ACTUAL=${ACTUAL_MANUFACTURER}|${ACTUAL_BRAND}|${ACTUAL_MODEL}"\n            if [ "$ACTUAL_MODEL" = "$DEVICE_MODEL" ]; then\n              echo \'DEVICE_REAL_MODEL_APPLIED\'\n            else\n              echo "::warning::Requested model \'${DEVICE_MODEL}\', but Android reports \'${ACTUAL_MODEL}\'."\n            fi\n          fi\n\n          # Fresh Android often needs a short settling period before first app launch.\n          sleep 12\n          adb shell settings put global window_animation_scale 0 || true\n          adb shell settings put global transition_animation_scale 0 || true\n          adb shell settings put global animator_duration_scale 0 || true\n          adb shell settings put global disable_window_blurs 1 || true\n          adb shell settings put system peak_refresh_rate 60.0 || true\n          adb shell settings put system min_refresh_rate 60.0 || true\n          adb shell wm size 720x1600 || true\n          adb shell wm density 280 || true\n\n          # Phone creation/restoration is intentionally APK-neutral. The GUI may\n          # remember a package name for monitoring, but this workflow never downloads,\n          # installs, or auto-launches an APK.\n          DEFAULT_PACKAGE="$PACKAGE_NAME"\n          if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then\n            echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"\n          else\n            echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"\n          fi\n          echo \'MANAGED_PHONE_APK_NEUTRAL\'\n\n          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true\n          adb shell settings put global auto_update_system_apps 0 || true\n\n          echo \'ADB_TCPIP_BOOTSTRAP_START\'\n          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }\n          for _ in $(seq 1 30); do\n            nc -z 127.0.0.1 5555 && break\n            sleep 1\n          done\n          nc -z 127.0.0.1 5555\n          echo \'ADB_TCPIP_5555_READY\'\n\n          TS_IPV4=$(tailscale ip -4 | head -n1)\n          [ -n "$TS_IPV4" ]\n          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555\n          echo \'MANAGED_CLOUD_PHONE_READY\'\n          echo "TAILSCALE_ADB=${TS_IPV4}:5555"\n          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"\n          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"\n\n          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"\n          for _ in $(seq 1 1800); do\n            ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \\\n              --jq ".[] | select(.pull_request == null) | select(.title == \\"${COMMAND_TITLE}\\") | .number" \\\n              2>/dev/null | head -n1 || true)\n            if [ -n "$ISSUE_NO" ]; then\n              ISSUE_BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" \\\n                --jq \'.body // ""\' 2>/dev/null || true)\n              CMD_JSON=$(printf \'%s\\n\' "$ISSUE_BODY" | grep -m1 \'^{\' || true)\n              if [ -n "$CMD_JSON" ]; then\n                CMD=$(jq -r \'.command // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_RUN=$(jq -r \'.run_id // 0\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_PHONE=$(jq -r \'.phone_id // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                if [ "$CMD" = \'backup\' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then\n                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n                    echo \'BACKUP_REQUEST_REJECTED_NO_KEY\'\n                  else\n                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"\n                    printf \'%s\' "$ISSUE_NO" >/tmp/managed-backup-issue-number\n                    touch /tmp/managed-backup-requested\n                    adb shell sync || true\n                    exit 0\n                  fi\n                fi\n              fi\n            fi\n            sleep 10\n          done\n\n          # End-of-life safety backup when the 5-hour session naturally expires.\n          if [ -n "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP\'\n            touch /tmp/managed-backup-requested\n            adb shell sync || true\n          else\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY\'\n          fi\n          SCRIPT\n          chmod +x /tmp/managed-phone.sh\n          bash -n /tmp/managed-phone.sh\n          echo \'MANAGED_BOOTSTRAP_SCRIPT_READY\'\n\n      - name: Start managed Android phone\n        id: android\n        uses: reactivecircus/android-emulator-runner@v2\n        env:\n          PHONE_MODE: ${{ inputs.mode }}\n          GH_TOKEN: ${{ github.token }}\n        with:\n          api-level: ${{ inputs.api_level }}\n          target: ${{ inputs.target }}\n          arch: ${{ inputs.arch }}\n          profile: ${{ inputs.profile }}\n          avd-name: managed-phone-${{ inputs.phone_id || \'001\' }}\n          cores: ${{ inputs.cores }}\n          ram-size: ${{ format(\'{0}M\', inputs.ram_mb) }}\n          force-avd-creation: ${{ inputs.mode == \'new\' }}\n          disable-animations: false\n          emulator-options: >-\n            -no-snapshot\n            ${{ inputs.device_model != \'\' && \'-writable-system\' || \'\' }}\n            -gpu swiftshader_indirect\n            -noaudio\n            -no-boot-anim\n            -camera-back none\n            -camera-front none\n          script: bash /tmp/managed-phone.sh\n\n      - name: Pack and encrypt full AVD backup\n        id: pack\n        if: always()\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ ! -f /tmp/managed-backup-requested ]; then\n            echo \'should_save=false\' >> "$GITHUB_OUTPUT"\n            echo \'NO_BACKUP_REQUEST\'\n            exit 0\n          fi\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          mkdir -p /tmp/managed-avd-backup\n          rm -f /tmp/managed-avd-backup/*\n          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst\n          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY \\\n            -in /tmp/managed-avd.tar.zst \\\n            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"\n          rm -f /tmp/managed-avd.tar.zst\n          BYTES=$(stat -c \'%s\' /tmp/managed-avd-backup/*.enc)\n          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"\n          echo \'should_save=true\' >> "$GITHUB_OUTPUT"\n          echo \'FULL_AVD_ENCRYPTED_BACKUP_READY\'\n\n      - name: Save encrypted AVD backup to GitHub Actions Cache\n        if: steps.pack.outputs.should_save == \'true\'\n        uses: actions/cache/save@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}\n\n      - name: Close consumed backup command\n        if: steps.pack.outputs.should_save == \'true\'\n        env:\n          GH_TOKEN: ${{ github.token }}\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ -s /tmp/managed-backup-issue-number ]; then\n            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)\n            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true\n          fi\n          echo \'MANAGED_BACKUP_SAVED\'\n'
+BUILTIN_MANAGED_WORKFLOW = 'name: Managed Android Cloud Phone\nrun-name: ${{ inputs.phone_name || \'Managed Phone\' }} · ${{ inputs.phone_id || \'001\' }} / ${{ inputs.mode || \'new\' }}\n\non:\n  workflow_dispatch:\n    inputs:\n      mode:\n        description: Create a new phone or restore the latest encrypted backup\n        required: true\n        default: new\n        type: choice\n        options:\n          - new\n          - restore\n      phone_id:\n        description: Logical phone ID (digits only, e.g. 001)\n        required: true\n        default: \'001\'\n        type: string\n      phone_name:\n        description: Friendly phone name shown in GitHub and the local GUI\n        required: false\n        default: \'BICOIN-001\'\n        type: string\n      package_name:\n        description: Android package used for GUI monitoring/launch only; it is not auto-installed\n        required: false\n        default: \'com.temperaturecoin\'\n        type: string\n      apk_url:\n        description: Optional APK reference only; managed phone creation does not auto-install APKs\n        required: false\n        default: \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\'\n        type: string\n      api_level:\n        description: Android API level\n        required: false\n        default: \'35\'\n        type: string\n      target:\n        description: Android system image target\n        required: false\n        default: \'google_apis\'\n        type: string\n      arch:\n        description: Android emulator architecture\n        required: false\n        default: \'x86_64\'\n        type: string\n      profile:\n        description: Android device profile\n        required: false\n        default: \'pixel_6\'\n        type: string\n      cores:\n        description: Emulator CPU cores\n        required: false\n        default: \'4\'\n        type: string\n      ram_mb:\n        description: Emulator RAM in MiB\n        required: false\n        default: \'8192\'\n        type: string\n      use_s5:\n        description: Route Android network through the phone-specific SOCKS5 proxy\n        required: false\n        default: \'false\'\n        type: string\n      s5_secret_name:\n        description: Repository secret name containing the phone-specific SOCKS5 configuration\n        required: false\n        default: \'\'\n        type: string\n      device_manufacturer:\n        description: Optional Android Build.MANUFACTURER value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_brand:\n        description: Optional Android Build.BRAND value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_model:\n        description: Optional Android Build.MODEL value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n\npermissions:\n  contents: read\n  actions: read\n  issues: write\n\nconcurrency:\n  group: managed-android-phone-${{ inputs.phone_id || \'001\' }}\n  cancel-in-progress: true\n\nenv:\n  DISPLAY: :99\n  APK_URL: ${{ inputs.apk_url || \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\' }}\n  PHONE_ID: ${{ inputs.phone_id || \'001\' }}\n  PHONE_NAME: ${{ inputs.phone_name || \'BICOIN-001\' }}\n  PACKAGE_NAME: ${{ inputs.package_name || \'com.temperaturecoin\' }}\n  AVD_NAME: managed-phone-${{ inputs.phone_id || \'001\' }}\n  DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || \'\' }}\n  DEVICE_BRAND: ${{ inputs.device_brand || \'\' }}\n  DEVICE_MODEL: ${{ inputs.device_model || \'\' }}\n  USE_S5: ${{ inputs.use_s5 || \'false\' }}\n\njobs:\n  phone:\n    runs-on: ubuntu-latest\n    timeout-minutes: 330\n    env:\n      AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}\n      S5_CONFIG_B64: ${{ inputs.use_s5 == \'true\' && secrets[inputs.s5_secret_name] || \'\' }}\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v4\n\n      - name: Validate inputs and backup encryption key\n        shell: bash\n        run: |\n          set -euo pipefail\n          case "$PHONE_ID" in\n            \'\'|*[!0-9]*) echo \'::error::phone_id must contain digits only\'; exit 1 ;;\n          esac\n          printf \'%s\\n\' "${PACKAGE_NAME:-}" | grep -Eq \'^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$\' || { echo \'::error::package_name is invalid\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MANUFACTURER:-}" | grep -Eq \'^[A-Za-z0-9._+ -]*$\' || { echo \'::error::device_manufacturer contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_BRAND:-}" | grep -Eq \'^[A-Za-z0-9._+-]*$\' || { echo \'::error::device_brand contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MODEL:-}" | grep -Eq \'^[A-Za-z0-9._+() -]*$\' || { echo \'::error::device_model contains unsupported characters\'; exit 1; }\n          if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then\n            echo \'::error::device_model requires device_manufacturer and device_brand\'\n            exit 1\n          fi\n          if [ "${{ inputs.mode }}" = \'restore\' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.\'\n            exit 1\n          fi\n          if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.\'\n          fi\n          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"\n\n      - name: Prepare phone identity\n        id: identity\n        shell: bash\n        run: |\n          set -euo pipefail\n          SLUG=$(printf \'%s\' "${PHONE_NAME:-}" | tr \'[:upper:]\' \'[:lower:]\' | sed -E \'s/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//\' | cut -c1-35)\n          [ -n "$SLUG" ] || SLUG="managed-phone${PHONE_ID}"\n          echo "ts_hostname=${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"\n          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"\n\n      - name: Join Tailscale\n        uses: tailscale/github-action@v4\n        with:\n          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}\n          tags: tag:github-phone\n          hostname: ${{ steps.identity.outputs.ts_hostname }}\n          version: latest\n\n      - name: Enable KVM and install runtime dependencies\n        shell: bash\n        run: |\n          set -euo pipefail\n          echo \'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\' | sudo tee /etc/udev/rules.d/99-kvm4all.rules\n          sudo udevadm control --reload-rules\n          sudo udevadm trigger --name-match=kvm\n          test -e /dev/kvm\n          sudo apt-get update -qq\n          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq python3-pip\n          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &\n          sleep 2\n\n      - name: Prepare and verify phone network\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ "${USE_S5:-false}" != \'true\' ]; then\n            curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null\n            echo \'DIRECT_NETWORK_OK\'\n            exit 0\n          fi\n\n          [ -n "${S5_CONFIG_B64:-}" ] || { echo \'::error::S5 is enabled but the phone-specific S5 secret is missing\'; exit 1; }\n          python3 -m pip install --quiet --break-system-packages PySocks\n\n          cat >/tmp/s5_bridge.py <<\'PY\'\n          import base64\n          import json\n          import os\n          import select\n          import socketserver\n          from urllib.parse import urlsplit\n          import socks\n\n          cfg = json.loads(base64.b64decode(os.environ[\'S5_CONFIG_B64\']).decode(\'utf-8\'))\n          S5_HOST = str(cfg.get(\'host\') or \'\').strip()\n          S5_PORT = int(cfg.get(\'port\') or 0)\n          S5_USER = str(cfg.get(\'user\') or \'\') or None\n          S5_PASS = str(cfg.get(\'pass\') or \'\') or None\n          if not S5_HOST or not (1 <= S5_PORT <= 65535):\n              raise SystemExit(\'invalid S5 configuration\')\n\n          def open_upstream(host, port):\n              s = socks.socksocket()\n              s.set_proxy(\n                  socks.SOCKS5,\n                  S5_HOST,\n                  S5_PORT,\n                  rdns=True,\n                  username=S5_USER,\n                  password=S5_PASS,\n              )\n              s.settimeout(30)\n              s.connect((host, int(port)))\n              s.settimeout(None)\n              return s\n\n          def relay(a, b):\n              sockets = [a, b]\n              while True:\n                  readable, _, _ = select.select(sockets, [], [], 60)\n                  if not readable:\n                      continue\n                  for src in readable:\n                      dst = b if src is a else a\n                      data = src.recv(65536)\n                      if not data:\n                          return\n                      dst.sendall(data)\n\n          class Handler(socketserver.BaseRequestHandler):\n              def handle(self):\n                  client = self.request\n                  client.settimeout(30)\n                  data = b\'\'\n                  while b\'\\r\\n\\r\\n\' not in data and len(data) < 65536:\n                      chunk = client.recv(4096)\n                      if not chunk:\n                          return\n                      data += chunk\n                  if b\'\\r\\n\\r\\n\' not in data:\n                      return\n                  head, rest = data.split(b\'\\r\\n\\r\\n\', 1)\n                  lines = head.split(b\'\\r\\n\')\n                  parts = lines[0].decode(\'latin1\').split(\' \', 2)\n                  if len(parts) != 3:\n                      return\n                  method, target, version = parts\n                  try:\n                      if method.upper() == \'CONNECT\':\n                          host, port = target.rsplit(\':\', 1)\n                          upstream = open_upstream(host.strip(\'[]\'), int(port))\n                          client.sendall(b\'HTTP/1.1 200 Connection Established\\r\\n\\r\\n\')\n                          if rest:\n                              upstream.sendall(rest)\n                          relay(client, upstream)\n                          upstream.close()\n                          return\n\n                      parsed = urlsplit(target)\n                      if parsed.hostname:\n                          host = parsed.hostname\n                          port = parsed.port or 80\n                          path = parsed.path or \'/\'\n                          if parsed.query:\n                              path += \'?\' + parsed.query\n                      else:\n                          host_header = \'\'\n                          for line in lines[1:]:\n                              if line.lower().startswith(b\'host:\'):\n                                  host_header = line.split(b\':\', 1)[1].strip().decode(\'latin1\')\n                                  break\n                          if not host_header:\n                              return\n                          if \':\' in host_header:\n                              host, port_text = host_header.rsplit(\':\', 1)\n                              port = int(port_text)\n                          else:\n                              host, port = host_header, 80\n                          path = target\n                      upstream = open_upstream(host, port)\n                      lines[0] = f\'{method} {path} {version}\'.encode(\'latin1\')\n                      upstream.sendall(b\'\\r\\n\'.join(lines) + b\'\\r\\n\\r\\n\' + rest)\n                      relay(client, upstream)\n                      upstream.close()\n                  except Exception:\n                      try:\n                          client.sendall(b\'HTTP/1.1 502 Bad Gateway\\r\\nContent-Length: 0\\r\\n\\r\\n\')\n                      except Exception:\n                          pass\n\n          class Server(socketserver.ThreadingTCPServer):\n              allow_reuse_address = True\n              daemon_threads = True\n\n          Server((\'127.0.0.1\', 8118), Handler).serve_forever()\n          PY\n\n          cat >/tmp/s5_bridge_supervisor.sh <<\'SH\'\n          #!/usr/bin/env bash\n          set -u\n          while true; do\n            python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1\n            echo \'SOCKS5_BRIDGE_RESTARTING\' >>/tmp/s5_bridge.log\n            sleep 2\n          done\n          SH\n          chmod +x /tmp/s5_bridge_supervisor.sh\n          : >/tmp/s5_bridge.log\n          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &\n          S5_BRIDGE_PID=$!\n          echo "$S5_BRIDGE_PID" >/tmp/s5_bridge_supervisor.pid\n          sleep 1\n          kill -0 "$S5_BRIDGE_PID" 2>/dev/null || { echo \'::error::SOCKS5 local bridge failed to start\'; exit 1; }\n\n          python3 - <<\'PY\'\n          import base64, json, os, socks\n          cfg = json.loads(base64.b64decode(os.environ[\'S5_CONFIG_B64\']).decode(\'utf-8\'))\n          s = socks.socksocket()\n          s.set_proxy(\n              socks.SOCKS5,\n              str(cfg[\'host\']),\n              int(cfg[\'port\']),\n              rdns=True,\n              username=(str(cfg.get(\'user\') or \'\') or None),\n              password=(str(cfg.get(\'pass\') or \'\') or None),\n          )\n          s.settimeout(12)\n          s.connect((\'www.cloudflare.com\', 443))\n          s.close()\n          print(\'SOCKS5_UPSTREAM_OK\')\n          PY\n\n          curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 10 --max-time 20 \\\n            https://www.cloudflare.com/cdn-cgi/trace -o /dev/null\n          echo \'SOCKS5_BRIDGE_OK\'\n\n      - name: Restore latest encrypted AVD backup\n        if: inputs.mode == \'restore\'\n        id: cache-restore\n        uses: actions/cache/restore@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}\n          restore-keys: |\n            managed-avd-${{ inputs.phone_id }}-\n\n      - name: Decrypt restored AVD\n        if: inputs.mode == \'restore\'\n        shell: bash\n        run: |\n          set -euo pipefail\n          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {\n            echo \'::error::No encrypted AVD backup exists for this phone_id.\'\n            exit 1\n          }\n          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name \'*.enc\' | head -n1)\n          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]\n          mkdir -p "$HOME/.android"\n          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst\n          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"\n          rm -f /tmp/managed-avd.tar.zst\n          test -f "$HOME/.android/avd/${AVD_NAME}.ini"\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"\n          echo \'MANAGED_AVD_DECRYPT_RESTORE_OK\'\n\n      - name: Prepare runner status service\n        shell: bash\n        run: |\n          cat >/tmp/runner_status_server.py <<\'PY\'\n          import http.server, json, os, subprocess, time\n\n          RUN_ID = os.environ.get(\'GITHUB_RUN_ID\', \'\')\n          PHONE_ID = os.environ.get(\'PHONE_ID\', \'\')\n\n          def cpu_sample():\n              def snap():\n                  with open(\'/proc/stat\', \'r\', encoding=\'utf-8\') as f:\n                      vals = [int(x) for x in f.readline().split()[1:]]\n                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)\n                  return sum(vals), idle\n              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()\n              total = max(1, b_total - a_total)\n              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)\n\n          def mem_sample():\n              vals = {}\n              with open(\'/proc/meminfo\', \'r\', encoding=\'utf-8\') as f:\n                  for line in f:\n                      k, v = line.split(\':\', 1)\n                      vals[k] = int(v.strip().split()[0])\n              total = vals.get(\'MemTotal\', 0)\n              avail = vals.get(\'MemAvailable\', 0)\n              used = max(0, total - avail)\n              pct = round(100.0 * used / total, 1) if total else 0\n              return total, used, avail, pct\n\n          def qemu_sample():\n              cp = subprocess.run(\n                  [\'ps\', \'-C\', \'qemu-system-x86_64\', \'-o\', \'%cpu=,%mem=,rss=,pid=\', \'--sort=-%cpu\'],\n                  capture_output=True, text=True\n              )\n              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), \'\')\n              if not line:\n                  return {\'cpu_percent\': 0.0, \'mem_percent\': 0.0, \'rss_kib\': 0, \'pid\': None}\n              parts = line.split()\n              try:\n                  return {\n                      \'cpu_percent\': float(parts[0]),\n                      \'mem_percent\': float(parts[1]),\n                      \'rss_kib\': int(parts[2]),\n                      \'pid\': int(parts[3]),\n                  }\n              except Exception:\n                  return {\'raw\': line}\n\n          class Handler(http.server.BaseHTTPRequestHandler):\n              def do_GET(self):\n                  if self.path not in (\'/\', \'/status\'):\n                      self.send_response(404); self.end_headers(); return\n                  total, used, avail, pct = mem_sample()\n                  load = os.getloadavg()\n                  data = {\n                      \'ok\': True,\n                      \'run_id\': RUN_ID,\n                      \'phone_id\': PHONE_ID,\n                      \'cpu_percent\': cpu_sample(),\n                      \'load1\': round(load[0], 2),\n                      \'load5\': round(load[1], 2),\n                      \'load15\': round(load[2], 2),\n                      \'mem_total_kib\': total,\n                      \'mem_used_kib\': used,\n                      \'mem_available_kib\': avail,\n                      \'mem_percent\': pct,\n                      \'qemu\': qemu_sample(),\n                  }\n                  body = json.dumps(data).encode()\n                  self.send_response(200)\n                  self.send_header(\'Content-Type\', \'application/json\')\n                  self.send_header(\'Content-Length\', str(len(body)))\n                  self.end_headers(); self.wfile.write(body)\n              def log_message(self, *args):\n                  pass\n\n          http.server.ThreadingHTTPServer((\'127.0.0.1\', 8787), Handler).serve_forever()\n          PY\n          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &\n          sleep 1\n          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json\n          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787\n          echo \'RUNNER_STATUS_READY=8787\'\n\n      - name: Prepare managed Android bootstrap script\n        shell: bash\n        run: |\n          cat >/tmp/managed-phone.sh <<\'SCRIPT\'\n          #!/usr/bin/env bash\n          set -euo pipefail\n\n          wait_android_boot() {\n            adb wait-for-device\n            for _ in $(seq 1 180); do\n              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d \'\\r\')" = \'1\' ] && return 0\n              sleep 1\n            done\n            return 1\n          }\n\n          echo \'MANAGED_AVD_BOOT_WAIT\'\n          wait_android_boot\n          echo \'MANAGED_AVD_BOOT_COMPLETE\'\n\n          # Optional Build identity for emulator compatibility testing. Android Emulator\n          # does not allow arbitrary ro.product.* values through -prop, so use the\n          # writable-system/remount development path and verify after reboot.\n          if [ -n "${DEVICE_MODEL:-}" ]; then\n            echo "DEVICE_IDENTITY_TARGET=${DEVICE_MANUFACTURER}|${DEVICE_BRAND}|${DEVICE_MODEL}"\n            IDENTITY_READY=0\n            if adb root >/tmp/adb-root.log 2>&1; then\n              adb wait-for-device\n              sleep 2\n              if adb remount >/tmp/adb-remount.log 2>&1; then\n                IDENTITY_READY=1\n              else\n                adb disable-verity >/tmp/adb-disable-verity.log 2>&1 || true\n                adb reboot || true\n                if wait_android_boot; then\n                  adb root >/tmp/adb-root2.log 2>&1 || true\n                  adb wait-for-device\n                  sleep 2\n                  if adb remount >/tmp/adb-remount2.log 2>&1; then\n                    IDENTITY_READY=1\n                  fi\n                fi\n              fi\n            fi\n\n            if [ "$IDENTITY_READY" = \'1\' ]; then\n              cat >/tmp/patch-device-identity.sh <<\'DEVICEPATCH\'\n          #!/system/bin/sh\n          set -eu\n          patch_prop() {\n            key="$1"\n            value="$2"\n            file="$3"\n            [ -f "$file" ] || return 0\n            if grep -q "^${key}=" "$file" 2>/dev/null; then\n              sed -i "s|^${key}=.*|${key}=${value}|g" "$file"\n            fi\n          }\n          for file in             /system/build.prop /system/system/build.prop             /product/build.prop /system/product/build.prop             /vendor/build.prop /system/vendor/build.prop             /odm/build.prop /system/odm/build.prop             /system_ext/build.prop /system/system_ext/build.prop; do\n            for suffix in \'\' \'.system\' \'.product\' \'.vendor\' \'.odm\' \'.system_ext\'; do\n              patch_prop "ro.product${suffix}.manufacturer" "$TARGET_MANUFACTURER" "$file"\n              patch_prop "ro.product${suffix}.brand" "$TARGET_BRAND" "$file"\n              patch_prop "ro.product${suffix}.model" "$TARGET_MODEL" "$file"\n            done\n          done\n          sync\n          DEVICEPATCH\n              adb push /tmp/patch-device-identity.sh /data/local/tmp/patch-device-identity.sh >/dev/null\n              adb shell chmod 700 /data/local/tmp/patch-device-identity.sh\n              if adb shell "TARGET_MANUFACTURER=\'${DEVICE_MANUFACTURER}\' TARGET_BRAND=\'${DEVICE_BRAND}\' TARGET_MODEL=\'${DEVICE_MODEL}\' sh /data/local/tmp/patch-device-identity.sh"; then\n                adb reboot || true\n                wait_android_boot\n              fi\n            else\n              echo \'::warning::Could not remount emulator system; continuing with stock AVD identity.\'\n            fi\n\n            ACTUAL_MANUFACTURER=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_BRAND=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d \'\\r\')\n            echo "DEVICE_IDENTITY_ACTUAL=${ACTUAL_MANUFACTURER}|${ACTUAL_BRAND}|${ACTUAL_MODEL}"\n            if [ "$ACTUAL_MODEL" = "$DEVICE_MODEL" ]; then\n              echo \'DEVICE_REAL_MODEL_APPLIED\'\n            else\n              echo "::warning::Requested model \'${DEVICE_MODEL}\', but Android reports \'${ACTUAL_MODEL}\'."\n            fi\n          fi\n\n          # Fresh Android often needs a short settling period before first app launch.\n          sleep 12\n          adb shell settings put global window_animation_scale 0 || true\n          adb shell settings put global transition_animation_scale 0 || true\n          adb shell settings put global animator_duration_scale 0 || true\n          adb shell settings put global disable_window_blurs 1 || true\n          adb shell settings put system peak_refresh_rate 60.0 || true\n          adb shell settings put system min_refresh_rate 60.0 || true\n          adb shell wm size 720x1600 || true\n          adb shell wm density 280 || true\n\n          # Phone creation/restoration is intentionally APK-neutral. The GUI may\n          # remember a package name for monitoring, but this workflow never downloads,\n          # installs, or auto-launches an APK.\n          DEFAULT_PACKAGE="$PACKAGE_NAME"\n          if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then\n            echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"\n          else\n            echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"\n          fi\n          echo \'MANAGED_PHONE_APK_NEUTRAL\'\n\n          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true\n          adb shell settings put global auto_update_system_apps 0 || true\n\n          echo \'ADB_TCPIP_BOOTSTRAP_START\'\n          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }\n          for _ in $(seq 1 30); do\n            nc -z 127.0.0.1 5555 && break\n            sleep 1\n          done\n          nc -z 127.0.0.1 5555\n          echo \'ADB_TCPIP_5555_READY\'\n\n          TS_IPV4=$(tailscale ip -4 | head -n1)\n          [ -n "$TS_IPV4" ]\n          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555\n          echo \'MANAGED_CLOUD_PHONE_READY\'\n          echo "TAILSCALE_ADB=${TS_IPV4}:5555"\n          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"\n          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"\n\n          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"\n          for _ in $(seq 1 1800); do\n            ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \\\n              --jq ".[] | select(.pull_request == null) | select(.title == \\"${COMMAND_TITLE}\\") | .number" \\\n              2>/dev/null | head -n1 || true)\n            if [ -n "$ISSUE_NO" ]; then\n              ISSUE_BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" \\\n                --jq \'.body // ""\' 2>/dev/null || true)\n              CMD_JSON=$(printf \'%s\\n\' "$ISSUE_BODY" | grep -m1 \'^{\' || true)\n              if [ -n "$CMD_JSON" ]; then\n                CMD=$(jq -r \'.command // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_RUN=$(jq -r \'.run_id // 0\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_PHONE=$(jq -r \'.phone_id // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                if [ "$CMD" = \'backup\' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then\n                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n                    echo \'BACKUP_REQUEST_REJECTED_NO_KEY\'\n                  else\n                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"\n                    printf \'%s\' "$ISSUE_NO" >/tmp/managed-backup-issue-number\n                    touch /tmp/managed-backup-requested\n                    adb shell sync || true\n                    exit 0\n                  fi\n                fi\n              fi\n            fi\n            sleep 10\n          done\n\n          # End-of-life safety backup when the 5-hour session naturally expires.\n          if [ -n "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP\'\n            touch /tmp/managed-backup-requested\n            adb shell sync || true\n          else\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY\'\n          fi\n          SCRIPT\n          chmod +x /tmp/managed-phone.sh\n          bash -n /tmp/managed-phone.sh\n          echo \'MANAGED_BOOTSTRAP_SCRIPT_READY\'\n\n      - name: Start managed Android phone\n        id: android\n        uses: reactivecircus/android-emulator-runner@v2\n        env:\n          PHONE_MODE: ${{ inputs.mode }}\n          GH_TOKEN: ${{ github.token }}\n        with:\n          api-level: ${{ inputs.api_level }}\n          target: ${{ inputs.target }}\n          arch: ${{ inputs.arch }}\n          profile: ${{ inputs.profile }}\n          avd-name: managed-phone-${{ inputs.phone_id || \'001\' }}\n          cores: ${{ inputs.cores }}\n          ram-size: ${{ format(\'{0}M\', inputs.ram_mb) }}\n          force-avd-creation: ${{ inputs.mode == \'new\' }}\n          disable-animations: false\n          emulator-options: >-\n            -no-snapshot\n            ${{ (inputs.device_model != \'\' || inputs.mode == \'restore\') && \'-writable-system\' || \'\' }}\n            ${{ inputs.use_s5 == \'true\' && \'-http-proxy http://127.0.0.1:8118\' || \'\' }}\n            -gpu swiftshader_indirect\n            -noaudio\n            -no-boot-anim\n            -camera-back none\n            -camera-front none\n          script: bash /tmp/managed-phone.sh\n\n      - name: Pack and encrypt full AVD backup\n        id: pack\n        if: always()\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ ! -f /tmp/managed-backup-requested ]; then\n            echo \'should_save=false\' >> "$GITHUB_OUTPUT"\n            echo \'NO_BACKUP_REQUEST\'\n            exit 0\n          fi\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          mkdir -p /tmp/managed-avd-backup\n          rm -f /tmp/managed-avd-backup/*\n          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst\n          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY \\\n            -in /tmp/managed-avd.tar.zst \\\n            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"\n          rm -f /tmp/managed-avd.tar.zst\n          BYTES=$(stat -c \'%s\' /tmp/managed-avd-backup/*.enc)\n          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"\n          echo \'should_save=true\' >> "$GITHUB_OUTPUT"\n          echo \'FULL_AVD_ENCRYPTED_BACKUP_READY\'\n\n      - name: Save encrypted AVD backup to GitHub Actions Cache\n        if: steps.pack.outputs.should_save == \'true\'\n        uses: actions/cache/save@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}\n\n      - name: Close consumed backup command\n        if: steps.pack.outputs.should_save == \'true\'\n        env:\n          GH_TOKEN: ${{ github.token }}\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ -s /tmp/managed-backup-issue-number ]; then\n            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)\n            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true\n          fi\n          echo \'MANAGED_BACKUP_SAVED\'\n'
 
 REAL_DEVICE_CATALOG: list[dict[str, str]] = [{'name': 'Samsung Galaxy S25 Ultra (SM-S938B)',
   'manufacturer': 'samsung',
@@ -375,6 +375,73 @@ class GlobalSecretStore:
         else:
             self._write_raw(payload)
 
+    def load_s5_profile(self, profile_id: str) -> dict[str, str]:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            return {"host": "", "port": "", "user": "", "pass": ""}
+        payload = self._read_raw()
+        raw_profiles = payload.get("s5_profiles")
+        if not isinstance(raw_profiles, dict):
+            return {"host": "", "port": "", "user": "", "pass": ""}
+        item = raw_profiles.get(profile_id)
+        if not isinstance(item, dict):
+            return {"host": "", "port": "", "user": "", "pass": ""}
+
+        result: dict[str, str] = {}
+        for key in ("host", "port", "user", "pass"):
+            try:
+                result[key] = self._unprotect(str(item.get(key) or ""))
+            except Exception:
+                result[key] = ""
+        return result
+
+    def save_s5_profile(
+        self,
+        profile_id: str,
+        host: str,
+        port: str,
+        user: str = "",
+        password: str = "",
+    ) -> None:
+        profile_id = str(profile_id or "").strip()
+        host = str(host or "").strip()
+        port = str(port or "").strip()
+        user = str(user or "").strip()
+        password = str(password or "")
+        if not profile_id or not host or not port:
+            raise ValueError("S5 HOST 和 PORT 不能为空")
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError("S5 PORT 必须是 1-65535")
+
+        payload = self._read_raw()
+        raw_profiles = payload.get("s5_profiles")
+        profiles = dict(raw_profiles) if isinstance(raw_profiles, dict) else {}
+        profiles[profile_id] = {
+            "host": self._protect(host),
+            "port": self._protect(port),
+            "user": self._protect(user) if user else "",
+            "pass": self._protect(password) if password else "",
+        }
+        payload["s5_profiles"] = profiles
+        self._write_raw(payload)
+
+    def clear_s5_profile(self, profile_id: str) -> None:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            return
+        payload = self._read_raw()
+        raw_profiles = payload.get("s5_profiles")
+        profiles = dict(raw_profiles) if isinstance(raw_profiles, dict) else {}
+        profiles.pop(profile_id, None)
+        if profiles:
+            payload["s5_profiles"] = profiles
+        else:
+            payload.pop("s5_profiles", None)
+        if len(payload) <= 1:
+            self.clear()
+        else:
+            self._write_raw(payload)
+
     def clear(self) -> None:
         try:
             self.path.unlink(missing_ok=True)
@@ -586,7 +653,9 @@ class AppConfig:
     phone_id: str = "001"
     phone_name: str = "BICOIN-001"
     github_independent: bool = False
+    github_independent_locked: bool = False
     github_account: str = ""
+    use_s5: bool = False
     apk_url: str = DEFAULT_APK_URL
     package_name: str = DEFAULT_PACKAGE
     local_apk_path: str = ""
@@ -763,7 +832,11 @@ class AppConfig:
         except Exception:
             cfg.health_last_ts = 0.0
         cfg.github_independent = bool(cfg.github_independent)
+        cfg.github_independent_locked = bool(cfg.github_independent_locked)
+        if cfg.github_independent_locked:
+            cfg.github_independent = True
         cfg.github_account = str(cfg.github_account or "").strip()
+        cfg.use_s5 = bool(cfg.use_s5)
         return cfg
 
     def to_dict(self) -> dict[str, Any]:
@@ -2149,7 +2222,7 @@ class LocalTools:
 
         The user only completes the normal GitHub browser/device authorization.
         Fresh machines request the required scopes up front; an existing older
-        authorization is transparently refreshed when it lacks workflow access.
+        authorization is transparently refreshed when it lacks workflow/delete access.
         """
         installed_now = False
         if not self.gh:
@@ -2168,10 +2241,11 @@ class LocalTools:
             env.pop("GITHUB_TOKEN", None)
             env["GH_BROWSER"] = f'cmd.exe /d /c "{helper}"'
 
+            required_scopes = {"workflow", "delete_repo"}
             existing_account = self.github_account()
             existing_token = self.github_auth_token()
             existing_scopes = self.github_token_scopes(existing_token) if existing_token else set()
-            if existing_account and existing_token and "workflow" in existing_scopes:
+            if existing_account and existing_token and required_scopes.issubset(existing_scopes):
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
                 return True, prefix + f"已登录 @{existing_account}"
 
@@ -2183,7 +2257,7 @@ class LocalTools:
                     "--hostname",
                     "github.com",
                     "--scopes",
-                    "workflow",
+                    "workflow,delete_repo",
                     "--clipboard",
                 ]
             else:
@@ -2196,7 +2270,7 @@ class LocalTools:
                     "--git-protocol",
                     "https",
                     "--scopes",
-                    "repo,workflow",
+                    "repo,workflow,delete_repo",
                     "--web",
                     "--clipboard",
                 ]
@@ -2215,7 +2289,7 @@ class LocalTools:
             account = self.github_account()
             token = self.github_auth_token()
             scopes = self.github_token_scopes(token) if token else set()
-            if cp.returncode == 0 and account and token and "workflow" in scopes:
+            if cp.returncode == 0 and account and token and required_scopes.issubset(scopes):
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
                 return True, prefix + f"已登录 @{account}"
             if account and token:
@@ -2260,7 +2334,7 @@ class LocalTools:
                     "--git-protocol",
                     "https",
                     "--scopes",
-                    "repo,workflow",
+                    "repo,workflow,delete_repo",
                     "--web",
                     "--clipboard",
                     "--insecure-storage",
@@ -2297,7 +2371,8 @@ class LocalTools:
             account = account_cp.stdout.strip() if account_cp.returncode == 0 else ""
             token = token_cp.stdout.strip() if token_cp.returncode == 0 else ""
             scopes = self.github_token_scopes(token) if token else set()
-            if cp.returncode == 0 and account and token and "workflow" in scopes:
+            required_scopes = {"workflow", "delete_repo"}
+            if cp.returncode == 0 and account and token and required_scopes.issubset(scopes):
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
                 return True, prefix + f"已登录 @{account}", account, token
             if account and token:
@@ -2613,6 +2688,7 @@ class CloudPhoneGUI:
         ttk.Button(actions, text="备份", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=5)
         ttk.Button(actions, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="🗑 完全删除", command=lambda pid=cfg.profile_id: self.delete_profile_completely(pid)).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="停止", command=lambda pid=cfg.profile_id: self.cancel_profile(pid)).pack(side="right", padx=(5, 0))
 
     def _initial_run_text(self, cfg: AppConfig) -> str:
@@ -3465,37 +3541,33 @@ class CloudPhoneGUI:
             draft = AppConfig.from_dict(original.to_dict())
         else:
             base_repo = self.store.profiles[0].repo if self.store.profiles else "usdt19908888286-bit/android-test"
-            draft = AppConfig(repo=base_repo, phone_name=f"BICOIN-{len(self.store.profiles)+1:03d}", phone_id=f"{len(self.store.profiles)+1:03d}")
+            draft = AppConfig(
+                repo=base_repo,
+                phone_name=f"BICOIN-{len(self.store.profiles)+1:03d}",
+                phone_id=f"{len(self.store.profiles)+1:03d}",
+            )
 
         win = tk.Toplevel(self.root)
         win.title("普通设置" if original else "添加手机")
-        win.geometry("880x760")
-        win.minsize(780, 620)
+        win.geometry("880x690")
+        win.minsize(780, 560)
         win.transient(self.root)
 
         v_repo = tk.StringVar(value=draft.repo)
         v_branch = tk.StringVar(value=draft.branch)
         v_name = tk.StringVar(value=draft.phone_name)
         v_id = tk.StringVar(value=draft.phone_id)
-        v_pkg = tk.StringVar(value=draft.package_name)
-        v_apk = tk.StringVar(value=draft.apk_url)
-        v_local_apk = tk.StringVar(value=draft.local_apk_path)
-        v_install_template = tk.StringVar(value=draft.manual_install_command)
-        v_install_preview = tk.StringVar(value="")
         v_api = tk.StringVar(value=draft.api_level)
         v_target = tk.StringVar(value=draft.target)
         v_arch = tk.StringVar(value=draft.arch)
         v_profile = tk.StringVar(value=draft.profile)
         v_cores = tk.StringVar(value=draft.cores)
         v_ram = tk.StringVar(value=draft.ram_mb)
-        v_device_preset = tk.StringVar(value=draft.device_preset)
-        v_device_manufacturer = tk.StringVar(value=draft.device_manufacturer)
-        v_device_brand = tk.StringVar(value=draft.device_brand)
-        v_device_model = tk.StringVar(value=draft.device_model)
-        v_device_native = tk.StringVar(value=draft.device_native_resolution)
         v_auto = tk.BooleanVar(value=draft.auto_refresh)
         v_interval = tk.IntVar(value=draft.refresh_seconds)
+
         v_github_independent = tk.BooleanVar(value=bool(draft.github_independent))
+        github_locked = bool(draft.github_independent_locked)
         saved_profile_auth = self.global_secrets.load_github_profile(draft.profile_id)
         v_github_profile_status = tk.StringVar(
             value=(
@@ -3504,12 +3576,15 @@ class CloudPhoneGUI:
                 else "尚未授权"
             )
         )
-        v_rotate = tk.BooleanVar(value=draft.auto_rotate)
-        rotation_rules = list(draft.rotate_rules or [])
-        v_rule_type = tk.StringVar(value="每天时间点")
-        v_rule_value = tk.StringVar(value="04:00")
         v_repo_status = tk.StringVar(value="内置工作流将在启动/恢复前自动同步到目标仓库")
-        v_rotate_status = tk.StringVar(value=self._rotation_text(draft))
+
+        saved_s5 = self.global_secrets.load_s5_profile(draft.profile_id)
+        v_use_s5 = tk.BooleanVar(value=bool(draft.use_s5))
+        v_s5_host = tk.StringVar(value=saved_s5.get("host", ""))
+        v_s5_port = tk.StringVar(value=saved_s5.get("port", ""))
+        v_s5_user = tk.StringVar(value=saved_s5.get("user", ""))
+        v_s5_pass = tk.StringVar(value=saved_s5.get("pass", ""))
+        v_s5_show = tk.BooleanVar(value=False)
 
         footer = ttk.Frame(win, padding=(14, 10))
         footer.pack(side="bottom", fill="x")
@@ -3563,7 +3638,12 @@ class CloudPhoneGUI:
             def done(items: list[str]) -> None:
                 self.repo_cache = items
                 repo_combo["values"] = items
-                v_repo_status.set(f"已读取 {len(items)} 个仓库")
+                auth_label = (
+                    f"独立账号 @{self.global_secrets.load_github_profile(draft.profile_id).get('account')}"
+                    if v_github_independent.get()
+                    else "全局 GitHub 账号"
+                )
+                v_repo_status.set(f"{auth_label}：已读取 {len(items)} 个仓库")
 
             self.bg(
                 "读取 GitHub 仓库",
@@ -3675,60 +3755,21 @@ class CloudPhoneGUI:
             name_entry.focus_set()
             dlg.bind("<Return>", lambda _e: submit_create())
 
-        def delete_selected_repo() -> None:
-            target = v_repo.get().strip().strip("/")
-            if "/" not in target:
-                messagebox.showerror(APP_NAME, "请先选择要删除的 owner/repo 仓库", parent=win)
-                return
-            refs = [p.phone_name for p in self.store.profiles if p.repo.lower() == target.lower()]
-            ref_text = f"\n\n当前有 {len(refs)} 个本地手机配置引用这个仓库。删除仓库不会自动删除这些手机配置。" if refs else ""
-            if not messagebox.askyesno(
-                APP_NAME,
-                f"永久删除 GitHub 仓库：\n{target}\n\n此操作不可撤销，Actions、Cache、备份和仓库内容都会一起删除。{ref_text}",
-                parent=win,
-            ):
-                return
-            typed = simpledialog.askstring(
-                "确认删除仓库",
-                f"请输入完整仓库名确认删除：\n{target}",
-                parent=win,
-            )
-            if typed is None:
-                return
-            if typed.strip() != target:
-                messagebox.showerror(APP_NAME, "输入的仓库名不一致，已取消删除。", parent=win)
-                return
-            try:
-                token = settings_token()
-            except Exception as exc:
-                messagebox.showerror(APP_NAME, str(exc), parent=win)
-                return
-            v_repo_status.set(f"正在永久删除 {target}…")
-
-            def work() -> str:
-                try:
-                    GitHubAPI(target, token).delete_repository()
-                except RuntimeError as exc:
-                    text = str(exc)
-                    if "GitHub API 403" in text:
-                        raise RuntimeError(
-                            "当前 GitHub 授权没有删除仓库权限，或你不是该仓库管理员。需要带仓库删除权限的 GitHub 授权。"
-                        ) from exc
-                    raise
-                return target
-
-            def done(deleted: str) -> None:
-                self.repo_cache = [x for x in self.repo_cache if x.lower() != deleted.lower()]
-                repo_combo["values"] = self.repo_cache
-                v_repo.set("")
-                v_repo_status.set(f"已永久删除 {deleted}；请为这台手机重新选择仓库后保存")
-                self.log(f"已永久删除 GitHub 仓库: {deleted}")
-
-            self.bg("删除 GitHub 仓库", work, done, lambda err: v_repo_status.set(f"删除失败：{err}"))
+        auth_state = {"last": bool(v_github_independent.get()), "initial": True}
 
         def toggle_github_auth_controls() -> None:
-            if v_github_independent.get():
-                independent_auth_frame.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+            desired = bool(v_github_independent.get())
+            if github_locked and not desired:
+                v_github_independent.set(True)
+                desired = True
+                messagebox.showinfo(
+                    APP_NAME,
+                    "这台手机已经用独立 GitHub 成功启动过，独立授权已经锁定。\n如需移除，只能在首页使用“完全删除”。",
+                    parent=win,
+                )
+
+            if desired:
+                independent_auth_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
                 auth = self.global_secrets.load_github_profile(draft.profile_id)
                 if auth.get("account") and auth.get("token"):
                     v_github_profile_status.set(f"已登录 @{auth.get('account')}")
@@ -3736,6 +3777,13 @@ class CloudPhoneGUI:
                     v_github_profile_status.set("尚未授权")
             else:
                 independent_auth_frame.grid_remove()
+                if auth_state["last"] and not auth_state["initial"]:
+                    v_github_profile_status.set("保存后删除此手机的独立授权")
+                    v_repo_status.set("已切回全局 GitHub；正在刷新全局账号仓库…")
+                    self.root.after(20, load_repos)
+
+            auth_state["last"] = desired
+            auth_state["initial"] = False
 
         def login_independent_github() -> None:
             v_github_independent.set(True)
@@ -3769,28 +3817,36 @@ class CloudPhoneGUI:
             self.bg("手机独立 GitHub 授权", self.tools.github_login_isolated, done)
 
         ttk.Button(repo_box, text="读取我的仓库", command=load_repos).grid(row=0, column=2, padx=(5, 2))
-        ttk.Button(repo_box, text="＋ 创建仓库", command=create_repo_dialog).grid(row=0, column=3, padx=2)
-        ttk.Button(repo_box, text="删除仓库", command=delete_selected_repo).grid(row=0, column=4, padx=(2, 5))
+        ttk.Button(repo_box, text="＋ 创建仓库", command=create_repo_dialog).grid(row=0, column=3, padx=(2, 5))
         ttk.Label(repo_box, text="分支").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(repo_box, textvariable=v_branch).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
+
         auth_selector = ttk.Frame(repo_box)
-        auth_selector.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(
+        auth_selector.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        github_check = ttk.Checkbutton(
             auth_selector,
             text="独立 GitHub 授权",
             variable=v_github_independent,
             command=toggle_github_auth_controls,
-        ).pack(side="left")
-        ttk.Label(auth_selector, text="不勾选时使用全局 GitHub 账号").pack(side="left", padx=(12, 0))
+        )
+        github_check.pack(side="left")
+        if github_locked:
+            github_check.state(["disabled"])
+            ttk.Label(auth_selector, text="已锁定：这台手机已经用独立账号启动过").pack(side="left", padx=(12, 0))
+        else:
+            ttk.Label(auth_selector, text="不勾选时使用全局 GitHub；未启动前可自由切换").pack(side="left", padx=(12, 0))
+
         independent_auth_frame = ttk.Frame(repo_box)
         ttk.Label(independent_auth_frame, textvariable=v_github_profile_status).pack(side="left")
         ttk.Button(independent_auth_frame, text="GitHub 授权登录", command=login_independent_github).pack(
             side="left", padx=(12, 0)
         )
         toggle_github_auth_controls()
-        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=800).grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=800).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(8, 0)
+        )
 
-        identity = ttk.LabelFrame(body, text="手机身份 / App", padding=10)
+        identity = ttk.LabelFrame(body, text="手机身份", padding=10)
         identity.pack(fill="x", pady=(10, 0))
         for c in (1, 3):
             identity.columnconfigure(c, weight=1)
@@ -3798,264 +3854,133 @@ class CloudPhoneGUI:
         ttk.Entry(identity, textvariable=v_name).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Label(identity, text="Phone ID").grid(row=0, column=2, sticky="w")
         ttk.Entry(identity, textvariable=v_id).grid(row=0, column=3, sticky="ew", padx=6)
-        ttk.Label(identity, text="监控 / App 包名").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        pkg_combo = ttk.Combobox(identity, textvariable=v_pkg, values=draft.package_history)
-        pkg_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(identity, text="APK URL（仅参考，不自动安装）").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(identity, textvariable=v_apk).grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=(8, 0))
 
-        def read_apps() -> None:
-            device = original.last_device if original else ""
-            if not device:
-                messagebox.showinfo(APP_NAME, "这台手机还没有可用的 ADB 地址。")
-                return
-            self.bg(
-                "读取已安装 App",
-                lambda: self.tools.list_third_party_packages(device),
-                lambda items: pkg_combo.configure(values=items),
-            )
+        s5_box = ttk.LabelFrame(body, text="网络 / SOCKS5", padding=10)
+        s5_box.pack(fill="x", pady=(10, 0))
+        s5_box.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            s5_box,
+            text="使用 S5",
+            variable=v_use_s5,
+            command=lambda: toggle_s5_controls(),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            s5_box,
+            text="不勾选就是 Direct；每次新建和恢复启动前都会重新同步这台手机当前保存的 S5 参数。",
+        ).grid(row=0, column=1, columnspan=3, sticky="w", padx=(10, 0))
 
-        def refresh_install_preview(*_args) -> None:
-            temp = AppConfig.from_dict(draft.to_dict())
-            temp.local_apk_path = v_local_apk.get().strip()
-            temp.manual_install_command = v_install_template.get().strip()
-            if original:
-                temp.last_device = original.last_device
-            v_install_preview.set(self._build_apk_install_command(temp))
+        s5_fields = ttk.Frame(s5_box)
+        s5_fields.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        s5_fields.columnconfigure(1, weight=1)
+        s5_fields.columnconfigure(3, weight=1)
+        ttk.Label(s5_fields, text="HOST").grid(row=0, column=0, sticky="w")
+        ttk.Entry(s5_fields, textvariable=v_s5_host).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(s5_fields, text="PORT").grid(row=0, column=2, sticky="w")
+        ttk.Entry(s5_fields, textvariable=v_s5_port, width=12).grid(row=0, column=3, sticky="ew", padx=6)
+        ttk.Label(s5_fields, text="USER").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(s5_fields, textvariable=v_s5_user).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Label(s5_fields, text="PASS").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        s5_pass_entry = ttk.Entry(s5_fields, textvariable=v_s5_pass, show="*")
+        s5_pass_entry.grid(row=1, column=3, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Checkbutton(
+            s5_fields,
+            text="显示密码",
+            variable=v_s5_show,
+            command=lambda: s5_pass_entry.configure(show="" if v_s5_show.get() else "*"),
+        ).grid(row=2, column=3, sticky="e", padx=6, pady=(4, 0))
 
-        def choose_local_apk() -> None:
-            path = filedialog.askopenfilename(
-                parent=win,
-                title="选择本地 APK",
-                filetypes=[("Android APK", "*.apk"), ("所有文件", "*.*")],
-            )
-            if not path:
-                return
-            v_local_apk.set(path)
-            refresh_install_preview()
+        def toggle_s5_controls() -> None:
+            if v_use_s5.get():
+                s5_fields.grid()
+            else:
+                s5_fields.grid_remove()
 
-        def copy_install_command() -> None:
-            refresh_install_preview()
-            command = v_install_preview.get().strip()
-            if not v_local_apk.get().strip():
-                messagebox.showinfo(APP_NAME, "请先选择本地 APK。", parent=win)
-                return
-            self._copy_to_clipboard(command)
-            messagebox.showinfo(APP_NAME, "安装命令已复制。程序不会自动执行该命令。", parent=win)
-
-        ttk.Button(identity, text="读取当前手机已装 App", command=read_apps).grid(row=1, column=2, columnspan=2, sticky="w", padx=6, pady=(8, 0))
-        ttk.Label(identity, text="本地 APK").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(identity, textvariable=v_local_apk).grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Button(identity, text="选择 APK", command=choose_local_apk).grid(row=3, column=3, sticky="w", padx=6, pady=(8, 0))
-        ttk.Label(identity, text="安装命令模板").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(identity, textvariable=v_install_template).grid(row=4, column=1, columnspan=3, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(identity, text="可留空自动生成；自定义时可用 {adb}、{device}、{apk} 占位符。").grid(row=5, column=1, columnspan=3, sticky="w", padx=6, pady=(4, 0))
-        ttk.Label(identity, text="命令预览").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(identity, textvariable=v_install_preview, state="readonly").grid(row=6, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Button(identity, text="复制安装命令", command=copy_install_command).grid(row=6, column=3, sticky="w", padx=6, pady=(8, 0))
-        v_local_apk.trace_add("write", refresh_install_preview)
-        v_install_template.trace_add("write", refresh_install_preview)
-        refresh_install_preview()
+        toggle_s5_controls()
 
         spec = ttk.LabelFrame(body, text="Android / 云机规格", padding=10)
         spec.pack(fill="x", pady=(10, 0))
         for c in (1, 3, 5):
             spec.columnconfigure(c, weight=1)
         fields = [
-            ("Android API", v_api), ("Profile", v_profile), ("CPU 核数", v_cores),
-            ("内存 MB", v_ram), ("Target", v_target), ("架构", v_arch),
+            ("Android API", v_api),
+            ("Profile", v_profile),
+            ("CPU 核数", v_cores),
+            ("内存 MB", v_ram),
+            ("Target", v_target),
+            ("架构", v_arch),
         ]
         for i, (label, var) in enumerate(fields):
             row, pair = divmod(i, 3)
             col = pair * 2
             ttk.Label(spec, text=label).grid(row=row, column=col, sticky="w", pady=4)
-            ttk.Entry(spec, textvariable=var).grid(row=row, column=col+1, sticky="ew", padx=6, pady=4)
+            ttk.Entry(spec, textvariable=var).grid(row=row, column=col + 1, sticky="ew", padx=6, pady=4)
         ttk.Checkbutton(spec, text="自动监控", variable=v_auto).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Spinbox(spec, from_=3, to=120, textvariable=v_interval, width=7).grid(row=2, column=1, sticky="w", pady=(8, 0))
-        ttk.Label(spec, text="秒").grid(row=2, column=1, sticky="e", pady=(8, 0))
-
-        model_box = ttk.LabelFrame(body, text="真实手机型号 / Android Build 身份", padding=10)
-        model_box.pack(fill="x", pady=(10, 0))
-        model_box.columnconfigure(1, weight=1)
-        model_box.columnconfigure(3, weight=1)
-        preset_names = [item["name"] for item in REAL_DEVICE_CATALOG]
-        ttk.Label(model_box, text="机型预设").grid(row=0, column=0, sticky="w")
-        preset_combo = ttk.Combobox(model_box, textvariable=v_device_preset, values=preset_names, state="readonly")
-        preset_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=6)
-
-        def apply_device_entry(item: dict[str, str]) -> None:
-            v_device_preset.set(item["name"])
-            v_device_manufacturer.set(item["manufacturer"])
-            v_device_brand.set(item["brand"])
-            v_device_model.set(item["model"])
-            v_device_native.set(item.get("resolution", ""))
-
-        def apply_selected_device(_event=None) -> None:
-            name = v_device_preset.get()
-            item = next((x for x in REAL_DEVICE_CATALOG if x["name"] == name), None)
-            if item:
-                apply_device_entry(item)
-
-        def random_real_device() -> None:
-            apply_device_entry(secrets.choice(REAL_DEVICE_CATALOG))
-
-        def clear_device_identity() -> None:
-            v_device_preset.set("")
-            v_device_manufacturer.set("")
-            v_device_brand.set("")
-            v_device_model.set("")
-            v_device_native.set("")
-
-        preset_combo.bind("<<ComboboxSelected>>", apply_selected_device)
-        ttk.Button(model_box, text="🎲 随机真实机型", command=random_real_device).grid(row=0, column=3, sticky="w", padx=(6, 0))
-        ttk.Button(model_box, text="使用默认 AVD", command=clear_device_identity).grid(row=0, column=4, sticky="w", padx=(6, 0))
-        ttk.Label(model_box, text="Manufacturer").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(model_box, textvariable=v_device_manufacturer).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(model_box, text="Brand").grid(row=1, column=2, sticky="w", pady=(8, 0))
-        ttk.Entry(model_box, textvariable=v_device_brand).grid(row=1, column=3, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(model_box, text="Build.MODEL").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(model_box, textvariable=v_device_model).grid(row=2, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(model_box, text="原生分辨率参考").grid(row=2, column=2, sticky="w", pady=(8, 0))
-        ttk.Entry(model_box, textvariable=v_device_native, state="readonly").grid(row=2, column=3, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(
-            model_box,
-            text="随机按钮只从内置真实量产机型库选择。云机仍按当前 720×1600 渲染以控制资源占用；这里只改变 Emulator 的 Android Build 身份，不改变硬件级证明。",
-            wraplength=820,
-        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
-
-        rotation = ttk.LabelFrame(body, text="定时自动换机", padding=10)
-        # 自动换机已经统一迁移到“自动化”入口；普通设置保留变量以兼容旧配置，但不再重复显示。
-        rotation.columnconfigure(0, weight=1)
-        ttk.Checkbutton(rotation, text="启用定时自动换机", variable=v_rotate).grid(row=0, column=0, sticky="w")
-
-        rules_box = ttk.Frame(rotation)
-        rules_box.grid(row=1, column=0, sticky="ew", pady=(8, 4))
-        rules_box.columnconfigure(0, weight=1)
-        rules_list = tk.Listbox(rules_box, height=4, exportselection=False)
-        rules_list.grid(row=0, column=0, columnspan=5, sticky="ew")
-
-        def rule_label(rule: str) -> str:
-            if rule.startswith("time:"):
-                return f"每天 {rule.split(':', 1)[1]}"
-            match = re.fullmatch(r"hours:(\d{1,3})", rule)
-            return f"每 {int(match.group(1))} 小时" if match else rule
-
-        def render_rules() -> None:
-            rules_list.delete(0, "end")
-            for item in rotation_rules:
-                rules_list.insert("end", rule_label(item))
-            preview = AppConfig.from_dict({
-                **draft.to_dict(),
-                "auto_rotate": bool(v_rotate.get()),
-                "rotate_rules": list(rotation_rules),
-            })
-            preview.rotate_next_ts = self._next_rotation_ts(preview) if preview.auto_rotate and preview.rotate_rules else 0.0
-            v_rotate_status.set(self._rotation_text(preview))
-
-        def add_rule() -> None:
-            kind = v_rule_type.get()
-            value = v_rule_value.get().strip()
-            if kind == "每天时间点":
-                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
-                    messagebox.showerror(APP_NAME, "时间格式必须是 HH:MM，例如 04:30")
-                    return
-                rule = f"time:{value}"
-            else:
-                try:
-                    hours = int(value)
-                except Exception:
-                    messagebox.showerror(APP_NAME, "间隔小时必须是 1 到 168 的整数")
-                    return
-                if not 1 <= hours <= 168:
-                    messagebox.showerror(APP_NAME, "间隔小时必须是 1 到 168")
-                    return
-                rule = f"hours:{hours}"
-            if rule not in rotation_rules:
-                rotation_rules.append(rule)
-            render_rules()
-
-        def remove_rule() -> None:
-            selected = list(rules_list.curselection())
-            if not selected:
-                return
-            rotation_rules.pop(int(selected[0]))
-            render_rules()
-
-        def rule_type_changed(_event=None) -> None:
-            v_rule_value.set("04:00" if v_rule_type.get() == "每天时间点" else "4")
-
-        type_combo = ttk.Combobox(
-            rules_box,
-            textvariable=v_rule_type,
-            values=["每天时间点", "每 N 小时"],
-            state="readonly",
-            width=14,
+        ttk.Spinbox(spec, from_=3, to=120, textvariable=v_interval, width=7).grid(
+            row=2, column=1, sticky="w", pady=(8, 0)
         )
-        type_combo.grid(row=1, column=0, sticky="w", pady=(7, 0))
-        type_combo.bind("<<ComboboxSelected>>", rule_type_changed)
-        ttk.Entry(rules_box, textvariable=v_rule_value, width=12).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(7, 0))
-        ttk.Button(rules_box, text="＋ 添加规则", command=add_rule).grid(row=1, column=2, padx=(6, 0), pady=(7, 0))
-        ttk.Button(rules_box, text="删除选中", command=remove_rule).grid(row=1, column=3, padx=(6, 0), pady=(7, 0))
-
+        ttk.Label(spec, text="秒").grid(row=2, column=1, sticky="e", pady=(8, 0))
         ttk.Label(
-            rotation,
-            text="可以同时添加多个每天时间点和小时规则；程序每次选择最近到期的一条执行。执行顺序：备份旧机 → 确认完整 AVD 已保存 → 恢复新 Runner。",
-            wraplength=760,
-        ).grid(row=2, column=0, sticky="w", pady=(6, 2))
-        ttk.Label(rotation, textvariable=v_rotate_status, wraplength=760).grid(row=3, column=0, sticky="w", pady=(2, 0))
-        render_rules()
+            spec,
+            text="真实手机型号不再手工配置：每次启动“新机”时后台从内置真实量产机型库随机选择；恢复备份时沿用备份内原来的手机身份。",
+            wraplength=800,
+        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
         note = ttk.LabelFrame(body, text="仓库部署", padding=10)
         note.pack(fill="x", pady=(10, 0))
         ttk.Label(
             note,
             text=(
-                f"工作流已经内置在程序中。目标仓库缺少 {BUILTIN_WORKFLOW_PATH} 时会自动上传，"
-                "版本不同时会自动更新。备份密钥 AVD_BACKUP_KEY 可自动创建。\n"
-                "Tailscale OAuth 可以在主界面“全局设置”里只填写一次；程序使用 Windows DPAPI 加密保存在本机，"
-                "以后创建仓库或启动手机时会自动把缺少的 TS_API_CLIENT_ID / TS_API_CLIENT_SECRET 写入目标仓库。"
+                f"工作流已内置在程序中。目标仓库缺少 {BUILTIN_WORKFLOW_PATH} 时会自动上传，版本不同时自动更新。\n"
+                "Tailscale OAuth 使用全局设置；AVD_BACKUP_KEY 自动初始化。S5 使用每台手机自己的加密配置，启动/恢复前重新同步。"
             ),
-            wraplength=760,
+            wraplength=800,
             justify="left",
         ).pack(anchor="w")
+
+        def s5_values() -> dict[str, str]:
+            if not v_use_s5.get():
+                return {"host": "", "port": "", "user": "", "pass": ""}
+            host = v_s5_host.get().strip()
+            port = v_s5_port.get().strip()
+            user = v_s5_user.get().strip()
+            password = v_s5_pass.get()
+            if not host:
+                raise ValueError("启用 S5 后 HOST 不能为空")
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise ValueError("S5 PORT 必须是 1-65535")
+            return {"host": host, "port": port, "user": user, "pass": password}
+
+        def persist_s5(cfg: AppConfig) -> None:
+            values = s5_values()
+            if cfg.use_s5:
+                self.global_secrets.save_s5_profile(
+                    cfg.profile_id,
+                    values["host"],
+                    values["port"],
+                    values["user"],
+                    values["pass"],
+                )
+            else:
+                self.global_secrets.clear_s5_profile(cfg.profile_id)
 
         def collect() -> AppConfig:
             repo = v_repo.get().strip().strip("/")
             branch = v_branch.get().strip() or "main"
             phone_id = v_id.get().strip()
             phone_name = v_name.get().strip()
-            package = v_pkg.get().strip()
             if "/" not in repo:
                 raise ValueError("仓库格式应为 owner/repo")
             if not phone_id.isdigit():
                 raise ValueError("Phone ID 只能是数字")
             if not phone_name:
                 raise ValueError("手机名称不能为空")
-            if not PKG_RE.match(package):
-                raise ValueError("Android 包名格式无效")
             if not v_cores.get().strip().isdigit() or int(v_cores.get()) < 1:
                 raise ValueError("CPU 核数必须是正整数")
             if not v_ram.get().strip().isdigit() or int(v_ram.get()) < 1024:
                 raise ValueError("内存至少 1024 MB")
 
-            manufacturer = v_device_manufacturer.get().strip()
-            brand = v_device_brand.get().strip()
-            model = v_device_model.get().strip()
-            if model:
-                if not manufacturer or not brand:
-                    raise ValueError("设置手机型号时 Manufacturer 和 Brand 不能为空")
-                if not re.fullmatch(r"[A-Za-z0-9._+ -]+", manufacturer):
-                    raise ValueError("Manufacturer 含不支持的字符")
-                if not re.fullmatch(r"[A-Za-z0-9._+-]+", brand):
-                    raise ValueError("Brand 含不支持的字符")
-                if not re.fullmatch(r"[A-Za-z0-9._+() -]+", model):
-                    raise ValueError("Build.MODEL 含不支持的字符")
-
-            # 自动化配置由“自动化”窗口独立维护。普通设置保存时读取最新值并原样保留，
-            # 防止两个窗口同时打开时把刚修改的换机规则覆盖回旧状态。
             live_automation = self.store.get(draft.profile_id) if original else None
             automation_source = live_automation or draft
-
             for other in self.store.profiles:
                 if other.profile_id != draft.profile_id and other.repo.lower() == repo.lower() and other.phone_id == phone_id:
                     raise ValueError(f"同一个仓库内 Phone ID {phone_id} 已经存在")
@@ -4064,31 +3989,35 @@ class CloudPhoneGUI:
             if identity_changed and automation_source.rotation_phase:
                 raise ValueError("当前正在自动换机，完成后再修改仓库或 Phone ID")
 
+            requested_independent = bool(v_github_independent.get())
+            if draft.github_independent_locked and not requested_independent:
+                raise ValueError("独立 GitHub 已锁定；这台手机启动过后不能取消，只能完全删除")
+
             draft.repo = repo
             draft.branch = branch
             draft.phone_id = phone_id
             draft.phone_name = phone_name
-            draft.package_name = package
-            draft.apk_url = v_apk.get().strip() or DEFAULT_APK_URL
-            draft.local_apk_path = v_local_apk.get().strip()
-            draft.manual_install_command = v_install_template.get().strip()
             draft.api_level = v_api.get().strip() or "35"
             draft.target = v_target.get().strip() or "google_apis"
             draft.arch = v_arch.get().strip() or "x86_64"
             draft.profile = v_profile.get().strip() or "pixel_6"
             draft.cores = v_cores.get().strip() or "4"
             draft.ram_mb = v_ram.get().strip() or "8192"
-            draft.device_preset = v_device_preset.get().strip() if model else ""
-            draft.device_manufacturer = manufacturer if model else ""
-            draft.device_brand = brand if model else ""
-            draft.device_model = model
-            draft.device_native_resolution = v_device_native.get().strip() if model else ""
             draft.auto_refresh = bool(v_auto.get())
             try:
                 draft.refresh_seconds = max(3, int(v_interval.get()))
             except Exception:
                 draft.refresh_seconds = 8
-            draft.github_independent = bool(v_github_independent.get())
+
+            # Manual model controls are intentionally retired. New phones receive a
+            # random real model at dispatch time; restores keep the model in the AVD.
+            draft.device_preset = ""
+            draft.device_manufacturer = ""
+            draft.device_brand = ""
+            draft.device_model = ""
+            draft.device_native_resolution = ""
+
+            draft.github_independent = requested_independent or bool(draft.github_independent_locked)
             if draft.github_independent:
                 profile_auth = self.global_secrets.load_github_profile(draft.profile_id)
                 profile_account = str(profile_auth.get("account") or draft.github_account or "").strip()
@@ -4098,6 +4027,10 @@ class CloudPhoneGUI:
                 draft.github_account = profile_account
             else:
                 draft.github_account = ""
+
+            draft.use_s5 = bool(v_use_s5.get())
+            s5_values()
+
             draft.auto_rotate = bool(automation_source.auto_rotate)
             draft.rotate_rules = list(automation_source.rotate_rules or [])
             draft.rotate_mode = automation_source.rotate_mode
@@ -4109,8 +4042,13 @@ class CloudPhoneGUI:
             draft.rotation_run_id = automation_source.rotation_run_id
             draft.rotation_started_ts = automation_source.rotation_started_ts
             draft.rotation_last_error = automation_source.rotation_last_error
-            draft.package_history = [package] + [x for x in draft.package_history if x != package]
-            draft.package_history = draft.package_history[:40]
+            draft.adb_tasks = list(automation_source.adb_tasks or [])
+            draft.health_monitor_enabled = automation_source.health_monitor_enabled
+            draft.health_packages = list(automation_source.health_packages or [])
+            draft.health_fail_count = automation_source.health_fail_count
+            draft.health_last_status = automation_source.health_last_status
+            draft.health_last_reason = automation_source.health_last_reason
+            draft.health_last_ts = automation_source.health_last_ts
 
             if identity_changed:
                 draft.last_device = ""
@@ -4129,8 +4067,9 @@ class CloudPhoneGUI:
         def check_repo() -> None:
             try:
                 temp = collect()
+                persist_s5(temp)
             except Exception as exc:
-                messagebox.showerror(APP_NAME, str(exc))
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
                 return
             v_repo_status.set("正在同步内置 workflow 并检查 GitHub Secrets…")
             self.bg(
@@ -4143,28 +4082,20 @@ class CloudPhoneGUI:
         def save() -> None:
             try:
                 cfg = collect()
+                persist_s5(cfg)
             except Exception as exc:
-                messagebox.showerror(APP_NAME, str(exc))
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
                 return
+            if not cfg.github_independent:
+                self.global_secrets.clear_github_profile(cfg.profile_id)
             self.store.upsert(cfg)
             self._render_cards()
-            self.log(f"已保存手机配置: {cfg.phone_name} · {cfg.repo} · ID {cfg.phone_id}")
-            win.destroy()
-
-        def delete() -> None:
-            if not original:
-                return
-            if not messagebox.askyesno(APP_NAME, f"删除手机配置“{original.phone_name}”？\n不会删除 GitHub 上已有的备份。"):
-                return
-            self.global_secrets.clear_github_profile(original.profile_id)
-            self.store.remove(original.profile_id)
-            self._render_cards()
-            self.log(f"已删除手机配置: {original.phone_name}")
+            network = "S5" if cfg.use_s5 else "Direct"
+            auth = f"独立 @{cfg.github_account}" if cfg.github_independent else "全局 GitHub"
+            self.log(f"已保存手机配置: {cfg.phone_name} · {cfg.repo} · ID {cfg.phone_id} · {network} · {auth}")
             win.destroy()
 
         ttk.Button(footer, text="检查 / 部署仓库", command=check_repo).pack(side="left")
-        if original:
-            ttk.Button(footer, text="删除此手机", command=delete).pack(side="left", padx=8)
         ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right")
         ttk.Button(footer, text="保存", command=save).pack(side="right", padx=8)
         ttk.Label(footer, text="Ctrl+S 保存").pack(side="right", padx=(0, 10))
@@ -4215,9 +4146,50 @@ class CloudPhoneGUI:
                 notes.append("已初始化备份加密密钥")
         else:
             notes.append("Secret 状态不可读，已跳过完整性检查")
+
+        # S5 is stored per phone on this Windows user with DPAPI. Re-write the
+        # corresponding repository secret before every new/restore dispatch so
+        # edits in the GUI are picked up immediately on the next Runner.
+        if cfg.use_s5:
+            s5 = self.global_secrets.load_s5_profile(cfg.profile_id)
+            host = str(s5.get("host") or "").strip()
+            port = str(s5.get("port") or "").strip()
+            user = str(s5.get("user") or "").strip()
+            password = str(s5.get("pass") or "")
+            if not host or not port:
+                raise RuntimeError("这台手机已启用 S5，但 S5 HOST / PORT 未配置")
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise RuntimeError("这台手机的 S5 PORT 无效")
+            payload = json.dumps(
+                {"host": host, "port": int(port), "user": user, "pass": password},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            secret_value = base64.b64encode(payload).decode("ascii")
+            secret_name = f"MANAGED_S5_{cfg.phone_id}"
+            ok, detail = self.tools.set_github_secret(
+                cfg.repo,
+                token,
+                secret_name,
+                value=secret_value,
+            )
+            if not ok:
+                raise RuntimeError("同步这台手机的 S5 参数失败: " + detail)
+            notes.append("已同步当前 S5 参数")
+        else:
+            notes.append("网络模式 Direct")
         return notes
 
     def _workflow_inputs(self, cfg: AppConfig, mode: str) -> dict[str, str]:
+        manufacturer = ""
+        brand = ""
+        model = ""
+        if mode == "new":
+            item = secrets.choice(REAL_DEVICE_CATALOG)
+            manufacturer = str(item.get("manufacturer") or "")
+            brand = str(item.get("brand") or "")
+            model = str(item.get("model") or "")
+
         return {
             "mode": mode,
             "phone_id": cfg.phone_id,
@@ -4230,9 +4202,13 @@ class CloudPhoneGUI:
             "profile": cfg.profile or "pixel_6",
             "cores": cfg.cores or "4",
             "ram_mb": cfg.ram_mb or "8192",
-            "device_manufacturer": cfg.device_manufacturer or "",
-            "device_brand": cfg.device_brand or "",
-            "device_model": cfg.device_model or "",
+            "device_manufacturer": manufacturer,
+            "device_brand": brand,
+            "device_model": model,
+            "use_s5": "true" if cfg.use_s5 else "false",
+            # Always send a non-empty key name. Direct mode ignores its value, while
+            # S5 mode resolves the phone-specific repository secret through it.
+            "s5_secret_name": f"MANAGED_S5_{cfg.phone_id}",
         }
 
     # ------------------------- cloud phone actions -------------------------
@@ -4261,6 +4237,14 @@ class CloudPhoneGUI:
 
         def done(result: tuple[list[str], int]) -> None:
             notes, previous_run_id = result
+            # Once an independently-authorized phone has successfully dispatched its
+            # first Run, that identity is permanent for this local phone profile.
+            live = self.store.get(profile_id)
+            if live and live.github_independent and not live.github_independent_locked:
+                live.github_independent_locked = True
+                self.store.upsert(live)
+                notes.append("独立 GitHub 已锁定")
+
             # A new workflow was just dispatched, so the next background refresh
             # must fetch GitHub immediately instead of reusing the previous run.
             self._github_run_cache.pop(profile_id, None)
@@ -4658,6 +4642,11 @@ class CloudPhoneGUI:
             if "MANAGED_BACKUP_SAVED" not in logs:
                 return {"state": "failed", "error": f"旧 Run {old_run_id} 已结束，但日志未确认 MANAGED_BACKUP_SAVED"}
 
+            # The backup may take several minutes. Re-read this phone's current
+            # settings immediately before dispatching the replacement Runner so a
+            # newly edited S5 proxy is used without waiting for another cycle.
+            self._prepare_repository(cfg)
+            api = self.api_for(cfg)
             cleanup = api.prune_phone_caches(cfg.phone_id, old_run_id, keep=1)
             api.dispatch(
                 Path(BUILTIN_WORKFLOW_PATH).name,
@@ -4757,6 +4746,135 @@ class CloudPhoneGUI:
             lambda rid: (self._set_card(profile_id, "run", f"已请求停止 Run {rid}"), self.root.after(1800, lambda: self.refresh_profile(profile_id))),
             lambda err: self._set_card(profile_id, "run", f"停止失败：{err}"),
         )
+
+    def delete_profile_completely(self, profile_id: str) -> None:
+        cfg = self.store.get(profile_id)
+        if not cfg:
+            return
+
+        shared = [
+            p for p in self.store.profiles
+            if p.profile_id != profile_id and p.repo.lower() == cfg.repo.lower()
+        ]
+        if shared:
+            names = "、".join(p.phone_name for p in shared[:6])
+            messagebox.showerror(
+                APP_NAME,
+                f"不能完全删除。仓库 {cfg.repo} 还被其他手机使用：{names}\n请先处理这些手机，避免把它们的备份和 Actions 一起删除。",
+                parent=self.root,
+            )
+            return
+
+        if not messagebox.askyesno(
+            APP_NAME,
+            (
+                f"完全删除手机“{cfg.phone_name}”？\n\n"
+                f"将永久删除 GitHub 仓库：{cfg.repo}\n"
+                "仓库里的 Actions、Cache、AVD 备份、Issues、Releases 和其他内容都会一起删除。\n"
+                "同时会删除本机保存的这台手机 S5、独立 GitHub 授权、健康日志和手机配置。\n\n"
+                "此操作不可撤销。"
+            ),
+            parent=self.root,
+        ):
+            return
+
+        typed = simpledialog.askstring(
+            "确认完全删除",
+            f"请输入完整仓库名确认：\n{cfg.repo}",
+            parent=self.root,
+        )
+        if typed is None:
+            return
+        if typed.strip() != cfg.repo:
+            messagebox.showerror(APP_NAME, "输入的仓库名不一致，已取消完全删除。", parent=self.root)
+            return
+
+        try:
+            token = self._token_for(cfg)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+
+        self._set_card(profile_id, "run", "完全删除：正在停止云机并删除仓库…")
+        self._set_operation_progress(profile_id, "完全删除 10% · 正在处理 GitHub", 10.0, True)
+
+        def work() -> dict[str, Any]:
+            api = GitHubAPI(cfg.repo, token)
+            cancelled = 0
+            try:
+                run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+                if run and str(run.get("status") or "") in ("queued", "in_progress"):
+                    rid = int(run.get("id") or 0)
+                    if rid:
+                        try:
+                            api.cancel(rid)
+                            cancelled = rid
+                            time.sleep(1.0)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            repo_missing = False
+            try:
+                api.delete_repository()
+            except RuntimeError as exc:
+                if "GitHub API 404" in str(exc):
+                    repo_missing = True
+                else:
+                    raise
+            return {"cancelled": cancelled, "repo_missing": repo_missing}
+
+        def done(result: dict[str, Any]) -> None:
+            try:
+                self.global_secrets.clear_github_profile(profile_id)
+            except Exception:
+                pass
+            try:
+                self.global_secrets.clear_s5_profile(profile_id)
+            except Exception:
+                pass
+            try:
+                self._health_log_path(cfg).unlink(missing_ok=True)
+            except TypeError:
+                path = self._health_log_path(cfg)
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+
+            self._refreshing.discard(profile_id)
+            self._rotating.discard(profile_id)
+            self._adb_task_running.discard(profile_id)
+            self._backup_tracking.discard(profile_id)
+            self._launch_tracking.discard(profile_id)
+            self._github_run_cache.pop(profile_id, None)
+            self._github_run_last_fetch.pop(profile_id, None)
+            self._last_auto.pop(profile_id, None)
+            self._last_health.pop(profile_id, None)
+            self._last_push_health.pop(profile_id, None)
+            self._push_health_fail_count.pop(profile_id, None)
+            self._health_bootstrap_done.pop(profile_id, None)
+            self._health_online.pop(profile_id, None)
+            self._last_rotation_poll.pop(profile_id, None)
+
+            self.store.remove(profile_id)
+            self.repo_cache = [x for x in self.repo_cache if x.lower() != cfg.repo.lower()]
+            self._render_cards()
+            suffix = "（GitHub 仓库原本已不存在）" if result.get("repo_missing") else ""
+            self.log(f"已完全删除手机: {cfg.phone_name} · {cfg.repo}{suffix}")
+            messagebox.showinfo(APP_NAME, f"“{cfg.phone_name}”已完全删除。{suffix}", parent=self.root)
+
+        def failed(err: str) -> None:
+            self._set_operation_progress(profile_id, f"完全删除失败 · {err}", 100.0, True)
+            self._set_card(profile_id, "run", f"完全删除失败：{err}")
+            messagebox.showerror(
+                APP_NAME,
+                "GitHub 仓库没有删除成功，因此本地手机配置和凭据仍保留。\n\n" + err,
+                parent=self.root,
+            )
+
+        self.bg(f"{cfg.phone_name} 完全删除", work, done, failed)
 
     # ------------------------- monitoring -------------------------
     def refresh_profile(self, profile_id: str, quiet: bool = False) -> None:

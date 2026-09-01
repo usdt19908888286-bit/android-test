@@ -62,6 +62,16 @@ on:
         required: false
         default: '8192'
         type: string
+      use_s5:
+        description: Route Android network through the phone-specific SOCKS5 proxy
+        required: false
+        default: 'false'
+        type: string
+      s5_secret_name:
+        description: Repository secret name containing the phone-specific SOCKS5 configuration
+        required: false
+        default: ''
+        type: string
       device_manufacturer:
         description: Optional Android Build.MANUFACTURER value for emulator compatibility testing
         required: false
@@ -97,6 +107,7 @@ env:
   DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || '' }}
   DEVICE_BRAND: ${{ inputs.device_brand || '' }}
   DEVICE_MODEL: ${{ inputs.device_model || '' }}
+  USE_S5: ${{ inputs.use_s5 || 'false' }}
 
 jobs:
   phone:
@@ -104,6 +115,7 @@ jobs:
     timeout-minutes: 330
     env:
       AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}
+      S5_CONFIG_B64: ${{ inputs.use_s5 == 'true' && secrets[inputs.s5_secret_name] || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -160,16 +172,174 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           test -e /dev/kvm
           sudo apt-get update -qq
-          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq python3-pip
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
 
-      - name: Verify direct Internet
+      - name: Prepare and verify phone network
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
-          echo 'DIRECT_NETWORK_OK'
+          if [ "${USE_S5:-false}" != 'true' ]; then
+            curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+            echo 'DIRECT_NETWORK_OK'
+            exit 0
+          fi
+
+          [ -n "${S5_CONFIG_B64:-}" ] || { echo '::error::S5 is enabled but the phone-specific S5 secret is missing'; exit 1; }
+          python3 -m pip install --quiet --break-system-packages PySocks
+
+          cat >/tmp/s5_bridge.py <<'PY'
+          import base64
+          import json
+          import os
+          import select
+          import socketserver
+          from urllib.parse import urlsplit
+          import socks
+
+          cfg = json.loads(base64.b64decode(os.environ['S5_CONFIG_B64']).decode('utf-8'))
+          S5_HOST = str(cfg.get('host') or '').strip()
+          S5_PORT = int(cfg.get('port') or 0)
+          S5_USER = str(cfg.get('user') or '') or None
+          S5_PASS = str(cfg.get('pass') or '') or None
+          if not S5_HOST or not (1 <= S5_PORT <= 65535):
+              raise SystemExit('invalid S5 configuration')
+
+          def open_upstream(host, port):
+              s = socks.socksocket()
+              s.set_proxy(
+                  socks.SOCKS5,
+                  S5_HOST,
+                  S5_PORT,
+                  rdns=True,
+                  username=S5_USER,
+                  password=S5_PASS,
+              )
+              s.settimeout(30)
+              s.connect((host, int(port)))
+              s.settimeout(None)
+              return s
+
+          def relay(a, b):
+              sockets = [a, b]
+              while True:
+                  readable, _, _ = select.select(sockets, [], [], 60)
+                  if not readable:
+                      continue
+                  for src in readable:
+                      dst = b if src is a else a
+                      data = src.recv(65536)
+                      if not data:
+                          return
+                      dst.sendall(data)
+
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  client = self.request
+                  client.settimeout(30)
+                  data = b''
+                  while b'\r\n\r\n' not in data and len(data) < 65536:
+                      chunk = client.recv(4096)
+                      if not chunk:
+                          return
+                      data += chunk
+                  if b'\r\n\r\n' not in data:
+                      return
+                  head, rest = data.split(b'\r\n\r\n', 1)
+                  lines = head.split(b'\r\n')
+                  parts = lines[0].decode('latin1').split(' ', 2)
+                  if len(parts) != 3:
+                      return
+                  method, target, version = parts
+                  try:
+                      if method.upper() == 'CONNECT':
+                          host, port = target.rsplit(':', 1)
+                          upstream = open_upstream(host.strip('[]'), int(port))
+                          client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                          if rest:
+                              upstream.sendall(rest)
+                          relay(client, upstream)
+                          upstream.close()
+                          return
+
+                      parsed = urlsplit(target)
+                      if parsed.hostname:
+                          host = parsed.hostname
+                          port = parsed.port or 80
+                          path = parsed.path or '/'
+                          if parsed.query:
+                              path += '?' + parsed.query
+                      else:
+                          host_header = ''
+                          for line in lines[1:]:
+                              if line.lower().startswith(b'host:'):
+                                  host_header = line.split(b':', 1)[1].strip().decode('latin1')
+                                  break
+                          if not host_header:
+                              return
+                          if ':' in host_header:
+                              host, port_text = host_header.rsplit(':', 1)
+                              port = int(port_text)
+                          else:
+                              host, port = host_header, 80
+                          path = target
+                      upstream = open_upstream(host, port)
+                      lines[0] = f'{method} {path} {version}'.encode('latin1')
+                      upstream.sendall(b'\r\n'.join(lines) + b'\r\n\r\n' + rest)
+                      relay(client, upstream)
+                      upstream.close()
+                  except Exception:
+                      try:
+                          client.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+                      except Exception:
+                          pass
+
+          class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
+              daemon_threads = True
+
+          Server(('127.0.0.1', 8118), Handler).serve_forever()
+          PY
+
+          cat >/tmp/s5_bridge_supervisor.sh <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          while true; do
+            python3 /tmp/s5_bridge.py >>/tmp/s5_bridge.log 2>&1
+            echo 'SOCKS5_BRIDGE_RESTARTING' >>/tmp/s5_bridge.log
+            sleep 2
+          done
+          SH
+          chmod +x /tmp/s5_bridge_supervisor.sh
+          : >/tmp/s5_bridge.log
+          nohup /tmp/s5_bridge_supervisor.sh >/dev/null 2>&1 &
+          S5_BRIDGE_PID=$!
+          echo "$S5_BRIDGE_PID" >/tmp/s5_bridge_supervisor.pid
+          sleep 1
+          kill -0 "$S5_BRIDGE_PID" 2>/dev/null || { echo '::error::SOCKS5 local bridge failed to start'; exit 1; }
+
+          python3 - <<'PY'
+          import base64, json, os, socks
+          cfg = json.loads(base64.b64decode(os.environ['S5_CONFIG_B64']).decode('utf-8'))
+          s = socks.socksocket()
+          s.set_proxy(
+              socks.SOCKS5,
+              str(cfg['host']),
+              int(cfg['port']),
+              rdns=True,
+              username=(str(cfg.get('user') or '') or None),
+              password=(str(cfg.get('pass') or '') or None),
+          )
+          s.settimeout(12)
+          s.connect(('www.cloudflare.com', 443))
+          s.close()
+          print('SOCKS5_UPSTREAM_OK')
+          PY
+
+          curl -fsS --proxy http://127.0.0.1:8118 --connect-timeout 10 --max-time 20 \
+            https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+          echo 'SOCKS5_BRIDGE_OK'
 
       - name: Restore latest encrypted AVD backup
         if: inputs.mode == 'restore'
@@ -478,7 +648,8 @@ jobs:
           disable-animations: false
           emulator-options: >-
             -no-snapshot
-            ${{ inputs.device_model != '' && '-writable-system' || '' }}
+            ${{ (inputs.device_model != '' || inputs.mode == 'restore') && '-writable-system' || '' }}
+            ${{ inputs.use_s5 == 'true' && '-http-proxy http://127.0.0.1:8118' || '' }}
             -gpu swiftshader_indirect
             -noaudio
             -no-boot-anim
