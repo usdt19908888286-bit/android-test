@@ -1397,8 +1397,8 @@ class CloudPhoneGUI:
 
         win = tk.Toplevel(self.root)
         win.title("手机设置" if original else "添加手机")
-        win.geometry("880x900")
-        win.minsize(820, 760)
+        win.geometry("880x760")
+        win.minsize(780, 620)
         win.transient(self.root)
 
         v_repo = tk.StringVar(value=draft.repo)
@@ -1427,8 +1427,27 @@ class CloudPhoneGUI:
         v_repo_status = tk.StringVar(value="内置工作流将在启动/恢复前自动同步到目标仓库")
         v_rotate_status = tk.StringVar(value=self._rotation_text(draft))
 
-        body = ttk.Frame(win, padding=14)
-        body.pack(fill="both", expand=True)
+        footer = ttk.Frame(win, padding=(14, 10))
+        footer.pack(side="bottom", fill="x")
+        ttk.Separator(win, orient="horizontal").pack(side="bottom", fill="x")
+
+        content_shell = ttk.Frame(win)
+        content_shell.pack(side="top", fill="both", expand=True)
+        settings_canvas = tk.Canvas(content_shell, highlightthickness=0)
+        settings_scroll = ttk.Scrollbar(content_shell, orient="vertical", command=settings_canvas.yview)
+        settings_canvas.configure(yscrollcommand=settings_scroll.set)
+        settings_scroll.pack(side="right", fill="y")
+        settings_canvas.pack(side="left", fill="both", expand=True)
+        body = ttk.Frame(settings_canvas, padding=14)
+        body_window = settings_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind(
+            "<Configure>",
+            lambda _e: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")),
+        )
+        settings_canvas.bind(
+            "<Configure>",
+            lambda e: settings_canvas.itemconfigure(body_window, width=e.width),
+        )
 
         repo_box = ttk.LabelFrame(body, text="GitHub 仓库", padding=10)
         repo_box.pack(fill="x")
@@ -1788,13 +1807,14 @@ class CloudPhoneGUI:
             self.log(f"已删除手机配置: {original.phone_name}")
             win.destroy()
 
-        footer = ttk.Frame(body)
-        footer.pack(fill="x", pady=(14, 0))
         ttk.Button(footer, text="检查 / 部署仓库", command=check_repo).pack(side="left")
         if original:
             ttk.Button(footer, text="删除此手机", command=delete).pack(side="left", padx=8)
         ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right")
         ttk.Button(footer, text="保存", command=save).pack(side="right", padx=8)
+        ttk.Label(footer, text="Ctrl+S 保存").pack(side="right", padx=(0, 10))
+        win.bind("<Control-s>", lambda _e: save())
+        win.bind("<Control-S>", lambda _e: save())
 
     # ------------------------- repository / workflow -------------------------
     def _prepare_repository(self, cfg: AppConfig) -> list[str]:
