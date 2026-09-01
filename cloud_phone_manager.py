@@ -1661,7 +1661,12 @@ class LocalTools:
         return result
 
     def bicoin_health_recover(self, address: str) -> dict[str, Any]:
-        """Controlled mid-session recovery for BiCoin + Monitor after a core health failure."""
+        """Full five-minute recovery for BiCoin + Monitor after a core health failure.
+
+        Use force-stop + launcher start for both preset apps so stale SDK/process state
+        cannot survive the recovery. This intentionally matches the one-minute Push
+        watchdog's full-restart strategy instead of the old ``am kill`` behavior.
+        """
         bicoin = "com.temperaturecoin"
         monitor = "com.kolmonitor"
         listener = "com.kolmonitor/com.kolmonitor.monitor.BicoinNotificationListener"
@@ -1676,22 +1681,60 @@ class LocalTools:
             result["errors"].append(f"wait-for-device: {(out or err).strip()}")
             return result
 
-        def run_step(label: str, args: list[str], timeout: int = 25) -> None:
+        def run_step(label: str, args: list[str], timeout: int = 25) -> bool:
             c, o, e = self.adb_cmd(address, args, timeout=timeout)
             if c == 0:
                 result["steps"].append(label)
-            else:
-                result["errors"].append(f"{label}: {(o or e).strip() or f'exit={c}'}")
+                return True
+            result["errors"].append(f"{label}: {(o or e).strip() or f'exit={c}'}")
+            return False
 
-        run_step("kill Monitor", ["shell", "am", "kill", monitor])
-        time.sleep(1)
-        run_step("start Monitor", ["shell", "am", "start", "-n", "com.kolmonitor/.MainActivity"])
-        run_step("allow NotificationListener", ["shell", "cmd", "notification", "allow_listener", listener])
+        # Restart Monitor completely first, then re-grant its notification listener.
+        monitor_stopped = run_step(
+            "force-stop Monitor",
+            ["shell", "am", "force-stop", monitor],
+        )
+        if monitor_stopped:
+            time.sleep(2)
+        monitor_started = run_step(
+            "launch Monitor (monkey)",
+            [
+                "shell",
+                "monkey",
+                "-p", monitor,
+                "-c", "android.intent.category.LAUNCHER",
+                "1",
+            ],
+            timeout=35,
+        )
+        if monitor_started:
+            time.sleep(5)
+        run_step(
+            "allow NotificationListener",
+            ["shell", "cmd", "notification", "allow_listener", listener],
+        )
 
-        run_step("kill BiCoin", ["shell", "am", "kill", bicoin])
-        time.sleep(2)
-        run_step("start BiCoin", ["shell", "am", "start", "-n", "com.temperaturecoin/.mvp.activity.main.WelcomActivity"])
-        time.sleep(3)
+        # Restart BiCoin with the same full launcher cycle used by the one-minute
+        # Push watchdog; ordinary am kill is deliberately not used here.
+        bicoin_stopped = run_step(
+            "force-stop BiCoin",
+            ["shell", "am", "force-stop", bicoin],
+        )
+        if bicoin_stopped:
+            time.sleep(2)
+        bicoin_started = run_step(
+            "launch BiCoin (monkey)",
+            [
+                "shell",
+                "monkey",
+                "-p", bicoin,
+                "-c", "android.intent.category.LAUNCHER",
+                "1",
+            ],
+            timeout=35,
+        )
+        if bicoin_started:
+            time.sleep(8)
         run_step("HOME", ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
 
         result["ok"] = not result["errors"]
@@ -5721,13 +5764,13 @@ class CloudPhoneGUI:
                 pre_issues = [str(item) for item in (pre_recovery_health.get("issues") or []) if str(item).strip()]
                 if bool(local_health.get("ok", False)):
                     self.log(
-                        f"{cfg.phone_name} · 健康异常已自动重启 Monitor + BiCoin，复检恢复正常"
+                        f"{cfg.phone_name} · 健康异常已完整重启 Monitor + BiCoin（force-stop + monkey），复检恢复正常"
                         + (f" · 原因：{'；'.join(pre_issues)}" if pre_issues else "")
                     )
                 else:
                     recovery_errors = [str(item) for item in (health_recovery.get("errors") or []) if str(item).strip()]
                     detail = "；".join(recovery_errors) if recovery_errors else "重启完成但复检仍异常"
-                    self.log(f"{cfg.phone_name} · 健康异常已执行自动重启，但仍未恢复 · {detail}")
+                    self.log(f"{cfg.phone_name} · 健康异常已执行 Monitor + BiCoin 完整重启，但仍未恢复 · {detail}")
 
             if push_checked_ts:
                 self._last_push_health[profile_id] = push_checked_ts
@@ -6326,7 +6369,7 @@ class CloudPhoneGUI:
                 "• Monitor NotificationListener 权限必须存在\n"
                 "• relay_debug_state.xml 中 listenerConnected=true\n"
                 "• BiCoin netpolicy 必须 effective=NONE；APP_BACKGROUND 判异常\n\n"
-                "不检查 ping/pong，也不因为几分钟没有新通知判异常；5 分钟核心巡检异常仍按原规则重启 Monitor + BiCoin，自定义 App 异常不会触发核心重启。",
+                "不检查 ping/pong，也不因为几分钟没有新通知判异常；5 分钟核心巡检异常会完整重启 Monitor + BiCoin：两者都使用 force-stop + monkey 启动，Monitor 重新授权 NotificationListener，最后回 HOME；自定义 App 异常不会触发核心重启。",
                 parent=dlg,
             )
 
