@@ -1734,7 +1734,7 @@ class LocalTools:
             timeout=35,
         )
         if bicoin_started:
-            time.sleep(8)
+            time.sleep(60)
         run_step("HOME", ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
 
         result["ok"] = not result["errors"]
@@ -1939,7 +1939,7 @@ class LocalTools:
         )
         result["restarted"] = bool(launched)
         if launched:
-            time.sleep(8)
+            time.sleep(60)
 
         run_step("HOME", ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
         result["ok"] = not result["errors"]
@@ -5783,7 +5783,7 @@ class CloudPhoneGUI:
                     trigger_streak = 1 if immediate else 2
                     restarted = bool(push_recovery.get("restarted", False))
                     if restarted:
-                        self._push_health_grace_until[profile_id] = push_checked_ts + 90.0
+                        self._push_health_grace_until[profile_id] = time.time() + 90.0
 
                     final_status = (
                         "BICOIN_RECOVERED · 90秒 grace"
@@ -6359,7 +6359,7 @@ class CloudPhoneGUI:
                 "• 主进程死亡 BICOIN_MAIN_DEAD 可立即完整恢复；watch/mlp 异常采用连续 2 次保守确认\n"
                 "• mlp-worker 第一次缺失=MISSING_1，连续第二次=MISSING_2；伴随 CLOSE_WAIT 记录 MCL_SUSPECTED_DEAD，但仍需连续 2 次\n"
                 "• Watchdog 启动、ADB 重新上线或 BiCoin 重启后进入 90 秒 BICOIN_STARTUP_GRACE，grace 内不因 mlp-worker 暂未创建而重启\n"
-                "• Push 恢复顺序: force-stop BiCoin → 等 2 秒 → monkey 完整启动 → 等 8 秒 → HOME\n\n"
+                "• Push 恢复顺序: force-stop BiCoin → 等 2 秒 → monkey 完整启动 → 等 60 秒 → HOME\n\n"
                 "每 5 分钟健康检查:\n"
                 "• ADB get-state 必须是 device\n"
                 "• 预设 + 自定义 App 主进程必须存在\n"
@@ -6369,7 +6369,7 @@ class CloudPhoneGUI:
                 "• Monitor NotificationListener 权限必须存在\n"
                 "• relay_debug_state.xml 中 listenerConnected=true\n"
                 "• BiCoin netpolicy 必须 effective=NONE；APP_BACKGROUND 判异常\n\n"
-                "不检查 ping/pong，也不因为几分钟没有新通知判异常；5 分钟核心巡检异常会完整重启 Monitor + BiCoin：两者都使用 force-stop + monkey 启动，Monitor 重新授权 NotificationListener，最后回 HOME；自定义 App 异常不会触发核心重启。",
+                "不检查 ping/pong，也不因为几分钟没有新通知判异常；5 分钟核心巡检异常会完整重启 Monitor + BiCoin：两者都使用 force-stop + monkey 启动，Monitor 重新授权 NotificationListener；BiCoin monkey 启动后等待 60 秒再回 HOME；自定义 App 异常不会触发核心重启。",
                 parent=dlg,
             )
 
