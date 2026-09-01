@@ -1485,6 +1485,43 @@ class LocalTools:
         result["ok"] = not result["errors"]
         return result
 
+    def bicoin_health_recover(self, address: str) -> dict[str, Any]:
+        """Controlled mid-session recovery for BiCoin + Monitor after a core health failure."""
+        bicoin = "com.temperaturecoin"
+        monitor = "com.kolmonitor"
+        listener = "com.kolmonitor/com.kolmonitor.monitor.BicoinNotificationListener"
+        result: dict[str, Any] = {"ok": False, "steps": [], "errors": []}
+
+        ok, detail = self.adb_connect(address)
+        if not ok:
+            result["errors"].append(f"adb connect: {detail}")
+            return result
+        code, out, err = self.adb_cmd(address, ["wait-for-device"], timeout=60)
+        if code != 0:
+            result["errors"].append(f"wait-for-device: {(out or err).strip()}")
+            return result
+
+        def run_step(label: str, args: list[str], timeout: int = 25) -> None:
+            c, o, e = self.adb_cmd(address, args, timeout=timeout)
+            if c == 0:
+                result["steps"].append(label)
+            else:
+                result["errors"].append(f"{label}: {(o or e).strip() or f'exit={c}'}")
+
+        run_step("kill Monitor", ["shell", "am", "kill", monitor])
+        time.sleep(1)
+        run_step("start Monitor", ["shell", "am", "start", "-n", "com.kolmonitor/.MainActivity"])
+        run_step("allow NotificationListener", ["shell", "cmd", "notification", "allow_listener", listener])
+
+        run_step("kill BiCoin", ["shell", "am", "kill", bicoin])
+        time.sleep(2)
+        run_step("start BiCoin", ["shell", "am", "start", "-n", "com.temperaturecoin/.mvp.activity.main.WelcomActivity"])
+        time.sleep(3)
+        run_step("HOME", ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
+
+        result["ok"] = not result["errors"]
+        return result
+
     @staticmethod
     def _process_context(text: str, package: str, after: int = 8) -> str:
         lines = text.splitlines()
@@ -1495,7 +1532,7 @@ class LocalTools:
         return "\n".join(chunks)
 
     def bicoin_health_check(self, address: str, packages: Optional[list[str]] = None) -> dict[str, Any]:
-        """Five-minute local Android health check. It never force-stops/restarts apps."""
+        """Five-minute local Android health check. It may request one controlled recovery for preset-app faults."""
         bicoin = "com.temperaturecoin"
         monitor = "com.kolmonitor"
         listener = "com.kolmonitor/com.kolmonitor.monitor.BicoinNotificationListener"
@@ -1507,6 +1544,8 @@ class LocalTools:
 
         result: dict[str, Any] = {
             "ok": False,
+            "core_ok": False,
+            "custom_ok": False,
             "adb": False,
             "bicoin_process": False,
             "monitor_process": False,
@@ -1640,10 +1679,12 @@ class LocalTools:
         else:
             result["issues"].append("无法取得 BiCoin UID")
 
-        all_processes_ok = all(bool(result["processes"].get(pkg, False)) for pkg in monitored)
-        result["ok"] = bool(
+        custom_packages = [pkg for pkg in monitored if pkg not in (bicoin, monitor)]
+        custom_ok = all(bool(result["processes"].get(pkg, False)) for pkg in custom_packages)
+        core_ok = bool(
             result["adb"]
-            and all_processes_ok
+            and result["bicoin_process"]
+            and result["monitor_process"]
             and not result["bicoin_frozen"]
             and result["netpolicy"] == "NONE"
             and result["whitelist"].get(bicoin)
@@ -1651,6 +1692,9 @@ class LocalTools:
             and result["notification_listener"]
             and result["listener_connected"]
         )
+        result["core_ok"] = core_ok
+        result["custom_ok"] = custom_ok
+        result["ok"] = bool(core_ok and custom_ok)
         return result
 
     def start_package(self, address: str, package: str) -> tuple[bool, str]:
@@ -2357,6 +2401,14 @@ class CloudPhoneGUI:
             line = f"[{stamp}] 上线初始化 {'成功' if bool(payload.get('ok')) else '部分异常'}"
             if started:
                 line += " | 启动缺失进程=" + ", ".join(started)
+            if errors:
+                line += " | 错误=" + "；".join(errors)
+        elif event == "recovery":
+            steps = [str(item) for item in (payload.get("steps") or []) if str(item).strip()]
+            errors = [str(item) for item in (payload.get("errors") or []) if str(item).strip()]
+            line = f"[{stamp}] 自动恢复 {'执行完成' if bool(payload.get('ok')) else '部分失败'} | 重启=Monitor → BiCoin → HOME"
+            if steps:
+                line += " | 完成=" + ", ".join(steps)
             if errors:
                 line += " | 错误=" + "；".join(errors)
         else:
@@ -4135,6 +4187,8 @@ class CloudPhoneGUI:
                 "health": {},
                 "runner": {},
                 "local_health": {},
+                "pre_recovery_health": {},
+                "health_recovery": {},
                 "bootstrap": {},
                 "bootstrap_key": "",
                 "adb_online": False,
@@ -4187,7 +4241,19 @@ class CloudPhoneGUI:
                 result["bootstrap_key"] = bootstrap_key
 
             if need_bootstrap or health_due or not float(cfg.health_last_ts or 0):
-                result["local_health"] = self.tools.bicoin_health_check(address, cfg.health_packages)
+                initial_health = self.tools.bicoin_health_check(address, cfg.health_packages)
+                result["local_health"] = initial_health
+                # Mid-session recovery is only for BiCoin/Monitor core faults. Custom-app
+                # process failures are reported but do not restart the preset apps.
+                if (
+                    not need_bootstrap
+                    and same_run
+                    and bool(initial_health.get("adb", False))
+                    and not bool(initial_health.get("core_ok", False))
+                ):
+                    result["pre_recovery_health"] = initial_health
+                    result["health_recovery"] = self.tools.bicoin_health_recover(address)
+                    result["local_health"] = self.tools.bicoin_health_check(address, cfg.health_packages)
             return result
 
         def done(result: dict[str, Any]) -> None:
@@ -4228,6 +4294,8 @@ class CloudPhoneGUI:
             health = result.get("health") or {}
             runner = result.get("runner") or {}
             local_health = result.get("local_health") or {}
+            pre_recovery_health = result.get("pre_recovery_health") or {}
+            health_recovery = result.get("health_recovery") or {}
             adb_online = bool(result.get("adb_online", False))
             self._health_online[profile_id] = adb_online
 
@@ -4305,7 +4373,7 @@ class CloudPhoneGUI:
             bootstrap_key = str(result.get("bootstrap_key") or "")
             bootstrap = result.get("bootstrap") or {}
             if bootstrap_key:
-                # One attempt per ADB-online generation. Runtime health checks never restart apps.
+                # One initialization attempt per ADB-online generation.
                 self._health_bootstrap_done[profile_id] = bootstrap_key
                 try:
                     self._append_health_log(cfg, "bootstrap", bootstrap)
@@ -4319,6 +4387,23 @@ class CloudPhoneGUI:
                     self.log(f"{cfg.phone_name} · 上线初始化部分失败：{'；'.join(errors)}")
                 else:
                     self.log(f"{cfg.phone_name} · 上线初始化完成")
+
+            if pre_recovery_health:
+                try:
+                    self._append_health_log(cfg, "check", pre_recovery_health)
+                    self._append_health_log(cfg, "recovery", health_recovery)
+                except Exception as exc:
+                    self.log(f"{cfg.phone_name}: 健康恢复日志写入失败 · {exc}")
+                pre_issues = [str(item) for item in (pre_recovery_health.get("issues") or []) if str(item).strip()]
+                if bool(local_health.get("ok", False)):
+                    self.log(
+                        f"{cfg.phone_name} · 健康异常已自动重启 Monitor + BiCoin，复检恢复正常"
+                        + (f" · 原因：{'；'.join(pre_issues)}" if pre_issues else "")
+                    )
+                else:
+                    recovery_errors = [str(item) for item in (health_recovery.get("errors") or []) if str(item).strip()]
+                    detail = "；".join(recovery_errors) if recovery_errors else "重启完成但复检仍异常"
+                    self.log(f"{cfg.phone_name} · 健康异常已执行自动重启，但仍未恢复 · {detail}")
 
             if local_health:
                 self._update_health_state(cfg, status, local_health)
@@ -4790,7 +4875,7 @@ class CloudPhoneGUI:
                 "• Monitor NotificationListener 权限必须存在\n"
                 "• relay_debug_state.xml 中 listenerConnected=true\n"
                 "• BiCoin netpolicy 必须 effective=NONE；APP_BACKGROUND 判异常\n\n"
-                "不检查 ping/pong，也不因为几分钟没有新通知判异常；运行巡检不会为了保活反复重启 App。",
+                "不检查 ping/pong，也不因为几分钟没有新通知判异常；运行巡检只在 BiCoin/Monitor 核心健康异常时按固定顺序自动重启一次并复检，自定义 App 异常不会触发这次重启。",
                 parent=dlg,
             )
 
