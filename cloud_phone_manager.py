@@ -4796,20 +4796,22 @@ class CloudPhoneGUI:
                         )
                 elif push_health:
                     if not bool(push_health.get("countable", False)):
+                        streak = 0
                         self._push_health_fail_count[profile_id] = 0
                     elif bool(push_health.get("ok", False)):
+                        streak = 0
                         self._push_health_fail_count[profile_id] = 0
                     else:
                         streak = min(2, push_streak_before + 1)
                         self._push_health_fail_count[profile_id] = streak
-                        try:
-                            self._append_health_log(
-                                cfg,
-                                "push_check",
-                                {**push_health, "streak": streak, "threshold": 2},
-                            )
-                        except Exception as exc:
-                            self.log(f"{cfg.phone_name}: Push 健康日志写入失败 · {exc}")
+                    try:
+                        self._append_health_log(
+                            cfg,
+                            "push_check",
+                            {**push_health, "streak": streak, "threshold": 2},
+                        )
+                    except Exception as exc:
+                        self.log(f"{cfg.phone_name}: Push 健康日志写入失败 · {exc}")
 
             if local_health:
                 self._update_health_state(cfg, status, local_health)
