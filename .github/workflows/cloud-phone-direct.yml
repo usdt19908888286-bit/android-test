@@ -70,7 +70,8 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
-          curl -fIL --retry 2 --connect-timeout 15 --max-time 45 "$APK_URL" >/tmp/apk-head.txt
+          curl -fsSL -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36' --retry 2 --connect-timeout 15 --max-time 45 --range 0-1023 "$APK_URL" -o /tmp/apk-probe.bin
+          test -s /tmp/apk-probe.bin
           echo 'DIRECT_NETWORK_OK'
 
       - name: Start fresh Android phone, install APK, expose ADB
@@ -118,7 +119,7 @@ jobs:
             adb shell pm list packages -3 | tr -d '\r' | sort > /tmp/packages-before.txt
 
             echo "APK_DOWNLOAD_URL=$APK_URL"
-            curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 \
+            curl -fL -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36' --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 \
               "$APK_URL" -o /tmp/app-release.apk
             test -s /tmp/app-release.apk
             unzip -tq /tmp/app-release.apk >/dev/null
