@@ -1569,6 +1569,84 @@ class LocalTools:
         result["ok"] = not result["errors"]
         return result
 
+    def bicoin_push_health_check(self, address: str) -> dict[str, Any]:
+        """Check BiCoin push-process/thread/socket health using the app-specific probe."""
+        command = (
+            'uid=$(cmd package list packages -U com.temperaturecoin | sed "s/.*uid://"); '
+            'p=$(pidof com.temperaturecoin); '
+            'w=$(pidof com.temperaturecoin:watch); '
+            'if [ -z "$p" ]; then echo BICOIN_MAIN_DEAD; '
+            'elif [ -z "$w" ]; then echo BICOIN_WATCH_DEAD; '
+            'elif ! grep -q "M-PL-MP-PUSH_SD" /proc/$p/task/*/comm 2>/dev/null; then echo BICOIN_PUSH_THREAD_DEAD; '
+            'elif cat /proc/net/tcp /proc/net/tcp6 | grep " $uid " | grep " 01 " | grep " 02:" >/dev/null; '
+            'then echo BICOIN_PUSH_OK; else echo BICOIN_PUSH_SOCKET_DEAD; fi'
+        )
+        code, out, err = self.adb_cmd(address, ["shell", command], timeout=25)
+        raw = (out or err or "").strip()
+        if code != 0:
+            return {
+                "ok": False,
+                "countable": False,
+                "adb": False,
+                "status": "BICOIN_PUSH_CHECK_ADB_FAILED",
+                "detail": raw or f"exit={code}",
+            }
+
+        allowed = {
+            "BICOIN_MAIN_DEAD",
+            "BICOIN_WATCH_DEAD",
+            "BICOIN_PUSH_THREAD_DEAD",
+            "BICOIN_PUSH_OK",
+            "BICOIN_PUSH_SOCKET_DEAD",
+        }
+        status = ""
+        for line in reversed(raw.splitlines()):
+            value = line.strip()
+            if value in allowed:
+                status = value
+                break
+        if not status:
+            status = "BICOIN_PUSH_CHECK_UNKNOWN"
+        return {
+            "ok": status == "BICOIN_PUSH_OK",
+            "countable": True,
+            "adb": True,
+            "status": status,
+            "detail": raw,
+        }
+
+    def bicoin_push_recover(self, address: str) -> dict[str, Any]:
+        """Restart only BiCoin after two consecutive push-health failures, then return HOME."""
+        bicoin = "com.temperaturecoin"
+        result: dict[str, Any] = {"ok": False, "steps": [], "errors": []}
+
+        ok, detail = self.adb_connect(address)
+        if not ok:
+            result["errors"].append(f"adb connect: {detail}")
+            return result
+        code, out, err = self.adb_cmd(address, ["wait-for-device"], timeout=60)
+        if code != 0:
+            result["errors"].append(f"wait-for-device: {(out or err).strip()}")
+            return result
+
+        def run_step(label: str, args: list[str], timeout: int = 25) -> None:
+            c, o, e = self.adb_cmd(address, args, timeout=timeout)
+            if c == 0:
+                result["steps"].append(label)
+            else:
+                result["errors"].append(f"{label}: {(o or e).strip() or f'exit={c}'}")
+
+        run_step("kill BiCoin", ["shell", "am", "kill", bicoin])
+        time.sleep(2)
+        run_step(
+            "start BiCoin",
+            ["shell", "am", "start", "-n", "com.temperaturecoin/.mvp.activity.main.WelcomActivity"],
+        )
+        time.sleep(3)
+        run_step("HOME", ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
+        result["ok"] = not result["errors"]
+        return result
+
     @staticmethod
     def _process_context(text: str, package: str, after: int = 8) -> str:
         lines = text.splitlines()
@@ -2200,6 +2278,8 @@ class CloudPhoneGUI:
         self._refreshing: set[str] = set()
         self._last_auto: dict[str, float] = {}
         self._last_health: dict[str, float] = {}
+        self._last_push_health: dict[str, float] = {}
+        self._push_health_fail_count: dict[str, int] = {}
         self._health_bootstrap_done: dict[str, str] = {}
         self._health_online: dict[str, bool] = {}
         self._last_rotation_poll: dict[str, float] = {}
@@ -2351,13 +2431,27 @@ class CloudPhoneGUI:
         for i in range(4):
             status.columnconfigure(i, weight=1, uniform="phone_status")
 
-        def status_item(col: int, title: str, variable: tk.StringVar) -> None:
+        def copy_connection(_event: Any = None) -> str:
+            current = self.store.get(cfg.profile_id)
+            address = str(current.last_device or "").strip() if current else ""
+            if address:
+                self._copy_to_clipboard(address)
+                self.log(f"{cfg.phone_name}: 已复制连接地址 {address}")
+            return "break"
+
+        def status_item(col: int, title: str, variable: tk.StringVar, copy_on_double: bool = False) -> None:
             box = ttk.Frame(status, padding=(7, 3))
             box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0))
-            ttk.Label(box, text=title, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            ttk.Label(box, textvariable=variable, justify="left", wraplength=285).pack(anchor="w", pady=(2, 0))
+            title_label = ttk.Label(box, text=title, font=("Segoe UI", 9, "bold"))
+            title_label.pack(anchor="w")
+            value_label = ttk.Label(box, textvariable=variable, justify="left", wraplength=285)
+            value_label.pack(anchor="w", pady=(2, 0))
+            if copy_on_double:
+                for widget in (box, title_label, value_label):
+                    widget.bind("<Double-Button-1>", copy_connection)
+                value_label.configure(cursor="hand2")
 
-        status_item(0, "连接", vars_["adb"])
+        status_item(0, "连接", vars_["adb"], copy_on_double=True)
         status_item(1, "Android", vars_["android"])
         status_item(2, "当前 App", vars_["app"])
         status_item(3, "资源", vars_["server"])
@@ -2542,6 +2636,27 @@ class CloudPhoneGUI:
             steps = [str(item) for item in (payload.get("steps") or []) if str(item).strip()]
             errors = [str(item) for item in (payload.get("errors") or []) if str(item).strip()]
             line = f"[{stamp}] 自动恢复 {'执行完成' if bool(payload.get('ok')) else '部分失败'} | 重启=Monitor → BiCoin → HOME"
+            if steps:
+                line += " | 完成=" + ", ".join(steps)
+            if errors:
+                line += " | 错误=" + "；".join(errors)
+        elif event == "push_check":
+            status = str(payload.get("status") or "UNKNOWN")
+            streak = int(payload.get("streak") or 0)
+            threshold = int(payload.get("threshold") or 2)
+            line = f"[{stamp}] BiCoin Push 巡检 {status} | 连续异常={streak}/{threshold}"
+            detail = str(payload.get("detail") or "").strip()
+            if detail and detail != status:
+                line += " | 详情=" + detail.replace("\r", " ").replace("\n", " | ")[:500]
+        elif event == "push_recovery":
+            steps = [str(item) for item in (payload.get("steps") or []) if str(item).strip()]
+            errors = [str(item) for item in (payload.get("errors") or []) if str(item).strip()]
+            trigger = str(payload.get("trigger") or "UNKNOWN")
+            final_status = str(payload.get("final_status") or "UNKNOWN")
+            line = (
+                f"[{stamp}] BiCoin Push 自动恢复 {'执行完成' if bool(payload.get('ok')) else '部分失败'}"
+                f" | 触发={trigger} | 重启=BiCoin → HOME | 复检={final_status}"
+            )
             if steps:
                 line += " | 完成=" + ", ".join(steps)
             if errors:
@@ -4391,6 +4506,11 @@ class CloudPhoneGUI:
                 "local_health": {},
                 "pre_recovery_health": {},
                 "health_recovery": {},
+                "push_health": {},
+                "pre_push_health": {},
+                "push_recovery": {},
+                "push_checked_ts": 0.0,
+                "push_streak_before": 0,
                 "bootstrap": {},
                 "bootstrap_key": "",
                 "adb_online": False,
@@ -4405,6 +4525,11 @@ class CloudPhoneGUI:
                 and same_run
                 and float(cfg.health_last_ts or 0) > 0
                 and now - float(cfg.health_last_ts or 0) >= 300
+            )
+            push_due = bool(
+                cfg.health_monitor_enabled
+                and same_run
+                and now - float(self._last_push_health.get(profile_id, 0.0)) >= 60
             )
             ip, host = self.tools.discover_phone(cfg.phone_id, rid, cfg.phone_name)
             result["ip"] = ip
@@ -4456,6 +4581,25 @@ class CloudPhoneGUI:
                     result["pre_recovery_health"] = initial_health
                     result["health_recovery"] = self.tools.bicoin_health_recover(address)
                     result["local_health"] = self.tools.bicoin_health_check(address, cfg.health_packages)
+
+            # BiCoin push liveness is checked independently every minute. A failed
+            # ADB invocation itself is not counted as a push failure. Only two
+            # consecutive valid probe results that are not BICOIN_PUSH_OK trigger
+            # the BiCoin-only restart path.
+            if push_due and not need_bootstrap and not result["health_recovery"]:
+                push = self.tools.bicoin_push_health_check(address)
+                result["push_health"] = push
+                result["push_checked_ts"] = now
+                streak_before = int(self._push_health_fail_count.get(profile_id, 0))
+                result["push_streak_before"] = streak_before
+                if bool(push.get("countable", False)) and not bool(push.get("ok", False)):
+                    if streak_before + 1 >= 2:
+                        result["pre_push_health"] = push
+                        result["push_recovery"] = self.tools.bicoin_push_recover(address)
+                        # Start the 60-second cooldown only after the restart has
+                        # completed and HOME has been sent. No immediate recheck.
+                        result["push_health"] = {}
+                        result["push_checked_ts"] = time.time()
             return result
 
         def done(result: dict[str, Any]) -> None:
@@ -4463,6 +4607,8 @@ class CloudPhoneGUI:
             run = result.get("run") or {}
             if not run:
                 self._health_online[profile_id] = False
+                self._last_push_health.pop(profile_id, None)
+                self._push_health_fail_count[profile_id] = 0
                 cfg.last_run_id = 0
                 cfg.last_run_status = "-"
                 cfg.last_device = ""
@@ -4487,6 +4633,8 @@ class CloudPhoneGUI:
                 cfg.health_last_status = "启动中" if status in ("queued", "in_progress") else "未检测"
                 cfg.health_last_reason = ""
                 self._last_health.pop(profile_id, None)
+                self._last_push_health[profile_id] = time.time()
+                self._push_health_fail_count[profile_id] = 0
                 self._health_online[profile_id] = False
                 self._health_bootstrap_done.pop(profile_id, None)
             cfg.last_run_id = rid
@@ -4498,8 +4646,15 @@ class CloudPhoneGUI:
             local_health = result.get("local_health") or {}
             pre_recovery_health = result.get("pre_recovery_health") or {}
             health_recovery = result.get("health_recovery") or {}
+            push_health = result.get("push_health") or {}
+            pre_push_health = result.get("pre_push_health") or {}
+            push_recovery = result.get("push_recovery") or {}
+            push_checked_ts = float(result.get("push_checked_ts") or 0.0)
+            push_streak_before = int(result.get("push_streak_before") or 0)
             adb_online = bool(result.get("adb_online", False))
             self._health_online[profile_id] = adb_online
+            if not adb_online:
+                self._push_health_fail_count[profile_id] = 0
 
             if ip:
                 cfg.last_device = f"{ip}:5555"
@@ -4537,7 +4692,6 @@ class CloudPhoneGUI:
                     f"GitHub Run {rid} 运行失败",
                     {"run_id": rid},
                 )
-
 
             if ip:
                 adb_text = cfg.last_device
@@ -4577,6 +4731,8 @@ class CloudPhoneGUI:
             if bootstrap_key:
                 # One initialization attempt per ADB-online generation.
                 self._health_bootstrap_done[profile_id] = bootstrap_key
+                self._last_push_health[profile_id] = time.time()
+                self._push_health_fail_count[profile_id] = 0
                 try:
                     self._append_health_log(cfg, "bootstrap", bootstrap)
                 except Exception as exc:
@@ -4591,6 +4747,8 @@ class CloudPhoneGUI:
                     self.log(f"{cfg.phone_name} · 上线初始化完成")
 
             if pre_recovery_health:
+                self._last_push_health[profile_id] = time.time()
+                self._push_health_fail_count[profile_id] = 0
                 try:
                     self._append_health_log(cfg, "check", pre_recovery_health)
                     self._append_health_log(cfg, "recovery", health_recovery)
@@ -4606,6 +4764,52 @@ class CloudPhoneGUI:
                     recovery_errors = [str(item) for item in (health_recovery.get("errors") or []) if str(item).strip()]
                     detail = "；".join(recovery_errors) if recovery_errors else "重启完成但复检仍异常"
                     self.log(f"{cfg.phone_name} · 健康异常已执行自动重启，但仍未恢复 · {detail}")
+
+            if push_checked_ts:
+                self._last_push_health[profile_id] = push_checked_ts
+                if pre_push_health:
+                    self._push_health_fail_count[profile_id] = 0
+                    pre_status = str(pre_push_health.get("status") or "UNKNOWN")
+                    try:
+                        self._append_health_log(
+                            cfg,
+                            "push_check",
+                            {**pre_push_health, "streak": 2, "threshold": 2},
+                        )
+                        self._append_health_log(
+                            cfg,
+                            "push_recovery",
+                            {**push_recovery, "trigger": pre_status, "final_status": "等待60秒复检"},
+                        )
+                    except Exception as exc:
+                        self.log(f"{cfg.phone_name}: Push 健康日志写入失败 · {exc}")
+                    recovery_errors = [str(item) for item in (push_recovery.get("errors") or []) if str(item).strip()]
+                    if recovery_errors:
+                        self.log(
+                            f"{cfg.phone_name} · BiCoin Push 连续 2 次异常（{pre_status}），"
+                            f"自动重启 BiCoin 部分失败 · {'；'.join(recovery_errors)} · 60 秒后再检查"
+                        )
+                    else:
+                        self.log(
+                            f"{cfg.phone_name} · BiCoin Push 连续 2 次异常（{pre_status}），"
+                            "已自动重启 BiCoin → HOME · 等待 60 秒后再检查"
+                        )
+                elif push_health:
+                    if not bool(push_health.get("countable", False)):
+                        self._push_health_fail_count[profile_id] = 0
+                    elif bool(push_health.get("ok", False)):
+                        self._push_health_fail_count[profile_id] = 0
+                    else:
+                        streak = min(2, push_streak_before + 1)
+                        self._push_health_fail_count[profile_id] = streak
+                        try:
+                            self._append_health_log(
+                                cfg,
+                                "push_check",
+                                {**push_health, "streak": streak, "threshold": 2},
+                            )
+                        except Exception as exc:
+                            self.log(f"{cfg.phone_name}: Push 健康日志写入失败 · {exc}")
 
             if local_health:
                 self._update_health_state(cfg, status, local_health)
@@ -5068,6 +5272,14 @@ class CloudPhoneGUI:
                 "• 授权 Monitor NotificationListener\n"
                 "• 仅当预设 App 主进程不存在时启动 BiCoin / Monitor\n"
                 "• 最后回 HOME，不 force-stop、不划掉后台\n\n"
+                "每 1 分钟 BiCoin Push 检查:\n"
+                "• 主进程 com.temperaturecoin 必须存在\n"
+                "• :watch 进程必须存在\n"
+                "• M-PL-MP-PUSH_SD 线程必须存在\n"
+                "• Push TCP socket 必须为 ESTABLISHED\n"
+                "• 连续 2 次不是 BICOIN_PUSH_OK 才重启 BiCoin\n"
+                "• 重启顺序: am kill BiCoin → 等 2 秒 → 启动 WelcomActivity → 等 3 秒 → HOME\n"
+                "• ADB 自身检查失败不计入这 2 次；重启完成回 HOME 后等待 60 秒再做下一次 Push 检查\n\n"
                 "每 5 分钟健康检查:\n"
                 "• ADB get-state 必须是 device\n"
                 "• 预设 + 自定义 App 主进程必须存在\n"
@@ -5077,7 +5289,7 @@ class CloudPhoneGUI:
                 "• Monitor NotificationListener 权限必须存在\n"
                 "• relay_debug_state.xml 中 listenerConnected=true\n"
                 "• BiCoin netpolicy 必须 effective=NONE；APP_BACKGROUND 判异常\n\n"
-                "不检查 ping/pong，也不因为几分钟没有新通知判异常；运行巡检只在 BiCoin/Monitor 核心健康异常时按固定顺序自动重启一次并复检，自定义 App 异常不会触发这次重启。",
+                "不检查 ping/pong，也不因为几分钟没有新通知判异常；5 分钟核心巡检异常仍按原规则重启 Monitor + BiCoin，自定义 App 异常不会触发核心重启。",
                 parent=dlg,
             )
 
@@ -5097,12 +5309,14 @@ class CloudPhoneGUI:
             cfg.health_last_status = "未检测" if cfg.health_monitor_enabled else "已关闭"
             cfg.health_last_reason = ""
             self._last_health.pop(cfg.profile_id, None)
+            self._last_push_health.pop(cfg.profile_id, None)
+            self._push_health_fail_count[cfg.profile_id] = 0
             if cfg.health_monitor_enabled:
                 self._health_bootstrap_done.pop(cfg.profile_id, None)
                 self._health_online[cfg.profile_id] = False
             self.store.upsert(cfg)
             extra = f" + {len(custom)}个自定义App" if custom else ""
-            v_health_status.set(f"已保存 · 2个预设{extra} · 每5分钟巡检")
+            v_health_status.set(f"已保存 · 2个预设{extra} · Push每1分钟 / 综合每5分钟")
             self.log(f"{cfg.phone_name}: 本机 Android 健康设置已保存 · {len(cfg.health_packages)} 个包")
 
         def check_health_now() -> None:
