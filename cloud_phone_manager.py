@@ -904,6 +904,21 @@ class GitHubAPI:
         names = self.repo_secret_names()
         return None if names is None else name in names
 
+    def repository_access(self) -> dict[str, Any]:
+        """Return repository identity and effective permissions for this token."""
+        data = self._request("GET", "") or {}
+        permissions = data.get("permissions") if isinstance(data, dict) else {}
+        permissions = permissions if isinstance(permissions, dict) else {}
+        return {
+            "full_name": str(data.get("full_name") or self.repo),
+            "private": bool(data.get("private", False)),
+            "default_branch": str(data.get("default_branch") or ""),
+            "pull": bool(permissions.get("pull", False)),
+            "push": bool(permissions.get("push", False)),
+            "maintain": bool(permissions.get("maintain", False)),
+            "admin": bool(permissions.get("admin", False)),
+        }
+
     def user_repos(self) -> list[str]:
         url = (
             "https://api.github.com/user/repos?per_page=100&sort=updated&"
@@ -1942,13 +1957,34 @@ class LocalTools:
         except Exception:
             return ""
 
-    def github_login(self) -> tuple[bool, str]:
-        """Run GitHub device authorization without inherited token override.
+    def github_token_scopes(self, token: str = "") -> set[str]:
+        """Return OAuth scopes granted to the active gh token."""
+        token = str(token or "").strip() or self.github_auth_token()
+        if not token:
+            return set()
+        req = urllib.request.Request(
+            "https://api.github.com/user",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "cloud-android-manager/3.0",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = str(resp.headers.get("X-OAuth-Scopes") or "")
+        except Exception:
+            return set()
+        return {part.strip() for part in raw.split(",") if part.strip()}
 
-        GitHub CLI generates the one-time code and copies it to the clipboard. The
-        GUI shows https://github.com/login/device and lets the user decide whether
-        to open/copy it. Any inherited GH_TOKEN/GITHUB_TOKEN is removed so the
-        account authorized in this flow becomes the account used by the manager.
+    def github_login(self) -> tuple[bool, str]:
+        """Authorize GitHub CLI with every permission this manager needs.
+
+        The user only completes the normal GitHub browser/device authorization.
+        Fresh machines request the required scopes up front; an existing older
+        authorization is transparently refreshed when it lacks workflow access.
         """
         installed_now = False
         if not self.gh:
@@ -1966,8 +2002,27 @@ class LocalTools:
             env.pop("GH_TOKEN", None)
             env.pop("GITHUB_TOKEN", None)
             env["GH_BROWSER"] = f'cmd.exe /d /c "{helper}"'
-            cp = subprocess.run(
-                [
+
+            existing_account = self.github_account()
+            existing_token = self.github_auth_token()
+            existing_scopes = self.github_token_scopes(existing_token) if existing_token else set()
+            if existing_account and existing_token and "workflow" in existing_scopes:
+                prefix = "GitHub CLI 已自动安装；" if installed_now else ""
+                return True, prefix + f"已登录 @{existing_account}"
+
+            if existing_account and existing_token:
+                command = [
+                    self.gh,
+                    "auth",
+                    "refresh",
+                    "--hostname",
+                    "github.com",
+                    "--scopes",
+                    "workflow",
+                    "--clipboard",
+                ]
+            else:
+                command = [
                     self.gh,
                     "auth",
                     "login",
@@ -1975,9 +2030,14 @@ class LocalTools:
                     "github.com",
                     "--git-protocol",
                     "https",
+                    "--scopes",
+                    "repo,workflow",
                     "--web",
                     "--clipboard",
-                ],
+                ]
+
+            cp = subprocess.run(
+                command,
                 input="\n",
                 capture_output=True,
                 text=True,
@@ -1989,10 +2049,14 @@ class LocalTools:
             )
             account = self.github_account()
             token = self.github_auth_token()
-            if cp.returncode == 0 and account and token:
+            scopes = self.github_token_scopes(token) if token else set()
+            if cp.returncode == 0 and account and token and "workflow" in scopes:
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
-                return True, prefix + f"已登录 @{account}；后续操作将使用此账号"
-            return False, "GitHub 授权未完成、未切换到新账号或已取消"
+                return True, prefix + f"已登录 @{account}"
+            if account and token:
+                return False, "GitHub 授权不完整，请再次完成授权"
+            detail = (cp.stderr or cp.stdout or "").strip()
+            return False, detail or "GitHub 授权未完成或已取消"
         except subprocess.TimeoutExpired:
             return False, "GitHub 授权超时"
         except Exception as exc:
@@ -3693,9 +3757,38 @@ class CloudPhoneGUI:
 
     # ------------------------- repository / workflow -------------------------
     def _prepare_repository(self, cfg: AppConfig) -> list[str]:
-        api = self.api_for(cfg)
         token = self._token()
-        notes = [api.ensure_builtin_workflow(cfg.branch)]
+        api = GitHubAPI(cfg.repo, token)
+        account = self.tools.github_account() or "当前账号"
+        scopes = self.tools.github_token_scopes(token)
+
+        # All permission mechanics stay behind the login button. By the time a
+        # phone operation reaches here, the credential should already be complete.
+        if scopes and "workflow" not in scopes:
+            raise RuntimeError("GitHub 授权不完整，请重新点击“GitHub 授权登录”")
+
+        try:
+            access = api.repository_access()
+        except RuntimeError as exc:
+            if "GitHub API 404" in str(exc):
+                raise RuntimeError(
+                    f"当前 GitHub 登录无法访问仓库 {cfg.repo}，请重新完成 GitHub 授权登录"
+                ) from exc
+            raise
+
+        if not access.get("pull") or not access.get("push") or not access.get("admin"):
+            raise RuntimeError(
+                f"当前 GitHub 登录账号 @{account} 无权管理仓库 {cfg.repo}，请使用该仓库管理员账号重新登录"
+            )
+
+        notes = ["GitHub 授权检查通过"]
+        try:
+            notes.append(api.ensure_builtin_workflow(cfg.branch))
+        except RuntimeError as exc:
+            if "GitHub API 404" in str(exc):
+                raise RuntimeError("GitHub 授权不完整，请重新点击“GitHub 授权登录”") from exc
+            raise
+
         secret_names = api.repo_secret_names()
         if secret_names is not None:
             notes.extend(self._sync_tailscale_repo_secrets(cfg.repo, token, secret_names, require_configured=True))
@@ -3705,7 +3798,7 @@ class CloudPhoneGUI:
                     raise RuntimeError("初始化 AVD_BACKUP_KEY 失败: " + detail)
                 notes.append("已初始化备份加密密钥")
         else:
-            notes.append("当前授权无法列出 Secret 元数据，跳过 Secret 完整性检查")
+            notes.append("Secret 状态不可读，已跳过完整性检查")
         return notes
 
     def _workflow_inputs(self, cfg: AppConfig, mode: str) -> dict[str, str]:
