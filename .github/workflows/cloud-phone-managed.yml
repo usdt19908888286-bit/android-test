@@ -1,0 +1,390 @@
+name: Managed Android Cloud Phone
+run-name: Managed Phone ${{ inputs.phone_id || '001' }} / ${{ inputs.mode || 'new' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Create a new phone or restore the latest encrypted backup
+        required: true
+        default: new
+        type: choice
+        options:
+          - new
+          - restore
+      phone_id:
+        description: Logical phone ID (digits only, e.g. 001)
+        required: true
+        default: '001'
+        type: string
+      apk_url:
+        description: APK URL used for a new phone or restore fallback
+        required: false
+        default: 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: managed-android-phone-${{ inputs.phone_id || '001' }}
+  cancel-in-progress: true
+
+env:
+  DISPLAY: :99
+  APK_URL: ${{ inputs.apk_url || 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk' }}
+  PHONE_ID: ${{ inputs.phone_id || '001' }}
+  AVD_NAME: managed-phone-${{ inputs.phone_id || '001' }}
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and backup encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PHONE_ID" in
+            ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
+          esac
+          [ -n "${APK_URL:-}" ] || { echo '::error::apk_url is empty'; exit 1; }
+          [ -n "${AVD_BACKUP_KEY:-}" ] || {
+            echo '::error::AVD_BACKUP_KEY repository secret is required. Initialize it once from Cloud Android Manager.'
+            exit 1
+          }
+          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: managed-phone${{ inputs.phone_id || '001' }}-${{ github.run_id }}
+          version: latest
+
+      - name: Enable KVM and install runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+
+      - name: Verify direct Internet and APK URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+          curl -fsSL -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36' \
+            --retry 2 --connect-timeout 15 --max-time 45 --range 0-1023 "$APK_URL" -o /tmp/apk-probe.bin
+          test -s /tmp/apk-probe.bin
+          echo 'DIRECT_NETWORK_OK'
+
+      - name: Restore latest encrypted AVD backup
+        if: inputs.mode == 'restore'
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: /tmp/managed-avd-backup
+          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}
+          restore-keys: |
+            managed-avd-${{ inputs.phone_id }}-
+
+      - name: Decrypt restored AVD
+        if: inputs.mode == 'restore'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {
+            echo '::error::No encrypted AVD backup exists for this phone_id.'
+            exit 1
+          }
+          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name '*.enc' | head -n1)
+          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]
+          mkdir -p "$HOME/.android"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst
+          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"
+          rm -f /tmp/managed-avd.tar.zst
+          test -f "$HOME/.android/avd/${AVD_NAME}.ini"
+          test -d "$HOME/.android/avd/${AVD_NAME}.avd"
+          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"
+          echo 'MANAGED_AVD_DECRYPT_RESTORE_OK'
+
+      - name: Prepare runner status service
+        shell: bash
+        run: |
+          cat >/tmp/runner_status_server.py <<'PY'
+          import http.server, json, os, subprocess, time
+
+          RUN_ID = os.environ.get('GITHUB_RUN_ID', '')
+          PHONE_ID = os.environ.get('PHONE_ID', '')
+
+          def cpu_sample():
+              def snap():
+                  with open('/proc/stat', 'r', encoding='utf-8') as f:
+                      vals = [int(x) for x in f.readline().split()[1:]]
+                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                  return sum(vals), idle
+              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()
+              total = max(1, b_total - a_total)
+              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)
+
+          def mem_sample():
+              vals = {}
+              with open('/proc/meminfo', 'r', encoding='utf-8') as f:
+                  for line in f:
+                      k, v = line.split(':', 1)
+                      vals[k] = int(v.strip().split()[0])
+              total = vals.get('MemTotal', 0)
+              avail = vals.get('MemAvailable', 0)
+              used = max(0, total - avail)
+              pct = round(100.0 * used / total, 1) if total else 0
+              return total, used, avail, pct
+
+          def qemu_sample():
+              cp = subprocess.run(
+                  ['ps', '-C', 'qemu-system-x86_64', '-o', '%cpu=,%mem=,rss=,pid=', '--sort=-%cpu'],
+                  capture_output=True, text=True
+              )
+              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), '')
+              if not line:
+                  return {'cpu_percent': 0.0, 'mem_percent': 0.0, 'rss_kib': 0, 'pid': None}
+              parts = line.split()
+              try:
+                  return {
+                      'cpu_percent': float(parts[0]),
+                      'mem_percent': float(parts[1]),
+                      'rss_kib': int(parts[2]),
+                      'pid': int(parts[3]),
+                  }
+              except Exception:
+                  return {'raw': line}
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path not in ('/', '/status'):
+                      self.send_response(404); self.end_headers(); return
+                  total, used, avail, pct = mem_sample()
+                  load = os.getloadavg()
+                  data = {
+                      'ok': True,
+                      'run_id': RUN_ID,
+                      'phone_id': PHONE_ID,
+                      'cpu_percent': cpu_sample(),
+                      'load1': round(load[0], 2),
+                      'load5': round(load[1], 2),
+                      'load15': round(load[2], 2),
+                      'mem_total_kib': total,
+                      'mem_used_kib': used,
+                      'mem_available_kib': avail,
+                      'mem_percent': pct,
+                      'qemu': qemu_sample(),
+                  }
+                  body = json.dumps(data).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(body)))
+                  self.end_headers(); self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8787), Handler).serve_forever()
+          PY
+          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &
+          sleep 1
+          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json
+          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787
+          echo 'RUNNER_STATUS_READY=8787'
+
+      - name: Prepare managed Android bootstrap script
+        shell: bash
+        run: |
+          cat >/tmp/managed-phone.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo 'MANAGED_AVD_BOOT_WAIT'
+          adb wait-for-device
+          for _ in $(seq 1 180); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && break
+            sleep 1
+          done
+          test "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1'
+          echo 'MANAGED_AVD_BOOT_COMPLETE'
+
+          # Fresh Android often needs a short settling period before first app launch.
+          sleep 12
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          adb shell settings put global disable_window_blurs 1 || true
+          adb shell settings put system peak_refresh_rate 60.0 || true
+          adb shell settings put system min_refresh_rate 60.0 || true
+          adb shell wm size 720x1600 || true
+          adb shell wm density 280 || true
+
+          if [ "${PHONE_MODE}" = 'new' ]; then
+            echo "APK_DOWNLOAD_URL=$APK_URL"
+            curl -fL -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36' \
+              --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 "$APK_URL" -o /tmp/app-release.apk
+            test -s /tmp/app-release.apk
+            unzip -tq /tmp/app-release.apk >/dev/null
+            APK_SHA256=$(sha256sum /tmp/app-release.apk | awk '{print $1}')
+            echo "APK_SHA256=$APK_SHA256"
+            adb install -r -g /tmp/app-release.apk
+            echo 'APK_INSTALL_SUCCESS'
+          fi
+
+          # Default BICOIN package; restored phones keep all other packages/data too.
+          DEFAULT_PACKAGE='com.temperaturecoin'
+          if ! adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then
+            curl -fL --retry 3 --connect-timeout 20 --max-time 240 "$APK_URL" -o /tmp/app-release.apk
+            adb install -r -g /tmp/app-release.apk
+          fi
+          adb shell am force-stop "$DEFAULT_PACKAGE" >/dev/null 2>&1 || true
+          sleep 1
+          adb shell monkey -p "$DEFAULT_PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+          sleep 5
+          if ! adb shell pidof "$DEFAULT_PACKAGE" >/dev/null 2>&1; then
+            adb shell monkey -p "$DEFAULT_PACKAGE" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+          fi
+          echo 'DEFAULT_APP_LAUNCH_ATTEMPTED'
+
+          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true
+          adb shell settings put global auto_update_system_apps 0 || true
+
+          echo 'ADB_TCPIP_BOOTSTRAP_START'
+          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 5555 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 5555
+          echo 'ADB_TCPIP_5555_READY'
+
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ]
+          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+          echo 'MANAGED_CLOUD_PHONE_READY'
+          echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"
+          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+
+          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"
+          for _ in $(seq 1 1800); do
+            ISSUE_LINE=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | [.number,.body] | @tsv" \
+              2>/dev/null | head -n1 || true)
+            if [ -n "$ISSUE_LINE" ]; then
+              ISSUE_NO=${ISSUE_LINE%%$'\t'*}
+              ISSUE_BODY=${ISSUE_LINE#*$'\t'}
+              CMD_JSON=$(printf '%s\n' "$ISSUE_BODY" | grep -m1 '^{' || true)
+              if [ -n "$CMD_JSON" ]; then
+                CMD=$(jq -r '.command // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_RUN=$(jq -r '.run_id // 0' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_PHONE=$(jq -r '.phone_id // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                if [ "$CMD" = 'backup' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then
+                  echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"
+                  printf '%s' "$ISSUE_NO" >/tmp/managed-backup-issue-number
+                  touch /tmp/managed-backup-requested
+                  adb shell sync || true
+                  exit 0
+                fi
+              fi
+            fi
+            sleep 10
+          done
+
+          # End-of-life safety backup when the 5-hour session naturally expires.
+          echo 'SESSION_TIMEOUT_AUTO_BACKUP'
+          touch /tmp/managed-backup-requested
+          adb shell sync || true
+          SCRIPT
+          chmod +x /tmp/managed-phone.sh
+          bash -n /tmp/managed-phone.sh
+          echo 'MANAGED_BOOTSTRAP_SCRIPT_READY'
+
+      - name: Start managed Android phone
+        id: android
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          PHONE_MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: managed-phone-${{ inputs.phone_id || '001' }}
+          cores: 4
+          ram-size: 8192M
+          force-avd-creation: ${{ inputs.mode == 'new' }}
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/managed-phone.sh
+
+      - name: Pack and encrypt full AVD backup
+        id: pack
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/managed-backup-requested ]; then
+            echo 'should_save=false' >> "$GITHUB_OUTPUT"
+            echo 'NO_BACKUP_REQUEST'
+            exit 0
+          fi
+          test -d "$HOME/.android/avd/${AVD_NAME}.avd"
+          mkdir -p /tmp/managed-avd-backup
+          rm -f /tmp/managed-avd-backup/*
+          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -pass env:AVD_BACKUP_KEY \
+            -in /tmp/managed-avd.tar.zst \
+            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"
+          rm -f /tmp/managed-avd.tar.zst
+          BYTES=$(stat -c '%s' /tmp/managed-avd-backup/*.enc)
+          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"
+          echo 'should_save=true' >> "$GITHUB_OUTPUT"
+          echo 'FULL_AVD_ENCRYPTED_BACKUP_READY'
+
+      - name: Save encrypted AVD backup to GitHub Actions Cache
+        if: steps.pack.outputs.should_save == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: /tmp/managed-avd-backup
+          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}
+
+      - name: Close consumed backup command
+        if: steps.pack.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s /tmp/managed-backup-issue-number ]; then
+            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)
+            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true
+          fi
+          echo 'MANAGED_BACKUP_SAVED'
