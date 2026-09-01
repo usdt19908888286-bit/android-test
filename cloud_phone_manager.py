@@ -48,7 +48,7 @@ RUN_ID_RE = re.compile(r"-(\d+)$")
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 BUILTIN_WORKFLOW_PATH = ".github/workflows/cloud-phone-managed.yml"
-BUILTIN_MANAGED_WORKFLOW = 'name: Managed Android Cloud Phone\nrun-name: ${{ inputs.phone_name || \'Managed Phone\' }} · ${{ inputs.phone_id || \'001\' }} / ${{ inputs.mode || \'new\' }}\n\non:\n  workflow_dispatch:\n    inputs:\n      mode:\n        description: Create a new phone or restore the latest encrypted backup\n        required: true\n        default: new\n        type: choice\n        options:\n          - new\n          - restore\n      phone_id:\n        description: Logical phone ID (digits only, e.g. 001)\n        required: true\n        default: \'001\'\n        type: string\n      phone_name:\n        description: Friendly phone name shown in GitHub and the local GUI\n        required: false\n        default: \'BICOIN-001\'\n        type: string\n      package_name:\n        description: Android package used for GUI monitoring/launch only; it is not auto-installed\n        required: false\n        default: \'com.temperaturecoin\'\n        type: string\n      apk_url:\n        description: Optional APK reference only; managed phone creation does not auto-install APKs\n        required: false\n        default: \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\'\n        type: string\n      api_level:\n        description: Android API level\n        required: false\n        default: \'35\'\n        type: string\n      target:\n        description: Android system image target\n        required: false\n        default: \'google_apis\'\n        type: string\n      arch:\n        description: Android emulator architecture\n        required: false\n        default: \'x86_64\'\n        type: string\n      profile:\n        description: Android device profile\n        required: false\n        default: \'pixel_6\'\n        type: string\n      cores:\n        description: Emulator CPU cores\n        required: false\n        default: \'4\'\n        type: string\n      ram_mb:\n        description: Emulator RAM in MiB\n        required: false\n        default: \'8192\'\n        type: string\n      device_manufacturer:\n        description: Optional Android Build.MANUFACTURER value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_brand:\n        description: Optional Android Build.BRAND value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_model:\n        description: Optional Android Build.MODEL value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n\npermissions:\n  contents: read\n  actions: read\n  issues: write\n\nconcurrency:\n  group: managed-android-phone-${{ inputs.phone_id || \'001\' }}\n  cancel-in-progress: true\n\nenv:\n  DISPLAY: :99\n  APK_URL: ${{ inputs.apk_url || \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\' }}\n  PHONE_ID: ${{ inputs.phone_id || \'001\' }}\n  PHONE_NAME: ${{ inputs.phone_name || \'BICOIN-001\' }}\n  PACKAGE_NAME: ${{ inputs.package_name || \'com.temperaturecoin\' }}\n  AVD_NAME: managed-phone-${{ inputs.phone_id || \'001\' }}\n  DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || \'\' }}\n  DEVICE_BRAND: ${{ inputs.device_brand || \'\' }}\n  DEVICE_MODEL: ${{ inputs.device_model || \'\' }}\n\njobs:\n  phone:\n    runs-on: ubuntu-latest\n    timeout-minutes: 330\n    env:\n      AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v4\n\n      - name: Validate inputs and backup encryption key\n        shell: bash\n        run: |\n          set -euo pipefail\n          case "$PHONE_ID" in\n            \'\'|*[!0-9]*) echo \'::error::phone_id must contain digits only\'; exit 1 ;;\n          esac\n          printf \'%s\\n\' "${PACKAGE_NAME:-}" | grep -Eq \'^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$\' || { echo \'::error::package_name is invalid\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MANUFACTURER:-}" | grep -Eq \'^[A-Za-z0-9._+ -]*$\' || { echo \'::error::device_manufacturer contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_BRAND:-}" | grep -Eq \'^[A-Za-z0-9._+-]*$\' || { echo \'::error::device_brand contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MODEL:-}" | grep -Eq \'^[A-Za-z0-9._+() -]*$\' || { echo \'::error::device_model contains unsupported characters\'; exit 1; }\n          if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then\n            echo \'::error::device_model requires device_manufacturer and device_brand\'\n            exit 1\n          fi\n          if [ "${{ inputs.mode }}" = \'restore\' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.\'\n            exit 1\n          fi\n          if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.\'\n          fi\n          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"\n\n      - name: Prepare phone identity\n        id: identity\n        shell: bash\n        run: |\n          set -euo pipefail\n          SLUG=$(printf \'%s\' "${PHONE_NAME:-}" | tr \'[:upper:]\' \'[:lower:]\' | sed -E \'s/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//\' | cut -c1-35)\n          [ -n "$SLUG" ] || SLUG="managed-phone${PHONE_ID}"\n          echo "ts_hostname=${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"\n          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"\n\n      - name: Join Tailscale\n        uses: tailscale/github-action@v4\n        with:\n          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}\n          tags: tag:github-phone\n          hostname: ${{ steps.identity.outputs.ts_hostname }}\n          version: latest\n\n      - name: Enable KVM and install runtime dependencies\n        shell: bash\n        run: |\n          set -euo pipefail\n          echo \'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\' | sudo tee /etc/udev/rules.d/99-kvm4all.rules\n          sudo udevadm control --reload-rules\n          sudo udevadm trigger --name-match=kvm\n          test -e /dev/kvm\n          sudo apt-get update -qq\n          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq\n          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &\n          sleep 2\n\n      - name: Verify direct Internet\n        shell: bash\n        run: |\n          set -euo pipefail\n          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null\n          echo \'DIRECT_NETWORK_OK\'\n\n      - name: Restore latest encrypted AVD backup\n        if: inputs.mode == \'restore\'\n        id: cache-restore\n        uses: actions/cache/restore@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}\n          restore-keys: |\n            managed-avd-${{ inputs.phone_id }}-\n\n      - name: Decrypt restored AVD\n        if: inputs.mode == \'restore\'\n        shell: bash\n        run: |\n          set -euo pipefail\n          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {\n            echo \'::error::No encrypted AVD backup exists for this phone_id.\'\n            exit 1\n          }\n          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name \'*.enc\' | head -n1)\n          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]\n          mkdir -p "$HOME/.android"\n          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst\n          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"\n          rm -f /tmp/managed-avd.tar.zst\n          test -f "$HOME/.android/avd/${AVD_NAME}.ini"\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"\n          echo \'MANAGED_AVD_DECRYPT_RESTORE_OK\'\n\n      - name: Prepare runner status service\n        shell: bash\n        run: |\n          cat >/tmp/runner_status_server.py <<\'PY\'\n          import http.server, json, os, subprocess, time\n\n          RUN_ID = os.environ.get(\'GITHUB_RUN_ID\', \'\')\n          PHONE_ID = os.environ.get(\'PHONE_ID\', \'\')\n\n          def cpu_sample():\n              def snap():\n                  with open(\'/proc/stat\', \'r\', encoding=\'utf-8\') as f:\n                      vals = [int(x) for x in f.readline().split()[1:]]\n                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)\n                  return sum(vals), idle\n              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()\n              total = max(1, b_total - a_total)\n              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)\n\n          def mem_sample():\n              vals = {}\n              with open(\'/proc/meminfo\', \'r\', encoding=\'utf-8\') as f:\n                  for line in f:\n                      k, v = line.split(\':\', 1)\n                      vals[k] = int(v.strip().split()[0])\n              total = vals.get(\'MemTotal\', 0)\n              avail = vals.get(\'MemAvailable\', 0)\n              used = max(0, total - avail)\n              pct = round(100.0 * used / total, 1) if total else 0\n              return total, used, avail, pct\n\n          def qemu_sample():\n              cp = subprocess.run(\n                  [\'ps\', \'-C\', \'qemu-system-x86_64\', \'-o\', \'%cpu=,%mem=,rss=,pid=\', \'--sort=-%cpu\'],\n                  capture_output=True, text=True\n              )\n              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), \'\')\n              if not line:\n                  return {\'cpu_percent\': 0.0, \'mem_percent\': 0.0, \'rss_kib\': 0, \'pid\': None}\n              parts = line.split()\n              try:\n                  return {\n                      \'cpu_percent\': float(parts[0]),\n                      \'mem_percent\': float(parts[1]),\n                      \'rss_kib\': int(parts[2]),\n                      \'pid\': int(parts[3]),\n                  }\n              except Exception:\n                  return {\'raw\': line}\n\n          class Handler(http.server.BaseHTTPRequestHandler):\n              def do_GET(self):\n                  if self.path not in (\'/\', \'/status\'):\n                      self.send_response(404); self.end_headers(); return\n                  total, used, avail, pct = mem_sample()\n                  load = os.getloadavg()\n                  data = {\n                      \'ok\': True,\n                      \'run_id\': RUN_ID,\n                      \'phone_id\': PHONE_ID,\n                      \'cpu_percent\': cpu_sample(),\n                      \'load1\': round(load[0], 2),\n                      \'load5\': round(load[1], 2),\n                      \'load15\': round(load[2], 2),\n                      \'mem_total_kib\': total,\n                      \'mem_used_kib\': used,\n                      \'mem_available_kib\': avail,\n                      \'mem_percent\': pct,\n                      \'qemu\': qemu_sample(),\n                  }\n                  body = json.dumps(data).encode()\n                  self.send_response(200)\n                  self.send_header(\'Content-Type\', \'application/json\')\n                  self.send_header(\'Content-Length\', str(len(body)))\n                  self.end_headers(); self.wfile.write(body)\n              def log_message(self, *args):\n                  pass\n\n          http.server.ThreadingHTTPServer((\'127.0.0.1\', 8787), Handler).serve_forever()\n          PY\n          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &\n          sleep 1\n          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json\n          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787\n          echo \'RUNNER_STATUS_READY=8787\'\n\n      - name: Prepare managed Android bootstrap script\n        shell: bash\n        run: |\n          cat >/tmp/managed-phone.sh <<\'SCRIPT\'\n          #!/usr/bin/env bash\n          set -euo pipefail\n\n          wait_android_boot() {\n            adb wait-for-device\n            for _ in $(seq 1 180); do\n              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d \'\\r\')" = \'1\' ] && return 0\n              sleep 1\n            done\n            return 1\n          }\n\n          echo \'MANAGED_AVD_BOOT_WAIT\'\n          wait_android_boot\n          echo \'MANAGED_AVD_BOOT_COMPLETE\'\n\n          # Optional Build identity for emulator compatibility testing. Android Emulator\n          # does not allow arbitrary ro.product.* values through -prop, so use the\n          # writable-system/remount development path and verify after reboot.\n          if [ -n "${DEVICE_MODEL:-}" ]; then\n            echo "DEVICE_IDENTITY_TARGET=${DEVICE_MANUFACTURER}|${DEVICE_BRAND}|${DEVICE_MODEL}"\n            IDENTITY_READY=0\n            if adb root >/tmp/adb-root.log 2>&1; then\n              adb wait-for-device\n              sleep 2\n              if adb remount >/tmp/adb-remount.log 2>&1; then\n                IDENTITY_READY=1\n              else\n                adb disable-verity >/tmp/adb-disable-verity.log 2>&1 || true\n                adb reboot || true\n                if wait_android_boot; then\n                  adb root >/tmp/adb-root2.log 2>&1 || true\n                  adb wait-for-device\n                  sleep 2\n                  if adb remount >/tmp/adb-remount2.log 2>&1; then\n                    IDENTITY_READY=1\n                  fi\n                fi\n              fi\n            fi\n\n            if [ "$IDENTITY_READY" = \'1\' ]; then\n              cat >/tmp/patch-device-identity.sh <<\'DEVICEPATCH\'\n          #!/system/bin/sh\n          set -eu\n          patch_prop() {\n            key="$1"\n            value="$2"\n            file="$3"\n            [ -f "$file" ] || return 0\n            if grep -q "^${key}=" "$file" 2>/dev/null; then\n              sed -i "s|^${key}=.*|${key}=${value}|g" "$file"\n            fi\n          }\n          for file in             /system/build.prop /system/system/build.prop             /product/build.prop /system/product/build.prop             /vendor/build.prop /system/vendor/build.prop             /odm/build.prop /system/odm/build.prop             /system_ext/build.prop /system/system_ext/build.prop; do\n            for suffix in \'\' \'.system\' \'.product\' \'.vendor\' \'.odm\' \'.system_ext\'; do\n              patch_prop "ro.product${suffix}.manufacturer" "$TARGET_MANUFACTURER" "$file"\n              patch_prop "ro.product${suffix}.brand" "$TARGET_BRAND" "$file"\n              patch_prop "ro.product${suffix}.model" "$TARGET_MODEL" "$file"\n            done\n          done\n          sync\n          DEVICEPATCH\n              adb push /tmp/patch-device-identity.sh /data/local/tmp/patch-device-identity.sh >/dev/null\n              adb shell chmod 700 /data/local/tmp/patch-device-identity.sh\n              if adb shell "TARGET_MANUFACTURER=\'${DEVICE_MANUFACTURER}\' TARGET_BRAND=\'${DEVICE_BRAND}\' TARGET_MODEL=\'${DEVICE_MODEL}\' sh /data/local/tmp/patch-device-identity.sh"; then\n                adb reboot || true\n                wait_android_boot\n              fi\n            else\n              echo \'::warning::Could not remount emulator system; continuing with stock AVD identity.\'\n            fi\n\n            ACTUAL_MANUFACTURER=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_BRAND=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d \'\\r\')\n            echo "DEVICE_IDENTITY_ACTUAL=${ACTUAL_MANUFACTURER}|${ACTUAL_BRAND}|${ACTUAL_MODEL}"\n            if [ "$ACTUAL_MODEL" = "$DEVICE_MODEL" ]; then\n              echo \'DEVICE_REAL_MODEL_APPLIED\'\n            else\n              echo "::warning::Requested model \'${DEVICE_MODEL}\', but Android reports \'${ACTUAL_MODEL}\'."\n            fi\n          fi\n\n          # Fresh Android often needs a short settling period before first app launch.\n          sleep 12\n          adb shell settings put global window_animation_scale 0 || true\n          adb shell settings put global transition_animation_scale 0 || true\n          adb shell settings put global animator_duration_scale 0 || true\n          adb shell settings put global disable_window_blurs 1 || true\n          adb shell settings put system peak_refresh_rate 60.0 || true\n          adb shell settings put system min_refresh_rate 60.0 || true\n          adb shell wm size 720x1600 || true\n          adb shell wm density 280 || true\n\n          # Phone creation/restoration is intentionally APK-neutral. The GUI may\n          # remember a package name for monitoring, but this workflow never downloads,\n          # installs, or auto-launches an APK.\n          DEFAULT_PACKAGE="$PACKAGE_NAME"\n          if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then\n            echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"\n          else\n            echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"\n          fi\n          echo \'MANAGED_PHONE_APK_NEUTRAL\'\n\n          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true\n          adb shell settings put global auto_update_system_apps 0 || true\n\n          echo \'ADB_TCPIP_BOOTSTRAP_START\'\n          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }\n          for _ in $(seq 1 30); do\n            nc -z 127.0.0.1 5555 && break\n            sleep 1\n          done\n          nc -z 127.0.0.1 5555\n          echo \'ADB_TCPIP_5555_READY\'\n\n          TS_IPV4=$(tailscale ip -4 | head -n1)\n          [ -n "$TS_IPV4" ]\n          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555\n          echo \'MANAGED_CLOUD_PHONE_READY\'\n          echo "TAILSCALE_ADB=${TS_IPV4}:5555"\n          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"\n          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"\n\n          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"\n          for _ in $(seq 1 1800); do\n            ISSUE_LINE=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \\\n              --jq ".[] | select(.pull_request == null) | select(.title == \\"${COMMAND_TITLE}\\") | [.number,.body] | @tsv" \\\n              2>/dev/null | head -n1 || true)\n            if [ -n "$ISSUE_LINE" ]; then\n              ISSUE_NO=${ISSUE_LINE%%$\'\\t\'*}\n              ISSUE_BODY=${ISSUE_LINE#*$\'\\t\'}\n              CMD_JSON=$(printf \'%s\\n\' "$ISSUE_BODY" | grep -m1 \'^{\' || true)\n              if [ -n "$CMD_JSON" ]; then\n                CMD=$(jq -r \'.command // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_RUN=$(jq -r \'.run_id // 0\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_PHONE=$(jq -r \'.phone_id // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                if [ "$CMD" = \'backup\' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then\n                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n                    echo \'BACKUP_REQUEST_REJECTED_NO_KEY\'\n                  else\n                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"\n                    printf \'%s\' "$ISSUE_NO" >/tmp/managed-backup-issue-number\n                    touch /tmp/managed-backup-requested\n                    adb shell sync || true\n                    exit 0\n                  fi\n                fi\n              fi\n            fi\n            sleep 10\n          done\n\n          # End-of-life safety backup when the 5-hour session naturally expires.\n          if [ -n "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP\'\n            touch /tmp/managed-backup-requested\n            adb shell sync || true\n          else\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY\'\n          fi\n          SCRIPT\n          chmod +x /tmp/managed-phone.sh\n          bash -n /tmp/managed-phone.sh\n          echo \'MANAGED_BOOTSTRAP_SCRIPT_READY\'\n\n      - name: Start managed Android phone\n        id: android\n        uses: reactivecircus/android-emulator-runner@v2\n        env:\n          PHONE_MODE: ${{ inputs.mode }}\n          GH_TOKEN: ${{ github.token }}\n        with:\n          api-level: ${{ inputs.api_level }}\n          target: ${{ inputs.target }}\n          arch: ${{ inputs.arch }}\n          profile: ${{ inputs.profile }}\n          avd-name: managed-phone-${{ inputs.phone_id || \'001\' }}\n          cores: ${{ inputs.cores }}\n          ram-size: ${{ format(\'{0}M\', inputs.ram_mb) }}\n          force-avd-creation: ${{ inputs.mode == \'new\' }}\n          disable-animations: false\n          emulator-options: >-\n            -no-snapshot\n            ${{ inputs.device_model != \'\' && \'-writable-system\' || \'\' }}\n            -gpu swiftshader_indirect\n            -noaudio\n            -no-boot-anim\n            -camera-back none\n            -camera-front none\n          script: bash /tmp/managed-phone.sh\n\n      - name: Pack and encrypt full AVD backup\n        id: pack\n        if: always()\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ ! -f /tmp/managed-backup-requested ]; then\n            echo \'should_save=false\' >> "$GITHUB_OUTPUT"\n            echo \'NO_BACKUP_REQUEST\'\n            exit 0\n          fi\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          mkdir -p /tmp/managed-avd-backup\n          rm -f /tmp/managed-avd-backup/*\n          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst\n          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY \\\n            -in /tmp/managed-avd.tar.zst \\\n            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"\n          rm -f /tmp/managed-avd.tar.zst\n          BYTES=$(stat -c \'%s\' /tmp/managed-avd-backup/*.enc)\n          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"\n          echo \'should_save=true\' >> "$GITHUB_OUTPUT"\n          echo \'FULL_AVD_ENCRYPTED_BACKUP_READY\'\n\n      - name: Save encrypted AVD backup to GitHub Actions Cache\n        if: steps.pack.outputs.should_save == \'true\'\n        uses: actions/cache/save@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}\n\n      - name: Close consumed backup command\n        if: steps.pack.outputs.should_save == \'true\'\n        env:\n          GH_TOKEN: ${{ github.token }}\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ -s /tmp/managed-backup-issue-number ]; then\n            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)\n            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true\n          fi\n          echo \'MANAGED_BACKUP_SAVED\'\n'
+BUILTIN_MANAGED_WORKFLOW = 'name: Managed Android Cloud Phone\nrun-name: ${{ inputs.phone_name || \'Managed Phone\' }} · ${{ inputs.phone_id || \'001\' }} / ${{ inputs.mode || \'new\' }}\n\non:\n  workflow_dispatch:\n    inputs:\n      mode:\n        description: Create a new phone or restore the latest encrypted backup\n        required: true\n        default: new\n        type: choice\n        options:\n          - new\n          - restore\n      phone_id:\n        description: Logical phone ID (digits only, e.g. 001)\n        required: true\n        default: \'001\'\n        type: string\n      phone_name:\n        description: Friendly phone name shown in GitHub and the local GUI\n        required: false\n        default: \'BICOIN-001\'\n        type: string\n      package_name:\n        description: Android package used for GUI monitoring/launch only; it is not auto-installed\n        required: false\n        default: \'com.temperaturecoin\'\n        type: string\n      apk_url:\n        description: Optional APK reference only; managed phone creation does not auto-install APKs\n        required: false\n        default: \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\'\n        type: string\n      api_level:\n        description: Android API level\n        required: false\n        default: \'35\'\n        type: string\n      target:\n        description: Android system image target\n        required: false\n        default: \'google_apis\'\n        type: string\n      arch:\n        description: Android emulator architecture\n        required: false\n        default: \'x86_64\'\n        type: string\n      profile:\n        description: Android device profile\n        required: false\n        default: \'pixel_6\'\n        type: string\n      cores:\n        description: Emulator CPU cores\n        required: false\n        default: \'4\'\n        type: string\n      ram_mb:\n        description: Emulator RAM in MiB\n        required: false\n        default: \'8192\'\n        type: string\n      device_manufacturer:\n        description: Optional Android Build.MANUFACTURER value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_brand:\n        description: Optional Android Build.BRAND value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n      device_model:\n        description: Optional Android Build.MODEL value for emulator compatibility testing\n        required: false\n        default: \'\'\n        type: string\n\npermissions:\n  contents: read\n  actions: read\n  issues: write\n\nconcurrency:\n  group: managed-android-phone-${{ inputs.phone_id || \'001\' }}\n  cancel-in-progress: true\n\nenv:\n  DISPLAY: :99\n  APK_URL: ${{ inputs.apk_url || \'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk\' }}\n  PHONE_ID: ${{ inputs.phone_id || \'001\' }}\n  PHONE_NAME: ${{ inputs.phone_name || \'BICOIN-001\' }}\n  PACKAGE_NAME: ${{ inputs.package_name || \'com.temperaturecoin\' }}\n  AVD_NAME: managed-phone-${{ inputs.phone_id || \'001\' }}\n  DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || \'\' }}\n  DEVICE_BRAND: ${{ inputs.device_brand || \'\' }}\n  DEVICE_MODEL: ${{ inputs.device_model || \'\' }}\n\njobs:\n  phone:\n    runs-on: ubuntu-latest\n    timeout-minutes: 330\n    env:\n      AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v4\n\n      - name: Validate inputs and backup encryption key\n        shell: bash\n        run: |\n          set -euo pipefail\n          case "$PHONE_ID" in\n            \'\'|*[!0-9]*) echo \'::error::phone_id must contain digits only\'; exit 1 ;;\n          esac\n          printf \'%s\\n\' "${PACKAGE_NAME:-}" | grep -Eq \'^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+$\' || { echo \'::error::package_name is invalid\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MANUFACTURER:-}" | grep -Eq \'^[A-Za-z0-9._+ -]*$\' || { echo \'::error::device_manufacturer contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_BRAND:-}" | grep -Eq \'^[A-Za-z0-9._+-]*$\' || { echo \'::error::device_brand contains unsupported characters\'; exit 1; }\n          printf \'%s\\n\' "${DEVICE_MODEL:-}" | grep -Eq \'^[A-Za-z0-9._+() -]*$\' || { echo \'::error::device_model contains unsupported characters\'; exit 1; }\n          if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then\n            echo \'::error::device_model requires device_manufacturer and device_brand\'\n            exit 1\n          fi\n          if [ "${{ inputs.mode }}" = \'restore\' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.\'\n            exit 1\n          fi\n          if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.\'\n          fi\n          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"\n\n      - name: Prepare phone identity\n        id: identity\n        shell: bash\n        run: |\n          set -euo pipefail\n          SLUG=$(printf \'%s\' "${PHONE_NAME:-}" | tr \'[:upper:]\' \'[:lower:]\' | sed -E \'s/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//\' | cut -c1-35)\n          [ -n "$SLUG" ] || SLUG="managed-phone${PHONE_ID}"\n          echo "ts_hostname=${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"\n          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"\n\n      - name: Join Tailscale\n        uses: tailscale/github-action@v4\n        with:\n          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}\n          tags: tag:github-phone\n          hostname: ${{ steps.identity.outputs.ts_hostname }}\n          version: latest\n\n      - name: Enable KVM and install runtime dependencies\n        shell: bash\n        run: |\n          set -euo pipefail\n          echo \'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"\' | sudo tee /etc/udev/rules.d/99-kvm4all.rules\n          sudo udevadm control --reload-rules\n          sudo udevadm trigger --name-match=kvm\n          test -e /dev/kvm\n          sudo apt-get update -qq\n          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq\n          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &\n          sleep 2\n\n      - name: Verify direct Internet\n        shell: bash\n        run: |\n          set -euo pipefail\n          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null\n          echo \'DIRECT_NETWORK_OK\'\n\n      - name: Restore latest encrypted AVD backup\n        if: inputs.mode == \'restore\'\n        id: cache-restore\n        uses: actions/cache/restore@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}\n          restore-keys: |\n            managed-avd-${{ inputs.phone_id }}-\n\n      - name: Decrypt restored AVD\n        if: inputs.mode == \'restore\'\n        shell: bash\n        run: |\n          set -euo pipefail\n          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {\n            echo \'::error::No encrypted AVD backup exists for this phone_id.\'\n            exit 1\n          }\n          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name \'*.enc\' | head -n1)\n          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]\n          mkdir -p "$HOME/.android"\n          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst\n          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"\n          rm -f /tmp/managed-avd.tar.zst\n          test -f "$HOME/.android/avd/${AVD_NAME}.ini"\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"\n          echo \'MANAGED_AVD_DECRYPT_RESTORE_OK\'\n\n      - name: Prepare runner status service\n        shell: bash\n        run: |\n          cat >/tmp/runner_status_server.py <<\'PY\'\n          import http.server, json, os, subprocess, time\n\n          RUN_ID = os.environ.get(\'GITHUB_RUN_ID\', \'\')\n          PHONE_ID = os.environ.get(\'PHONE_ID\', \'\')\n\n          def cpu_sample():\n              def snap():\n                  with open(\'/proc/stat\', \'r\', encoding=\'utf-8\') as f:\n                      vals = [int(x) for x in f.readline().split()[1:]]\n                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)\n                  return sum(vals), idle\n              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()\n              total = max(1, b_total - a_total)\n              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)\n\n          def mem_sample():\n              vals = {}\n              with open(\'/proc/meminfo\', \'r\', encoding=\'utf-8\') as f:\n                  for line in f:\n                      k, v = line.split(\':\', 1)\n                      vals[k] = int(v.strip().split()[0])\n              total = vals.get(\'MemTotal\', 0)\n              avail = vals.get(\'MemAvailable\', 0)\n              used = max(0, total - avail)\n              pct = round(100.0 * used / total, 1) if total else 0\n              return total, used, avail, pct\n\n          def qemu_sample():\n              cp = subprocess.run(\n                  [\'ps\', \'-C\', \'qemu-system-x86_64\', \'-o\', \'%cpu=,%mem=,rss=,pid=\', \'--sort=-%cpu\'],\n                  capture_output=True, text=True\n              )\n              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), \'\')\n              if not line:\n                  return {\'cpu_percent\': 0.0, \'mem_percent\': 0.0, \'rss_kib\': 0, \'pid\': None}\n              parts = line.split()\n              try:\n                  return {\n                      \'cpu_percent\': float(parts[0]),\n                      \'mem_percent\': float(parts[1]),\n                      \'rss_kib\': int(parts[2]),\n                      \'pid\': int(parts[3]),\n                  }\n              except Exception:\n                  return {\'raw\': line}\n\n          class Handler(http.server.BaseHTTPRequestHandler):\n              def do_GET(self):\n                  if self.path not in (\'/\', \'/status\'):\n                      self.send_response(404); self.end_headers(); return\n                  total, used, avail, pct = mem_sample()\n                  load = os.getloadavg()\n                  data = {\n                      \'ok\': True,\n                      \'run_id\': RUN_ID,\n                      \'phone_id\': PHONE_ID,\n                      \'cpu_percent\': cpu_sample(),\n                      \'load1\': round(load[0], 2),\n                      \'load5\': round(load[1], 2),\n                      \'load15\': round(load[2], 2),\n                      \'mem_total_kib\': total,\n                      \'mem_used_kib\': used,\n                      \'mem_available_kib\': avail,\n                      \'mem_percent\': pct,\n                      \'qemu\': qemu_sample(),\n                  }\n                  body = json.dumps(data).encode()\n                  self.send_response(200)\n                  self.send_header(\'Content-Type\', \'application/json\')\n                  self.send_header(\'Content-Length\', str(len(body)))\n                  self.end_headers(); self.wfile.write(body)\n              def log_message(self, *args):\n                  pass\n\n          http.server.ThreadingHTTPServer((\'127.0.0.1\', 8787), Handler).serve_forever()\n          PY\n          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &\n          sleep 1\n          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json\n          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787\n          echo \'RUNNER_STATUS_READY=8787\'\n\n      - name: Prepare managed Android bootstrap script\n        shell: bash\n        run: |\n          cat >/tmp/managed-phone.sh <<\'SCRIPT\'\n          #!/usr/bin/env bash\n          set -euo pipefail\n\n          wait_android_boot() {\n            adb wait-for-device\n            for _ in $(seq 1 180); do\n              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d \'\\r\')" = \'1\' ] && return 0\n              sleep 1\n            done\n            return 1\n          }\n\n          echo \'MANAGED_AVD_BOOT_WAIT\'\n          wait_android_boot\n          echo \'MANAGED_AVD_BOOT_COMPLETE\'\n\n          # Optional Build identity for emulator compatibility testing. Android Emulator\n          # does not allow arbitrary ro.product.* values through -prop, so use the\n          # writable-system/remount development path and verify after reboot.\n          if [ -n "${DEVICE_MODEL:-}" ]; then\n            echo "DEVICE_IDENTITY_TARGET=${DEVICE_MANUFACTURER}|${DEVICE_BRAND}|${DEVICE_MODEL}"\n            IDENTITY_READY=0\n            if adb root >/tmp/adb-root.log 2>&1; then\n              adb wait-for-device\n              sleep 2\n              if adb remount >/tmp/adb-remount.log 2>&1; then\n                IDENTITY_READY=1\n              else\n                adb disable-verity >/tmp/adb-disable-verity.log 2>&1 || true\n                adb reboot || true\n                if wait_android_boot; then\n                  adb root >/tmp/adb-root2.log 2>&1 || true\n                  adb wait-for-device\n                  sleep 2\n                  if adb remount >/tmp/adb-remount2.log 2>&1; then\n                    IDENTITY_READY=1\n                  fi\n                fi\n              fi\n            fi\n\n            if [ "$IDENTITY_READY" = \'1\' ]; then\n              cat >/tmp/patch-device-identity.sh <<\'DEVICEPATCH\'\n          #!/system/bin/sh\n          set -eu\n          patch_prop() {\n            key="$1"\n            value="$2"\n            file="$3"\n            [ -f "$file" ] || return 0\n            if grep -q "^${key}=" "$file" 2>/dev/null; then\n              sed -i "s|^${key}=.*|${key}=${value}|g" "$file"\n            fi\n          }\n          for file in             /system/build.prop /system/system/build.prop             /product/build.prop /system/product/build.prop             /vendor/build.prop /system/vendor/build.prop             /odm/build.prop /system/odm/build.prop             /system_ext/build.prop /system/system_ext/build.prop; do\n            for suffix in \'\' \'.system\' \'.product\' \'.vendor\' \'.odm\' \'.system_ext\'; do\n              patch_prop "ro.product${suffix}.manufacturer" "$TARGET_MANUFACTURER" "$file"\n              patch_prop "ro.product${suffix}.brand" "$TARGET_BRAND" "$file"\n              patch_prop "ro.product${suffix}.model" "$TARGET_MODEL" "$file"\n            done\n          done\n          sync\n          DEVICEPATCH\n              adb push /tmp/patch-device-identity.sh /data/local/tmp/patch-device-identity.sh >/dev/null\n              adb shell chmod 700 /data/local/tmp/patch-device-identity.sh\n              if adb shell "TARGET_MANUFACTURER=\'${DEVICE_MANUFACTURER}\' TARGET_BRAND=\'${DEVICE_BRAND}\' TARGET_MODEL=\'${DEVICE_MODEL}\' sh /data/local/tmp/patch-device-identity.sh"; then\n                adb reboot || true\n                wait_android_boot\n              fi\n            else\n              echo \'::warning::Could not remount emulator system; continuing with stock AVD identity.\'\n            fi\n\n            ACTUAL_MANUFACTURER=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_BRAND=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d \'\\r\')\n            ACTUAL_MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d \'\\r\')\n            echo "DEVICE_IDENTITY_ACTUAL=${ACTUAL_MANUFACTURER}|${ACTUAL_BRAND}|${ACTUAL_MODEL}"\n            if [ "$ACTUAL_MODEL" = "$DEVICE_MODEL" ]; then\n              echo \'DEVICE_REAL_MODEL_APPLIED\'\n            else\n              echo "::warning::Requested model \'${DEVICE_MODEL}\', but Android reports \'${ACTUAL_MODEL}\'."\n            fi\n          fi\n\n          # Fresh Android often needs a short settling period before first app launch.\n          sleep 12\n          adb shell settings put global window_animation_scale 0 || true\n          adb shell settings put global transition_animation_scale 0 || true\n          adb shell settings put global animator_duration_scale 0 || true\n          adb shell settings put global disable_window_blurs 1 || true\n          adb shell settings put system peak_refresh_rate 60.0 || true\n          adb shell settings put system min_refresh_rate 60.0 || true\n          adb shell wm size 720x1600 || true\n          adb shell wm density 280 || true\n\n          # Phone creation/restoration is intentionally APK-neutral. The GUI may\n          # remember a package name for monitoring, but this workflow never downloads,\n          # installs, or auto-launches an APK.\n          DEFAULT_PACKAGE="$PACKAGE_NAME"\n          if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then\n            echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"\n          else\n            echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"\n          fi\n          echo \'MANAGED_PHONE_APK_NEUTRAL\'\n\n          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true\n          adb shell settings put global auto_update_system_apps 0 || true\n\n          echo \'ADB_TCPIP_BOOTSTRAP_START\'\n          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }\n          for _ in $(seq 1 30); do\n            nc -z 127.0.0.1 5555 && break\n            sleep 1\n          done\n          nc -z 127.0.0.1 5555\n          echo \'ADB_TCPIP_5555_READY\'\n\n          TS_IPV4=$(tailscale ip -4 | head -n1)\n          [ -n "$TS_IPV4" ]\n          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555\n          echo \'MANAGED_CLOUD_PHONE_READY\'\n          echo "TAILSCALE_ADB=${TS_IPV4}:5555"\n          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"\n          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"\n\n          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"\n          for _ in $(seq 1 1800); do\n            ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \\\n              --jq ".[] | select(.pull_request == null) | select(.title == \\"${COMMAND_TITLE}\\") | .number" \\\n              2>/dev/null | head -n1 || true)\n            if [ -n "$ISSUE_NO" ]; then\n              ISSUE_BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" \\\n                --jq \'.body // ""\' 2>/dev/null || true)\n              CMD_JSON=$(printf \'%s\\n\' "$ISSUE_BODY" | grep -m1 \'^{\' || true)\n              if [ -n "$CMD_JSON" ]; then\n                CMD=$(jq -r \'.command // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_RUN=$(jq -r \'.run_id // 0\' <<<"$CMD_JSON" 2>/dev/null || true)\n                TARGET_PHONE=$(jq -r \'.phone_id // ""\' <<<"$CMD_JSON" 2>/dev/null || true)\n                if [ "$CMD" = \'backup\' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then\n                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then\n                    echo \'BACKUP_REQUEST_REJECTED_NO_KEY\'\n                  else\n                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"\n                    printf \'%s\' "$ISSUE_NO" >/tmp/managed-backup-issue-number\n                    touch /tmp/managed-backup-requested\n                    adb shell sync || true\n                    exit 0\n                  fi\n                fi\n              fi\n            fi\n            sleep 10\n          done\n\n          # End-of-life safety backup when the 5-hour session naturally expires.\n          if [ -n "${AVD_BACKUP_KEY:-}" ]; then\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP\'\n            touch /tmp/managed-backup-requested\n            adb shell sync || true\n          else\n            echo \'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY\'\n          fi\n          SCRIPT\n          chmod +x /tmp/managed-phone.sh\n          bash -n /tmp/managed-phone.sh\n          echo \'MANAGED_BOOTSTRAP_SCRIPT_READY\'\n\n      - name: Start managed Android phone\n        id: android\n        uses: reactivecircus/android-emulator-runner@v2\n        env:\n          PHONE_MODE: ${{ inputs.mode }}\n          GH_TOKEN: ${{ github.token }}\n        with:\n          api-level: ${{ inputs.api_level }}\n          target: ${{ inputs.target }}\n          arch: ${{ inputs.arch }}\n          profile: ${{ inputs.profile }}\n          avd-name: managed-phone-${{ inputs.phone_id || \'001\' }}\n          cores: ${{ inputs.cores }}\n          ram-size: ${{ format(\'{0}M\', inputs.ram_mb) }}\n          force-avd-creation: ${{ inputs.mode == \'new\' }}\n          disable-animations: false\n          emulator-options: >-\n            -no-snapshot\n            ${{ inputs.device_model != \'\' && \'-writable-system\' || \'\' }}\n            -gpu swiftshader_indirect\n            -noaudio\n            -no-boot-anim\n            -camera-back none\n            -camera-front none\n          script: bash /tmp/managed-phone.sh\n\n      - name: Pack and encrypt full AVD backup\n        id: pack\n        if: always()\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ ! -f /tmp/managed-backup-requested ]; then\n            echo \'should_save=false\' >> "$GITHUB_OUTPUT"\n            echo \'NO_BACKUP_REQUEST\'\n            exit 0\n          fi\n          test -d "$HOME/.android/avd/${AVD_NAME}.avd"\n          mkdir -p /tmp/managed-avd-backup\n          rm -f /tmp/managed-avd-backup/*\n          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst\n          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \\\n            -pass env:AVD_BACKUP_KEY \\\n            -in /tmp/managed-avd.tar.zst \\\n            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"\n          rm -f /tmp/managed-avd.tar.zst\n          BYTES=$(stat -c \'%s\' /tmp/managed-avd-backup/*.enc)\n          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"\n          echo \'should_save=true\' >> "$GITHUB_OUTPUT"\n          echo \'FULL_AVD_ENCRYPTED_BACKUP_READY\'\n\n      - name: Save encrypted AVD backup to GitHub Actions Cache\n        if: steps.pack.outputs.should_save == \'true\'\n        uses: actions/cache/save@v5\n        with:\n          path: /tmp/managed-avd-backup\n          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}\n\n      - name: Close consumed backup command\n        if: steps.pack.outputs.should_save == \'true\'\n        env:\n          GH_TOKEN: ${{ github.token }}\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ -s /tmp/managed-backup-issue-number ]; then\n            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)\n            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true\n          fi\n          echo \'MANAGED_BACKUP_SAVED\'\n'
 
 REAL_DEVICE_CATALOG: list[dict[str, str]] = [{'name': 'Samsung Galaxy S25 Ultra (SM-S938B)',
   'manufacturer': 'samsung',
@@ -705,7 +705,9 @@ class GitHubAPI:
             "run_id": run_id,
             "requested_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
-        body = "CLOUD_PHONE_COMMAND_V1\n```json\n" + json.dumps(body_obj, ensure_ascii=False) + "\n```\n"
+        # Keep the command body as one-line JSON. The runner can parse it directly,
+        # and it also avoids newline escaping surprises when GitHub CLI formats output.
+        body = json.dumps(body_obj, ensure_ascii=False, separators=(",", ":"))
         for issue in self.open_issues():
             if issue.get("title") == title:
                 return self.edit_issue(int(issue["number"]), body)
@@ -968,7 +970,11 @@ class LocalTools:
                 result["app_cpu"] = (m.group(1) + "%") if m else lines[0][:80]
             total = next((ln.strip() for ln in cpuinfo.splitlines() if "TOTAL" in ln), "")
             if total:
-                result["device_cpu"] = total[:100]
+                m = re.search(r"([0-9.]+)%\s+TOTAL", total, re.IGNORECASE)
+                if not m:
+                    m = re.search(r"([0-9.]+)%", total)
+                if m:
+                    result["device_cpu"] = m.group(1) + "%"
 
         if PKG_RE.match(package):
             meminfo = shell("dumpsys", "meminfo", package, timeout=25)
@@ -982,14 +988,20 @@ class LocalTools:
                 except ValueError:
                     pass
 
-        top = shell("top", "-b", "-n", "1", "-m", "5", timeout=20)
-        if top:
-            cpu_line = next((ln.strip() for ln in top.splitlines() if "%cpu" in ln.lower()), "")
-            mem_line = next((ln.strip() for ln in top.splitlines() if ln.strip().startswith("Mem:")), "")
-            if cpu_line:
-                result["device_cpu"] = cpu_line
-            if mem_line:
-                result["device_mem"] = mem_line
+        # Use /proc/meminfo for a compact and stable whole-device memory summary.
+        proc_mem = shell("cat", "/proc/meminfo", timeout=15)
+        if proc_mem:
+            values: dict[str, int] = {}
+            for line in proc_mem.splitlines():
+                m = re.match(r"^(MemTotal|MemAvailable):\s*([0-9]+)\s*kB", line)
+                if m:
+                    values[m.group(1)] = int(m.group(2))
+            total_kib = values.get("MemTotal", 0)
+            avail_kib = values.get("MemAvailable", 0)
+            if total_kib:
+                used_kib = max(0, total_kib - avail_kib)
+                result["device_mem"] = f"{used_kib / 1048576:.1f} / {total_kib / 1048576:.1f} GB"
+
         return result
 
     def list_third_party_packages(self, address: str) -> list[str]:
@@ -1328,13 +1340,12 @@ class LocalTools:
             req = urllib.request.Request(f"http://{ip}:8787/status", headers={"User-Agent": "cloud-android-manager/1.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 obj = json.loads(resp.read().decode("utf-8"))
-            out["host_cpu"] = f"{obj.get('cpu_percent', '-')}%  load {obj.get('load1', '-')}/{obj.get('load5', '-')}"
-            used = obj.get("mem_used_kib", 0) or 0
-            total = obj.get("mem_total_kib", 0) or 0
-            out["host_mem"] = f"{obj.get('mem_percent', '-')}%  {used/1048576:.2f}/{total/1048576:.2f} GiB" if total else "-"
+            out["host_cpu"] = f"{obj.get('cpu_percent', '-')}%"
+            out["host_mem"] = f"{obj.get('mem_percent', '-')}%"
             q = obj.get("qemu") or {}
             if isinstance(q, dict):
-                out["qemu"] = f"CPU {q.get('cpu_percent', '-')}% / MEM {q.get('mem_percent', '-')}% / RSS {(q.get('rss_kib', 0) or 0)/1024:.0f} MiB"
+                rss_gib = (q.get("rss_kib", 0) or 0) / 1048576
+                out["qemu"] = f"CPU {q.get('cpu_percent', '-')}% · RAM {rss_gib:.1f} GB"
         except Exception:
             pass
         return out
@@ -1374,7 +1385,12 @@ class CloudPhoneGUI:
         self._last_rotation_poll: dict[str, float] = {}
         self._rotating: set[str] = set()
         self._adb_task_running: set[str] = set()
-        self.card_vars: dict[str, dict[str, tk.StringVar]] = {}
+        self._backup_tracking: set[str] = set()
+        self._launch_tracking: set[str] = set()
+        self.card_vars: dict[str, dict[str, tk.Variable]] = {}
+        self.card_progress_frames: dict[str, ttk.Frame] = {}
+        self.card_status_frames: dict[str, ttk.Frame] = {}
+        self.repo_cache: list[str] = []
         self.repo_cache: list[str] = []
 
         env_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
@@ -1439,6 +1455,8 @@ class CloudPhoneGUI:
         for child in self.cards_inner.winfo_children():
             child.destroy()
         self.card_vars.clear()
+        self.card_progress_frames.clear()
+        self.card_status_frames.clear()
 
         if not self.store.profiles:
             empty = ttk.Frame(self.cards_inner, padding=40)
@@ -1456,10 +1474,12 @@ class CloudPhoneGUI:
             "run": tk.StringVar(value=self._initial_run_text(cfg)),
             "rotation": tk.StringVar(value=self._rotation_text(cfg)),
             "adb": tk.StringVar(value=cfg.last_device or "未发现 ADB 地址"),
-            "server": tk.StringVar(value="CPU -\n内存 -"),
+            "server": tk.StringVar(value="云 CPU - · 内存 -\nQEMU CPU - · RAM -"),
             "android": tk.StringVar(value=f"目标 {cfg.device_preset or cfg.device_model or '默认 AVD'}\n等待检测"),
             "app": tk.StringVar(value=f"{cfg.package_name}\n等待检测"),
             "repo": tk.StringVar(value=f"{cfg.repo} · {cfg.branch}"),
+            "progress_text": tk.StringVar(value=""),
+            "progress_value": tk.DoubleVar(value=0.0),
         }
         self.card_vars[cfg.profile_id] = vars_
 
@@ -1470,31 +1490,39 @@ class CloudPhoneGUI:
         )
         card.pack(fill="x", padx=3, pady=5)
 
-        # Header: only the state and the two controls people need constantly.
         head = ttk.Frame(card)
         head.pack(fill="x")
         ttk.Label(head, textvariable=vars_["run"], font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Button(head, text="⚙", width=3, command=lambda pid=cfg.profile_id: self.open_settings(pid)).pack(side="right")
         ttk.Button(head, text="↻", width=3, command=lambda pid=cfg.profile_id: self.refresh_profile(pid)).pack(side="right", padx=(0, 4))
 
-        # Compact status strip. Avoid nested LabelFrames: borders around every metric
-        # made the dashboard look like a monitoring console instead of a phone manager.
+        progress = ttk.Frame(card)
+        progress.columnconfigure(0, weight=1)
+        ttk.Label(progress, textvariable=vars_["progress_text"], font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 3)
+        )
+        ttk.Progressbar(progress, variable=vars_["progress_value"], maximum=100, mode="determinate").grid(
+            row=1, column=0, sticky="ew"
+        )
+        self.card_progress_frames[cfg.profile_id] = progress
+
         status = ttk.Frame(card)
+        self.card_status_frames[cfg.profile_id] = status
         status.pack(fill="x", pady=(9, 7))
-        for i in range(3):
+        for i in range(4):
             status.columnconfigure(i, weight=1, uniform="phone_status")
 
         def status_item(col: int, title: str, variable: tk.StringVar) -> None:
             box = ttk.Frame(status, padding=(7, 3))
             box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0))
             ttk.Label(box, text=title, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            ttk.Label(box, textvariable=variable, justify="left", wraplength=330).pack(anchor="w", pady=(2, 0))
+            ttk.Label(box, textvariable=variable, justify="left", wraplength=285).pack(anchor="w", pady=(2, 0))
 
         status_item(0, "连接", vars_["adb"])
         status_item(1, "Android", vars_["android"])
         status_item(2, "当前 App", vars_["app"])
+        status_item(3, "资源", vars_["server"])
 
-        # Primary actions: six only. Everything else is deliberately hidden by default.
         primary = ttk.Frame(card)
         primary.pack(fill="x", pady=(3, 0))
         ttk.Button(primary, text="▶ 启动", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=(0, 5))
@@ -1524,18 +1552,16 @@ class CloudPhoneGUI:
         meta = ttk.Frame(details)
         meta.pack(fill="x")
         meta.columnconfigure(0, weight=2)
-        meta.columnconfigure(1, weight=1)
-        meta.columnconfigure(2, weight=2)
+        meta.columnconfigure(1, weight=2)
 
         def detail_item(col: int, title: str, variable: tk.StringVar) -> None:
             box = ttk.Frame(meta, padding=(5, 2))
             box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0))
             ttk.Label(box, text=title, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            ttk.Label(box, textvariable=variable, justify="left", wraplength=360).pack(anchor="w", pady=(2, 0))
+            ttk.Label(box, textvariable=variable, justify="left", wraplength=500).pack(anchor="w", pady=(2, 0))
 
         detail_item(0, "仓库", vars_["repo"])
-        detail_item(1, "云服务器", vars_["server"])
-        detail_item(2, "自动换机", vars_["rotation"])
+        detail_item(1, "自动换机", vars_["rotation"])
 
         secondary = ttk.Frame(details)
         secondary.pack(fill="x", pady=(8, 0))
@@ -1621,6 +1647,34 @@ class CloudPhoneGUI:
         if vars_ and key in vars_:
             vars_[key].set(value)
 
+    def _set_operation_progress(self, profile_id: str, text: str, percent: float, visible: bool = True) -> None:
+        vars_ = self.card_vars.get(profile_id) or {}
+        text_var = vars_.get("progress_text")
+        value_var = vars_.get("progress_value")
+        if text_var is not None:
+            text_var.set(text)
+        if value_var is not None:
+            try:
+                value_var.set(max(0.0, min(100.0, float(percent))))
+            except Exception:
+                value_var.set(0.0)
+        frame = self.card_progress_frames.get(profile_id)
+        status = self.card_status_frames.get(profile_id)
+        if not frame:
+            return
+        if visible:
+            if not frame.winfo_manager():
+                if status and status.winfo_manager():
+                    frame.pack(fill="x", pady=(7, 2), before=status)
+                else:
+                    frame.pack(fill="x", pady=(7, 2))
+        else:
+            frame.pack_forget()
+
+    def _finish_operation_progress(self, profile_id: str, text: str = "完成") -> None:
+        self._set_operation_progress(profile_id, text, 100.0, True)
+        self.root.after(7000, lambda pid=profile_id: self._set_operation_progress(pid, "", 0.0, False))
+
     # ------------------------- background / logging -------------------------
     def log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -1648,6 +1702,14 @@ class CloudPhoneGUI:
         try:
             while True:
                 kind, payload = self.q.get_nowait()
+                if kind == "progress":
+                    profile_id, text, percent = payload
+                    self._set_operation_progress(profile_id, text, percent, True)
+                    continue
+                if kind == "progress_done":
+                    profile_id, text = payload
+                    self._finish_operation_progress(profile_id, text)
+                    continue
                 if kind == "ok":
                     name, value, callback = payload
                     if callback:
@@ -2622,31 +2684,197 @@ class CloudPhoneGUI:
             return
         action = "恢复备份" if mode == "restore" else "新建 / 启动"
         self._set_card(profile_id, "run", f"{action}：正在准备仓库…")
+        self._set_operation_progress(profile_id, f"{action} 3% · 正在准备仓库", 3.0, True)
 
-        def work() -> list[str]:
+        def work() -> tuple[list[str], int]:
             notes = self._prepare_repository(cfg)
             api = self.api_for(cfg)
+            previous = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+            previous_run_id = int(previous.get("id") or 0) if previous else 0
             api.dispatch(Path(BUILTIN_WORKFLOW_PATH).name, cfg.branch, self._workflow_inputs(cfg, mode))
             notes.append("GitHub workflow 已触发")
-            return notes
+            return notes, previous_run_id
 
-        def done(notes: list[str]) -> None:
+        def done(result: tuple[list[str], int]) -> None:
+            notes, previous_run_id = result
             self._set_card(profile_id, "run", f"{action}：已触发，等待 Runner")
+            self._set_operation_progress(profile_id, f"{action} 5% · 已触发，等待 GitHub Runner", 5.0, True)
             self.log(f"{cfg.phone_name}: " + "；".join(notes))
-            self.root.after(2200, lambda: self.refresh_profile(profile_id))
+            self._track_launch_progress(profile_id, mode, previous_run_id)
+            self.root.after(2200, lambda: self.refresh_profile(profile_id, quiet=True))
 
-        self.bg(
-            f"{cfg.phone_name} {action}",
-            work,
-            done,
-            lambda err: self._set_card(profile_id, "run", f"{action}失败：{err}"),
-        )
+        def failed(err: str) -> None:
+            self._set_operation_progress(profile_id, f"{action}失败 · {err}", 100.0, True)
+            self._set_card(profile_id, "run", f"{action}失败：{err}")
+
+        self.bg(f"{cfg.phone_name} {action}", work, done, failed)
+
+    @staticmethod
+    def _steps_by_name(jobs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        steps: dict[str, dict[str, Any]] = {}
+        for job in jobs or []:
+            for step in job.get("steps") or []:
+                name = str(step.get("name") or "")
+                if name:
+                    steps[name] = step
+        return steps
+
+    def _track_backup_progress(self, profile_id: str, run_id: int) -> None:
+        if profile_id in self._backup_tracking:
+            return
+        cfg = self.store.get(profile_id)
+        if not cfg:
+            return
+        self._backup_tracking.add(profile_id)
+
+        def work() -> str:
+            api = self.api_for(cfg)
+            deadline = time.time() + 3600
+            while time.time() < deadline:
+                run = api.run(run_id)
+                jobs = api.jobs(run_id)
+                steps = self._steps_by_name(jobs)
+                phone = steps.get("Start managed Android phone", {})
+                pack = steps.get("Pack and encrypt full AVD backup", {})
+                save = steps.get("Save encrypted AVD backup to GitHub Actions Cache", {})
+                close = steps.get("Close consumed backup command", {})
+
+                if str(close.get("status")) == "completed" and str(close.get("conclusion")) == "success":
+                    self.q.put(("progress", (profile_id, "备份 100% · 已保存到 GitHub", 100.0)))
+                elif str(save.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, "备份 85% · 正在上传 GitHub Cache", 85.0)))
+                elif str(save.get("status")) == "completed":
+                    self.q.put(("progress", (profile_id, "备份 95% · 上传完成，正在收尾", 95.0)))
+                elif str(pack.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, "备份 55% · 正在打包并加密完整 AVD", 55.0)))
+                elif str(pack.get("status")) == "completed":
+                    self.q.put(("progress", (profile_id, "备份 75% · 打包加密完成，等待上传", 75.0)))
+                elif str(phone.get("status")) == "completed":
+                    self.q.put(("progress", (profile_id, "备份 35% · Emulator 已停止，准备打包", 35.0)))
+                else:
+                    self.q.put(("progress", (profile_id, "备份 15% · 等待 Runner 接收请求并安全停机", 15.0)))
+
+                status = str(run.get("status") or "")
+                conclusion = str(run.get("conclusion") or "")
+                if status == "completed":
+                    if conclusion == "success":
+                        return "备份完成 · 已保存到 GitHub"
+                    raise RuntimeError(f"GitHub Run 结束：{conclusion or 'unknown'}")
+                time.sleep(3)
+            raise RuntimeError("备份等待超过 60 分钟")
+
+        def done(text: str) -> None:
+            self._backup_tracking.discard(profile_id)
+            self._finish_operation_progress(profile_id, text)
+            self._set_card(profile_id, "run", f"备份完成 · Run {run_id}")
+            self.log(f"{cfg.phone_name}: {text} · Run {run_id}")
+            self.root.after(1200, lambda: self.refresh_profile(profile_id, quiet=True))
+
+        def failed(err: str) -> None:
+            self._backup_tracking.discard(profile_id)
+            self._set_operation_progress(profile_id, f"备份失败 · {err}", 100.0, True)
+            self._set_card(profile_id, "run", f"备份失败：{err}")
+
+        self.bg(f"{cfg.phone_name} 备份进度", work, done, failed)
+
+    def _track_launch_progress(self, profile_id: str, mode: str, previous_run_id: int = 0) -> None:
+        if profile_id in self._launch_tracking:
+            return
+        cfg = self.store.get(profile_id)
+        if not cfg:
+            return
+        self._launch_tracking.add(profile_id)
+        label = "恢复" if mode == "restore" else "启动"
+
+        def work() -> tuple[str, int, str]:
+            api = self.api_for(cfg)
+            deadline = time.time() + 900
+            run_id = 0
+            address = ""
+            while time.time() < deadline:
+                run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+                if not run:
+                    self.q.put(("progress", (profile_id, f"{label} 5% · 等待 GitHub 创建 Run", 5.0)))
+                    time.sleep(2)
+                    continue
+                candidate = int(run.get("id") or 0)
+                if previous_run_id and candidate == previous_run_id:
+                    self.q.put(("progress", (profile_id, f"{label} 5% · 等待新的 Runner", 5.0)))
+                    time.sleep(2)
+                    continue
+                run_id = candidate
+                status = str(run.get("status") or "")
+                conclusion = str(run.get("conclusion") or "")
+                if status == "queued":
+                    self.q.put(("progress", (profile_id, f"{label} 10% · GitHub Runner 排队中", 10.0)))
+                    time.sleep(3)
+                    continue
+
+                jobs = api.jobs(run_id)
+                steps = self._steps_by_name(jobs)
+                restore = steps.get("Restore latest encrypted AVD backup", {})
+                decrypt = steps.get("Decrypt restored AVD", {})
+                tailscale = steps.get("Join Tailscale", {})
+                runtime = steps.get("Enable KVM and install runtime dependencies", {})
+                phone = steps.get("Start managed Android phone", {})
+
+                if mode == "restore" and str(restore.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, "恢复 25% · 正在下载最新备份", 25.0)))
+                elif mode == "restore" and str(decrypt.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, "恢复 45% · 正在解密并还原 AVD", 45.0)))
+                elif str(phone.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, f"{label} 70% · Android 正在启动", 70.0)))
+                elif str(runtime.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, f"{label} 40% · 正在准备云机运行环境", 40.0)))
+                elif str(tailscale.get("status")) == "in_progress":
+                    self.q.put(("progress", (profile_id, f"{label} 20% · 正在连接 Tailscale", 20.0)))
+                else:
+                    self.q.put(("progress", (profile_id, f"{label} 15% · Runner 正在初始化", 15.0)))
+
+                ip, _host = self.tools.discover_phone(cfg.phone_id, run_id, cfg.phone_name)
+                if ip:
+                    address = f"{ip}:5555"
+                    self.q.put(("progress", (profile_id, f"{label} 82% · 云机已联网，等待 ADB", 82.0)))
+                    if self.tools.port_open(ip, 5555, 1.2):
+                        ok, _msg = self.tools.adb_connect(address)
+                        if ok:
+                            code, out, _err = self.tools.adb_cmd(
+                                address, ["shell", "getprop", "sys.boot_completed"], timeout=8
+                            )
+                            if code == 0 and out.strip() == "1":
+                                return f"{label}完成 · Android / ADB 已就绪", run_id, address
+
+                if status == "completed":
+                    if conclusion == "success":
+                        raise RuntimeError("Run 已结束，但没有检测到可用的 Android / ADB")
+                    raise RuntimeError(f"GitHub Run 失败：{conclusion or 'unknown'}")
+                time.sleep(4)
+            raise RuntimeError(f"{label}等待超过 15 分钟")
+
+        def done(result: tuple[str, int, str]) -> None:
+            text, run_id, address = result
+            self._launch_tracking.discard(profile_id)
+            cfg.last_run_id = run_id
+            cfg.last_device = address
+            self.store.upsert(cfg)
+            self._finish_operation_progress(profile_id, text)
+            self._set_card(profile_id, "run", f"运行中 · Run {run_id}")
+            self.log(f"{cfg.phone_name}: {text}")
+            self.root.after(500, lambda: self.refresh_profile(profile_id, quiet=True))
+
+        def failed(err: str) -> None:
+            self._launch_tracking.discard(profile_id)
+            self._set_operation_progress(profile_id, f"{label}失败 · {err}", 100.0, True)
+            self._set_card(profile_id, "run", f"{label}失败：{err}")
+
+        self.bg(f"{cfg.phone_name} {label}进度", work, done, failed)
 
     def backup_profile(self, profile_id: str) -> None:
         cfg = self.store.get(profile_id)
         if not cfg:
             return
         self._set_card(profile_id, "run", "正在发送备份请求…")
+        self._set_operation_progress(profile_id, "备份 5% · 正在发送请求", 5.0, True)
 
         def work() -> tuple[int, int]:
             api = self.api_for(cfg)
@@ -2656,7 +2884,6 @@ class CloudPhoneGUI:
             if str(run.get("status")) != "in_progress":
                 raise RuntimeError("当前云机 Runner 已不在运行，无法从运行中实例触发完整备份")
             rid = int(run["id"])
-            # Ensure the encryption key exists, without regenerating an existing one.
             names = api.repo_secret_names()
             if names is not None and "AVD_BACKUP_KEY" not in names:
                 ok, detail = self.tools.set_github_secret(cfg.repo, self._token(), "AVD_BACKUP_KEY")
@@ -2669,16 +2896,16 @@ class CloudPhoneGUI:
             rid, issue_no = result
             cfg.last_run_id = rid
             self.store.save()
-            self._set_card(profile_id, "run", f"备份请求已发送 · Run {rid} · Issue #{issue_no}")
-            self.log(f"{cfg.phone_name}: 备份请求已发送，Runner 会停止 Emulator 后保存完整 AVD")
-            self.root.after(3000, lambda: self.refresh_profile(profile_id))
+            self._set_card(profile_id, "run", f"备份进行中 · Run {rid}")
+            self._set_operation_progress(profile_id, "备份 15% · 等待 Runner 接收并安全停机", 15.0, True)
+            self.log(f"{cfg.phone_name}: 备份请求已发送 · Run {rid} · Issue #{issue_no}")
+            self._track_backup_progress(profile_id, rid)
 
-        self.bg(
-            f"{cfg.phone_name} 备份",
-            work,
-            done,
-            lambda err: self._set_card(profile_id, "run", f"备份失败：{err}"),
-        )
+        def failed(err: str) -> None:
+            self._set_operation_progress(profile_id, f"备份失败 · {err}", 100.0, True)
+            self._set_card(profile_id, "run", f"备份失败：{err}")
+
+        self.bg(f"{cfg.phone_name} 备份", work, done, failed)
 
     def rotate_profile(self, profile_id: str, automatic: bool = False) -> None:
         cfg = self.store.get(profile_id)
@@ -2904,7 +3131,7 @@ class CloudPhoneGUI:
                 cfg.last_node = ""
                 self._set_card(profile_id, "run", "未找到 Run")
                 self._set_card(profile_id, "adb", "未发现 ADB 地址")
-                self._set_card(profile_id, "server", "CPU -\n内存 -")
+                self._set_card(profile_id, "server", "云 CPU - · 内存 -\nQEMU CPU - · RAM -")
                 self._set_card(profile_id, "android", "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n未检测")
                 self.store.save()
@@ -2948,7 +3175,7 @@ class CloudPhoneGUI:
             if ip:
                 adb_text = cfg.last_device
                 if not health:
-                    adb_text += "\nADB 5555 尚未就绪"
+                    adb_text += "\nADB 尚未就绪"
                 elif adb:
                     adb_text += f"\n{adb}"
                 self._set_card(profile_id, "adb", adb_text)
@@ -2957,17 +3184,23 @@ class CloudPhoneGUI:
 
             host_cpu = str(runner.get("host_cpu") or "-")
             host_mem = str(runner.get("host_mem") or "-")
-            self._set_card(profile_id, "server", f"CPU {host_cpu}\n内存 {host_mem}")
+            qemu = str(runner.get("qemu") or "-")
+            self._set_card(profile_id, "server", f"云 CPU {host_cpu} · 内存 {host_mem}\nQEMU {qemu}")
 
             if health:
                 model = str(health.get("model") or "-")
                 android = str(health.get("android") or "-")
                 device_cpu = str(health.get("device_cpu") or "-")
-                self._set_card(profile_id, "android", f"Android {android} · {model}\nBoot {boot or '-'} · CPU {device_cpu[:55]}")
+                device_mem = str(health.get("device_mem") or "-")
+                self._set_card(
+                    profile_id,
+                    "android",
+                    f"Android {android} · {model}\nCPU {device_cpu} · 内存 {device_mem}",
+                )
                 app_state = str(health.get("app") or "-")
                 app_cpu = str(health.get("app_cpu") or "-")
                 app_mem = str(health.get("app_mem") or "-")
-                self._set_card(profile_id, "app", f"{cfg.package_name}\n{app_state} · CPU {app_cpu} · MEM {app_mem}")
+                self._set_card(profile_id, "app", f"{cfg.package_name}\n{app_state} · CPU {app_cpu} · 内存 {app_mem}")
             else:
                 self._set_card(profile_id, "android", "等待 Android / ADB 就绪" if status == "in_progress" else "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n等待检测" if status == "in_progress" else "未运行")

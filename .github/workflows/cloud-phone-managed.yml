@@ -420,12 +420,12 @@ jobs:
 
           COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"
           for _ in $(seq 1 1800); do
-            ISSUE_LINE=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
-              --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | [.number,.body] | @tsv" \
+            ISSUE_NO=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | .number" \
               2>/dev/null | head -n1 || true)
-            if [ -n "$ISSUE_LINE" ]; then
-              ISSUE_NO=${ISSUE_LINE%%$'\t'*}
-              ISSUE_BODY=${ISSUE_LINE#*$'\t'}
+            if [ -n "$ISSUE_NO" ]; then
+              ISSUE_BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NO}" \
+                --jq '.body // ""' 2>/dev/null || true)
               CMD_JSON=$(printf '%s\n' "$ISSUE_BODY" | grep -m1 '^{' || true)
               if [ -n "$CMD_JSON" ]; then
                 CMD=$(jq -r '.command // ""' <<<"$CMD_JSON" 2>/dev/null || true)
