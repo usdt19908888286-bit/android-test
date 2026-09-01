@@ -1697,17 +1697,43 @@ class LocalTools:
         result["ok"] = not result["errors"]
         return result
 
-    def bicoin_push_health_check(self, address: str) -> dict[str, Any]:
-        """Check BiCoin push-process/thread/socket health using the app-specific probe."""
+    def bicoin_push_health_check(
+        self,
+        address: str,
+        streak_before: int = 0,
+        previous_kind: str = "",
+        startup_grace: bool = False,
+    ) -> dict[str, Any]:
+        """One-minute BiCoin MobPush/Fly MCL watchdog probe.
+
+        Push health is based on the real MCL TCP reader thread ``mlp-worker``.
+        TCP state data is collected dynamically by BiCoin UID for diagnostics only;
+        ESTABLISHED/CLOSE_WAIT never proves application-layer push health by itself.
+        """
+        code, out, err = self.adb_cmd(address, ["get-state"], timeout=12)
+        state = (out or err or "").strip()
+        if code != 0 or state != "device":
+            return {
+                "ok": False,
+                "countable": False,
+                "adb": False,
+                "status": "ADB_OFFLINE",
+                "issue_kind": "",
+                "streak_before": 0,
+                "detail": state or f"get-state exit={code}",
+            }
+
         command = (
-            'uid=$(cmd package list packages -U com.temperaturecoin | sed "s/.*uid://"); '
-            'p=$(pidof com.temperaturecoin); '
-            'w=$(pidof com.temperaturecoin:watch); '
-            'if [ -z "$p" ]; then echo BICOIN_MAIN_DEAD; '
-            'elif [ -z "$w" ]; then echo BICOIN_WATCH_DEAD; '
-            'elif ! grep -q "M-PL-MP-PUSH_SD" /proc/$p/task/*/comm 2>/dev/null; then echo BICOIN_PUSH_THREAD_DEAD; '
-            'elif cat /proc/net/tcp /proc/net/tcp6 | grep " $uid " | grep " 01 " | grep " 02:" >/dev/null; '
-            'then echo BICOIN_PUSH_OK; else echo BICOIN_PUSH_SOCKET_DEAD; fi'
+            'uid=$(cmd package list packages -U com.temperaturecoin 2>/dev/null | sed -n "s/.*uid://p" | head -n1); '
+            'uid=${uid%% *}; '
+            'p=$(pidof com.temperaturecoin 2>/dev/null || true); p=${p%% *}; '
+            'w=$(pidof com.temperaturecoin:watch 2>/dev/null || true); w=${w%% *}; '
+            'mlp=0; '
+            'if [ -n "$p" ] && grep -qx "mlp-worker" /proc/$p/task/*/comm 2>/dev/null; then mlp=1; fi; '
+            'printf "BICOIN_UID=%s\nBICOIN_MAIN_PID=%s\nBICOIN_WATCH_PID=%s\nBICOIN_MLP=%s\n" "$uid" "$p" "$w" "$mlp"; '
+            'echo __BICOIN_TCP_BEGIN__; '
+            'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null || true; '
+            'echo __BICOIN_TCP_END__'
         )
         code, out, err = self.adb_cmd(address, ["shell", command], timeout=25)
         raw = (out or err or "").strip()
@@ -1716,37 +1742,131 @@ class LocalTools:
                 "ok": False,
                 "countable": False,
                 "adb": False,
-                "status": "BICOIN_PUSH_CHECK_ADB_FAILED",
-                "detail": raw or f"exit={code}",
+                "status": "ADB_OFFLINE",
+                "issue_kind": "",
+                "streak_before": 0,
+                "detail": raw or f"shell probe exit={code}",
             }
 
-        allowed = {
-            "BICOIN_MAIN_DEAD",
-            "BICOIN_WATCH_DEAD",
-            "BICOIN_PUSH_THREAD_DEAD",
-            "BICOIN_PUSH_OK",
-            "BICOIN_PUSH_SOCKET_DEAD",
+        values: dict[str, str] = {}
+        tcp_lines: list[str] = []
+        in_tcp = False
+        for raw_line in raw.splitlines():
+            line = raw_line.strip()
+            if line == "__BICOIN_TCP_BEGIN__":
+                in_tcp = True
+                continue
+            if line == "__BICOIN_TCP_END__":
+                in_tcp = False
+                continue
+            if in_tcp:
+                tcp_lines.append(line)
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+
+        uid = values.get("BICOIN_UID", "").strip()
+        main_pid = values.get("BICOIN_MAIN_PID", "").strip()
+        watch_pid = values.get("BICOIN_WATCH_PID", "").strip()
+        mlp_present = values.get("BICOIN_MLP", "0").strip() == "1"
+
+        state_codes: dict[str, int] = {}
+        if uid:
+            for line in tcp_lines:
+                parts = line.split()
+                if len(parts) < 8 or parts[0].lower() == "sl":
+                    continue
+                if parts[7] != uid:
+                    continue
+                tcp_state = parts[3].upper()
+                state_codes[tcp_state] = state_codes.get(tcp_state, 0) + 1
+
+        state_names = {
+            "01": "ESTABLISHED",
+            "02": "SYN_SENT",
+            "03": "SYN_RECV",
+            "04": "FIN_WAIT1",
+            "05": "FIN_WAIT2",
+            "06": "TIME_WAIT",
+            "07": "CLOSE",
+            "08": "CLOSE_WAIT",
+            "09": "LAST_ACK",
+            "0A": "LISTEN",
+            "0B": "CLOSING",
+            "0C": "NEW_SYN_RECV",
         }
-        status = ""
-        for line in reversed(raw.splitlines()):
-            value = line.strip()
-            if value in allowed:
-                status = value
-                break
-        if not status:
-            status = "BICOIN_PUSH_CHECK_UNKNOWN"
+        tcp_states = {
+            state_names.get(code_key, code_key): count
+            for code_key, count in sorted(state_codes.items())
+        }
+        close_wait = int(state_codes.get("08", 0))
+        tcp_total = sum(state_codes.values())
+
+        issue_kind = ""
+        effective_streak = 0
+        countable = False
+        immediate_recovery = False
+
+        if not main_pid:
+            status = "BICOIN_MAIN_DEAD"
+            issue_kind = "main_dead"
+            immediate_recovery = True
+        elif not watch_pid:
+            status = "BICOIN_WATCH_DEAD"
+            issue_kind = "watch_dead"
+            effective_streak = int(streak_before) if previous_kind == issue_kind else 0
+            countable = True
+        elif mlp_present:
+            status = "BICOIN_PUSH_OK"
+        else:
+            issue_kind = "mlp_missing"
+            effective_streak = int(streak_before) if previous_kind == issue_kind else 0
+            if startup_grace:
+                status = "BICOIN_STARTUP_GRACE"
+                issue_kind = ""
+                effective_streak = 0
+            elif close_wait > 0:
+                status = "BICOIN_MCL_SUSPECTED_DEAD"
+                countable = True
+            else:
+                status = "BICOIN_MLP_MISSING_2" if effective_streak >= 1 else "BICOIN_MLP_MISSING_1"
+                countable = True
+
+        tcp_text = ",".join(f"{key}:{value}" for key, value in tcp_states.items()) or "none"
+        detail = (
+            f"uid={uid or '-'} main={main_pid or '-'} watch={watch_pid or '-'} "
+            f"mlp-worker={'yes' if mlp_present else 'no'} tcp={tcp_text} "
+            f"tcp_total={tcp_total} close_wait={close_wait}"
+        )
         return {
             "ok": status == "BICOIN_PUSH_OK",
-            "countable": True,
+            "countable": countable,
             "adb": True,
             "status": status,
-            "detail": raw,
+            "issue_kind": issue_kind,
+            "streak_before": effective_streak,
+            "immediate_recovery": immediate_recovery,
+            "uid": uid,
+            "main_pid": main_pid,
+            "watch_pid": watch_pid,
+            "mlp_worker": mlp_present,
+            "tcp_states": tcp_states,
+            "tcp_total": tcp_total,
+            "close_wait": close_wait,
+            "detail": detail,
         }
 
     def bicoin_push_recover(self, address: str) -> dict[str, Any]:
-        """Restart only BiCoin after two consecutive push-health failures, then return HOME."""
+        """Fully restart only BiCoin for the one-minute Push watchdog."""
         bicoin = "com.temperaturecoin"
-        result: dict[str, Any] = {"ok": False, "steps": [], "errors": []}
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": "BICOIN_RESTARTING",
+            "restarted": False,
+            "steps": [],
+            "errors": [],
+        }
 
         ok, detail = self.adb_connect(address)
         if not ok:
@@ -1757,22 +1877,31 @@ class LocalTools:
             result["errors"].append(f"wait-for-device: {(out or err).strip()}")
             return result
 
-        def run_step(label: str, args: list[str], timeout: int = 25) -> None:
+        def run_step(label: str, args: list[str], timeout: int = 25) -> bool:
             c, o, e = self.adb_cmd(address, args, timeout=timeout)
             if c == 0:
                 result["steps"].append(label)
-            else:
-                result["errors"].append(f"{label}: {(o or e).strip() or f'exit={c}'}")
+                return True
+            result["errors"].append(f"{label}: {(o or e).strip() or f'exit={c}'}")
+            return False
 
-        run_step("kill BiCoin", ["shell", "am", "kill", bicoin])
-        time.sleep(2)
-        run_step(
-            "start BiCoin",
-            ["shell", "am", "start", "-n", "com.temperaturecoin/.mvp.activity.main.WelcomActivity"],
+        force_stopped = run_step("force-stop BiCoin", ["shell", "am", "force-stop", bicoin])
+        if force_stopped:
+            time.sleep(2)
+
+        launched = run_step(
+            "launch BiCoin (monkey)",
+            ["shell", "monkey", "-p", bicoin, "-c", "android.intent.category.LAUNCHER", "1"],
+            timeout=35,
         )
-        time.sleep(3)
+        result["restarted"] = bool(launched)
+        if launched:
+            time.sleep(8)
+
         run_step("HOME", ["shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
         result["ok"] = not result["errors"]
+        if result["ok"]:
+            result["status"] = "BICOIN_RECOVERED"
         return result
 
     @staticmethod
@@ -2217,12 +2346,13 @@ class LocalTools:
             return set()
         return {part.strip() for part in raw.split(",") if part.strip()}
 
-    def github_login(self) -> tuple[bool, str]:
+    def github_login(self, force_new_account: bool = False) -> tuple[bool, str]:
         """Authorize GitHub CLI with every permission this manager needs.
 
-        The user only completes the normal GitHub browser/device authorization.
-        Fresh machines request the required scopes up front; an existing older
-        authorization is transparently refreshed when it lacks workflow/delete access.
+        By default an existing account is refreshed only when required scopes are
+        missing. ``force_new_account`` bypasses that shortcut so the user can log
+        into/switch to a different GitHub account, which is needed when the current
+        account can access a repository but does not have repository Admin rights.
         """
         installed_now = False
         if not self.gh:
@@ -2245,11 +2375,16 @@ class LocalTools:
             existing_account = self.github_account()
             existing_token = self.github_auth_token()
             existing_scopes = self.github_token_scopes(existing_token) if existing_token else set()
-            if existing_account and existing_token and required_scopes.issubset(existing_scopes):
+            if (
+                not force_new_account
+                and existing_account
+                and existing_token
+                and required_scopes.issubset(existing_scopes)
+            ):
                 prefix = "GitHub CLI 已自动安装；" if installed_now else ""
                 return True, prefix + f"已登录 @{existing_account}"
 
-            if existing_account and existing_token:
+            if not force_new_account and existing_account and existing_token:
                 command = [
                     self.gh,
                     "auth",
@@ -2497,6 +2632,13 @@ class CloudPhoneGUI:
         self._last_health: dict[str, float] = {}
         self._last_push_health: dict[str, float] = {}
         self._push_health_fail_count: dict[str, int] = {}
+        self._push_health_fail_kind: dict[str, str] = {}
+        watchdog_started = time.time()
+        self._push_health_grace_until: dict[str, float] = {
+            item.profile_id: watchdog_started + 90.0
+            for item in self.store.profiles
+            if item.health_monitor_enabled
+        }
         # Normal background status refresh may run every few seconds for local
         # ADB/resource display, but GitHub's latest-run API is capped at one fetch
         # per phone every 30 seconds. Explicit user refreshes bypass this cache.
@@ -2869,8 +3011,25 @@ class CloudPhoneGUI:
             streak = int(payload.get("streak") or 0)
             threshold = int(payload.get("threshold") or 2)
             line = f"[{stamp}] BiCoin Push 巡检 {status} | 连续异常={streak}/{threshold}"
+
+            uid = str(payload.get("uid") or "").strip()
+            main_pid = str(payload.get("main_pid") or "").strip()
+            watch_pid = str(payload.get("watch_pid") or "").strip()
+            if uid or main_pid or watch_pid or "mlp_worker" in payload:
+                line += (
+                    f" | UID={uid or '-'}"
+                    f" | main={main_pid or '-'}"
+                    f" | watch={watch_pid or '-'}"
+                    f" | mlp-worker={'是' if bool(payload.get('mlp_worker')) else '否'}"
+                )
+            tcp_states = payload.get("tcp_states") if isinstance(payload.get("tcp_states"), dict) else {}
+            if tcp_states:
+                line += " | TCP=" + ",".join(f"{key}:{value}" for key, value in tcp_states.items())
+            if "close_wait" in payload:
+                line += f" | CLOSE_WAIT={int(payload.get('close_wait') or 0)}"
+
             detail = str(payload.get("detail") or "").strip()
-            if detail and detail != status:
+            if detail and not (uid or main_pid or watch_pid or "mlp_worker" in payload):
                 line += " | 详情=" + detail.replace("\r", " ").replace("\n", " | ")[:500]
         elif event == "push_recovery":
             steps = [str(item) for item in (payload.get("steps") or []) if str(item).strip()]
@@ -2879,7 +3038,7 @@ class CloudPhoneGUI:
             final_status = str(payload.get("final_status") or "UNKNOWN")
             line = (
                 f"[{stamp}] BiCoin Push 自动恢复 {'执行完成' if bool(payload.get('ok')) else '部分失败'}"
-                f" | 触发={trigger} | 重启=BiCoin → HOME | 复检={final_status}"
+                f" | 触发={trigger} | 重启=force-stop → monkey → HOME | 状态={final_status}"
             )
             if steps:
                 line += " | 完成=" + ", ".join(steps)
@@ -3082,6 +3241,74 @@ class CloudPhoneGUI:
 
     def api_for(self, cfg: AppConfig) -> GitHubAPI:
         return GitHubAPI(cfg.repo, self._token_for(cfg))
+
+    def _reauthorize_profile_github(
+        self,
+        cfg: AppConfig,
+        on_success: Optional[Callable[[], None]] = None,
+        force_new_account: bool = False,
+    ) -> None:
+        """Reauthorize the GitHub identity this phone is already configured to use.
+
+        Locked independent phones must reauthorize the same account; this helper never
+        silently falls back to the global GitHub identity. For global authorization,
+        ``force_new_account`` opens a fresh login so the user can switch to an account
+        that actually owns/administers the target repository.
+        """
+        self._show_github_login_dialog()
+        status_var = getattr(self, "_github_login_status_var", None)
+        independent = bool(getattr(cfg, "github_independent", False))
+        locked = bool(getattr(cfg, "github_independent_locked", False))
+        expected_account = self._github_account_for(cfg) if independent and locked else ""
+        if status_var:
+            target = f"独立 GitHub @{expected_account}" if expected_account else ("独立 GitHub" if independent else "全局 GitHub")
+            action = "切换/重新授权" if force_new_account and not independent else "重新授权"
+            status_var.set(f"正在{action} {target}；不会自动打开浏览器")
+
+        def work() -> tuple[bool, str, str, str]:
+            if independent:
+                ok, detail, account, token = self.tools.github_login_isolated()
+                if ok and expected_account and account.lower() != expected_account.lower():
+                    return (
+                        False,
+                        f"此手机已锁定独立 GitHub @{expected_account}，不能改绑 @{account}。请重新授权 @{expected_account}。",
+                        "",
+                        "",
+                    )
+                return ok, detail, account, token
+
+            ok, detail = self.tools.github_login(force_new_account=force_new_account)
+            if not ok:
+                return False, detail, "", ""
+            account = self.tools.github_account()
+            token = self.tools.github_auth_token()
+            if not account or not token:
+                return False, "GitHub 授权完成但没有读取到账号或 Token", "", ""
+            return True, detail, account, token
+
+        def done(result: tuple[bool, str, str, str]) -> None:
+            ok, detail, account, token = result
+            self.log(f"{cfg.phone_name}: GitHub 重新授权 · {detail}")
+            current_status = getattr(self, "_github_login_status_var", None)
+            if current_status:
+                current_status.set("授权完成" if ok else detail)
+            if not ok:
+                return
+
+            if independent:
+                self.global_secrets.save_github_profile(cfg.profile_id, account, token)
+                cfg.github_account = account
+                self.store.upsert(cfg)
+            else:
+                self.var_token.set(token)
+                self.var_github_status.set(f"GitHub: 已登录 @{account}")
+                self._github_auth_invalid = False
+                self._github_auth_last_alert = 0.0
+
+            if on_success:
+                self.root.after(400, on_success)
+
+        self.bg(f"{cfg.phone_name} GitHub 重新授权", work, done)
 
     def refresh_github_auth(self) -> None:
         if self._github_auth_checking:
@@ -4765,67 +4992,21 @@ class CloudPhoneGUI:
             )
             return
 
-        if not messagebox.askyesno(
-            APP_NAME,
-            (
-                f"完全删除手机“{cfg.phone_name}”？\n\n"
-                f"将永久删除 GitHub 仓库：{cfg.repo}\n"
-                "仓库里的 Actions、Cache、AVD 备份、Issues、Releases 和其他内容都会一起删除。\n"
-                "同时会删除本机保存的这台手机 S5、独立 GitHub 授权、健康日志和手机配置。\n\n"
-                "此操作不可撤销。"
-            ),
-            parent=self.root,
-        ):
-            return
-
-        typed = simpledialog.askstring(
-            "确认完全删除",
-            f"请输入完整仓库名确认：\n{cfg.repo}",
-            parent=self.root,
-        )
-        if typed is None:
-            return
-        if typed.strip() != cfg.repo:
-            messagebox.showerror(APP_NAME, "输入的仓库名不一致，已取消完全删除。", parent=self.root)
-            return
-
         try:
             token = self._token_for(cfg)
+            account = self._github_account_for(cfg) or "未知账号"
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc), parent=self.root)
             return
 
-        self._set_card(profile_id, "run", "完全删除：正在停止云机并删除仓库…")
-        self._set_operation_progress(profile_id, "完全删除 10% · 正在处理 GitHub", 10.0, True)
+        independent = bool(getattr(cfg, "github_independent", False))
+        locked = bool(getattr(cfg, "github_independent_locked", False))
+        auth_mode = "独立 GitHub" if independent else "全局 GitHub"
 
-        def work() -> dict[str, Any]:
-            api = GitHubAPI(cfg.repo, token)
-            cancelled = 0
-            try:
-                run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
-                if run and str(run.get("status") or "") in ("queued", "in_progress"):
-                    rid = int(run.get("id") or 0)
-                    if rid:
-                        try:
-                            api.cancel(rid)
-                            cancelled = rid
-                            time.sleep(1.0)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        self._set_card(profile_id, "run", "完全删除：正在检查 GitHub 删除权限…")
+        self._set_operation_progress(profile_id, "完全删除 5% · 检查仓库权限", 5.0, True)
 
-            repo_missing = False
-            try:
-                api.delete_repository()
-            except RuntimeError as exc:
-                if "GitHub API 404" in str(exc):
-                    repo_missing = True
-                else:
-                    raise
-            return {"cancelled": cancelled, "repo_missing": repo_missing}
-
-        def done(result: dict[str, Any]) -> None:
+        def cleanup_local(result: dict[str, Any]) -> None:
             try:
                 self.global_secrets.clear_github_profile(profile_id)
             except Exception:
@@ -4854,6 +5035,8 @@ class CloudPhoneGUI:
             self._last_health.pop(profile_id, None)
             self._last_push_health.pop(profile_id, None)
             self._push_health_fail_count.pop(profile_id, None)
+            self._push_health_fail_kind.pop(profile_id, None)
+            self._push_health_grace_until.pop(profile_id, None)
             self._health_bootstrap_done.pop(profile_id, None)
             self._health_online.pop(profile_id, None)
             self._last_rotation_poll.pop(profile_id, None)
@@ -4865,16 +5048,198 @@ class CloudPhoneGUI:
             self.log(f"已完全删除手机: {cfg.phone_name} · {cfg.repo}{suffix}")
             messagebox.showinfo(APP_NAME, f"“{cfg.phone_name}”已完全删除。{suffix}", parent=self.root)
 
-        def failed(err: str) -> None:
-            self._set_operation_progress(profile_id, f"完全删除失败 · {err}", 100.0, True)
-            self._set_card(profile_id, "run", f"完全删除失败：{err}")
+        def start_delete(preflight: dict[str, Any]) -> None:
+            repo_missing = bool(preflight.get("repo_missing", False))
+            note = "\nGitHub 仓库当前已不存在，将只清理这台手机的本地配置和凭据。" if repo_missing else ""
+            if not messagebox.askyesno(
+                APP_NAME,
+                (
+                    f"完全删除手机“{cfg.phone_name}”？\n\n"
+                    f"GitHub 身份：{auth_mode} @{account}\n"
+                    f"将永久删除 GitHub 仓库：{cfg.repo}\n"
+                    "仓库里的 Actions、Cache、AVD 备份、Issues、Releases 和其他内容都会一起删除。\n"
+                    "同时会删除本机保存的这台手机 S5、独立 GitHub 授权、健康日志和手机配置。"
+                    f"{note}\n\n此操作不可撤销。"
+                ),
+                parent=self.root,
+            ):
+                self._set_operation_progress(profile_id, "完全删除已取消", 0.0, False)
+                return
+
+            typed = simpledialog.askstring(
+                "确认完全删除",
+                f"请输入完整仓库名确认：\n{cfg.repo}",
+                parent=self.root,
+            )
+            if typed is None:
+                self._set_operation_progress(profile_id, "完全删除已取消", 0.0, False)
+                return
+            if typed.strip() != cfg.repo:
+                self._set_operation_progress(profile_id, "完全删除已取消", 0.0, False)
+                messagebox.showerror(APP_NAME, "输入的仓库名不一致，已取消完全删除。", parent=self.root)
+                return
+
+            if repo_missing:
+                cleanup_local({"repo_missing": True, "cancelled": 0})
+                return
+
+            self._set_card(profile_id, "run", "完全删除：正在停止云机并删除仓库…")
+            self._set_operation_progress(profile_id, "完全删除 20% · 正在处理 GitHub", 20.0, True)
+
+            def work_delete() -> dict[str, Any]:
+                api = GitHubAPI(cfg.repo, token)
+                cancelled = 0
+                try:
+                    run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+                    if run and str(run.get("status") or "") in ("queued", "in_progress"):
+                        rid = int(run.get("id") or 0)
+                        if rid:
+                            try:
+                                api.cancel(rid)
+                                cancelled = rid
+                                time.sleep(1.0)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                try:
+                    api.delete_repository()
+                except RuntimeError as exc:
+                    text = str(exc)
+                    if "GitHub API 404" in text:
+                        return {"cancelled": cancelled, "repo_missing": True}
+                    if "GitHub API 403" in text:
+                        raise RuntimeError(
+                            "DELETE_AUTH_CHANGED|GitHub 在删除时拒绝了授权。"
+                            f"当前 {auth_mode} @{account} 对 {cfg.repo} 的删除权限可能已变化。原始错误：{text}"
+                        ) from exc
+                    raise
+                return {"cancelled": cancelled, "repo_missing": False}
+
+            def failed_delete(err: str) -> None:
+                self._set_operation_progress(profile_id, f"完全删除失败 · {err}", 100.0, True)
+                self._set_card(profile_id, "run", f"完全删除失败：{err}")
+                if err.startswith("DELETE_AUTH_CHANGED|"):
+                    detail = err.split("|", 1)[1]
+                    retry = messagebox.askyesno(
+                        APP_NAME,
+                        "GitHub 仓库没有删除成功，因此本地手机配置和凭据仍保留。\n\n"
+                        + detail
+                        + "\n\n是否立即重新授权这个 GitHub 身份？授权完成后会重新检查权限。",
+                        parent=self.root,
+                    )
+                    if retry:
+                        self._reauthorize_profile_github(
+                            cfg,
+                            lambda pid=profile_id: self.delete_profile_completely(pid),
+                            force_new_account=not independent,
+                        )
+                    return
+                messagebox.showerror(
+                    APP_NAME,
+                    "GitHub 仓库没有删除成功，因此本地手机配置和凭据仍保留。\n\n" + err,
+                    parent=self.root,
+                )
+
+            self.bg(f"{cfg.phone_name} 完全删除", work_delete, cleanup_local, failed_delete)
+
+        def work_preflight() -> dict[str, Any]:
+            api = GitHubAPI(cfg.repo, token)
+            try:
+                access = api.repository_access()
+            except RuntimeError as exc:
+                if "GitHub API 404" in str(exc):
+                    return {
+                        "repo_missing": True,
+                        "access": {},
+                        "scopes": [],
+                    }
+                raise
+
+            scopes = sorted(self.tools.github_token_scopes(token))
+            return {
+                "repo_missing": False,
+                "access": access,
+                "scopes": scopes,
+            }
+
+        def done_preflight(result: dict[str, Any]) -> None:
+            if bool(result.get("repo_missing", False)):
+                start_delete(result)
+                return
+
+            access = result.get("access") if isinstance(result.get("access"), dict) else {}
+            scopes = {str(item) for item in (result.get("scopes") or []) if str(item).strip()}
+            has_admin = bool(access.get("admin", False))
+            scope_known = bool(scopes)
+            has_delete_scope = ("delete_repo" in scopes) if scope_known else True
+
+            if not has_delete_scope:
+                self._set_operation_progress(profile_id, "完全删除：GitHub 授权缺少 delete_repo", 5.0, True)
+                self._set_card(profile_id, "run", "完全删除：需要重新授权 GitHub")
+                retry = messagebox.askyesno(
+                    APP_NAME,
+                    (
+                        f"当前 {auth_mode} @{account} 可以访问 {cfg.repo}，但授权 Token 缺少 delete_repo 权限。\n\n"
+                        "这是旧授权常见情况，不是仓库本身损坏。\n"
+                        "是否立即重新授权？授权成功后会重新检查删除权限。"
+                    ),
+                    parent=self.root,
+                )
+                if retry:
+                    self._reauthorize_profile_github(
+                        cfg,
+                        lambda pid=profile_id: self.delete_profile_completely(pid),
+                    )
+                return
+
+            if not has_admin:
+                self._set_operation_progress(profile_id, "完全删除：当前账号没有仓库 Admin 权限", 5.0, True)
+                self._set_card(profile_id, "run", "完全删除：GitHub 账号无 Admin 权限")
+                if independent and locked:
+                    messagebox.showerror(
+                        APP_NAME,
+                        (
+                            f"这台手机已锁定独立 GitHub @{account}。\n"
+                            f"该账号对仓库 {cfg.repo} 没有 Admin 权限，所以 GitHub 不允许删除仓库。\n\n"
+                            "请先在 GitHub 中让这个独立账号获得该仓库的 Admin 权限，然后再点“完全删除”。\n"
+                            "程序不会偷偷改用全局 GitHub 账号删除。"
+                        ),
+                        parent=self.root,
+                    )
+                    return
+
+                retry = messagebox.askyesno(
+                    APP_NAME,
+                    (
+                        f"当前 {auth_mode} @{account} 对仓库 {cfg.repo} 没有 Admin 权限。\n\n"
+                        "GitHub 只有仓库管理员才能永久删除仓库。\n"
+                        "是否立即重新授权/切换到有 Admin 权限的 GitHub 账号？"
+                    ),
+                    parent=self.root,
+                )
+                if retry:
+                    self._reauthorize_profile_github(
+                        cfg,
+                        lambda pid=profile_id: self.delete_profile_completely(pid),
+                        force_new_account=not independent,
+                    )
+                return
+
+            self._set_operation_progress(profile_id, "完全删除 10% · GitHub 权限检查通过", 10.0, True)
+            start_delete(result)
+
+        def failed_preflight(err: str) -> None:
+            self._set_operation_progress(profile_id, f"完全删除权限检查失败 · {err}", 100.0, True)
+            self._set_card(profile_id, "run", f"完全删除权限检查失败：{err}")
             messagebox.showerror(
                 APP_NAME,
-                "GitHub 仓库没有删除成功，因此本地手机配置和凭据仍保留。\n\n" + err,
+                "无法确认 GitHub 仓库删除权限，本地手机配置没有改动。\n\n" + err,
                 parent=self.root,
             )
 
-        self.bg(f"{cfg.phone_name} 完全删除", work, done, failed)
+        self.bg(f"{cfg.phone_name} 完全删除权限检查", work_preflight, done_preflight, failed_preflight)
 
     # ------------------------- monitoring -------------------------
     def refresh_profile(self, profile_id: str, quiet: bool = False) -> None:
@@ -4937,12 +5302,28 @@ class CloudPhoneGUI:
                 and same_run
                 and now - float(self._last_push_health.get(profile_id, 0.0)) >= 60
             )
+
+            def set_push_offline(detail: str) -> None:
+                if not push_due:
+                    return
+                result["push_health"] = {
+                    "ok": False,
+                    "countable": False,
+                    "adb": False,
+                    "status": "ADB_OFFLINE",
+                    "issue_kind": "",
+                    "streak_before": 0,
+                    "detail": detail,
+                }
+                result["push_checked_ts"] = now
+
             ip, host = self.tools.discover_phone(cfg.phone_id, rid, cfg.phone_name)
             result["ip"] = ip
             result["host"] = host
             if not ip:
                 if health_due:
                     result["local_health"] = {"ok": False, "adb": False, "issues": ["ADB 地址不可用"]}
+                set_push_offline("ADB device missing: Tailscale/ADB 地址不可用")
                 return result
 
             result["runner"] = self.tools.runner_status(ip)  # display only, never part of health verdict
@@ -4950,6 +5331,7 @@ class CloudPhoneGUI:
             if not self.tools.port_open(ip, 5555, 1.2):
                 if health_due:
                     result["local_health"] = {"ok": False, "adb": False, "issues": ["ADB 连接失败"]}
+                set_push_offline("ADB_OFFLINE: TCP/5555 不可达")
                 return result
 
             basic = self.tools.device_health(address, cfg.package_name)
@@ -4961,6 +5343,7 @@ class CloudPhoneGUI:
             if not ready:
                 if health_due and bool(self._health_online.get(profile_id, False)):
                     result["local_health"] = {"ok": False, "adb": False, "issues": ["ADB 未就绪"]}
+                set_push_offline("ADB_OFFLINE: device 未就绪")
                 return result
 
             bootstrap_key = f"{rid}:{address}"
@@ -4988,24 +5371,38 @@ class CloudPhoneGUI:
                     result["health_recovery"] = self.tools.bicoin_health_recover(address)
                     result["local_health"] = self.tools.bicoin_health_check(address, cfg.health_packages)
 
-            # BiCoin push liveness is checked independently every minute. A failed
-            # ADB invocation itself is not counted as a push failure. Only two
-            # consecutive valid probe results that are not BICOIN_PUSH_OK trigger
-            # the BiCoin-only restart path.
+            # BiCoin Push watchdog remains a dedicated 60-second probe. The real Fly/MobPush
+            # MCL reader thread is mlp-worker; TCP states are diagnostics only. Main-process
+            # death recovers immediately, while watch/mlp faults require two consecutive
+            # same-kind valid probes. ADB_OFFLINE and startup grace never trigger restart.
             if push_due and not need_bootstrap and not result["health_recovery"]:
-                push = self.tools.bicoin_push_health_check(address)
+                streak_before = int(self._push_health_fail_count.get(profile_id, 0))
+                previous_kind = str(self._push_health_fail_kind.get(profile_id, ""))
+                startup_grace = now < float(self._push_health_grace_until.get(profile_id, 0.0))
+                push = self.tools.bicoin_push_health_check(
+                    address,
+                    streak_before=streak_before,
+                    previous_kind=previous_kind,
+                    startup_grace=startup_grace,
+                )
                 result["push_health"] = push
                 result["push_checked_ts"] = now
-                streak_before = int(self._push_health_fail_count.get(profile_id, 0))
-                result["push_streak_before"] = streak_before
-                if bool(push.get("countable", False)) and not bool(push.get("ok", False)):
-                    if streak_before + 1 >= 2:
-                        result["pre_push_health"] = push
-                        result["push_recovery"] = self.tools.bicoin_push_recover(address)
-                        # Start the 60-second cooldown only after the restart has
-                        # completed and HOME has been sent. No immediate recheck.
-                        result["push_health"] = {}
-                        result["push_checked_ts"] = time.time()
+                effective_streak = int(push.get("streak_before") or 0)
+                result["push_streak_before"] = effective_streak
+
+                immediate = bool(push.get("immediate_recovery", False))
+                should_recover = immediate or (
+                    bool(push.get("countable", False))
+                    and not bool(push.get("ok", False))
+                    and effective_streak + 1 >= 2
+                )
+                if should_recover:
+                    result["pre_push_health"] = push
+                    result["push_recovery"] = self.tools.bicoin_push_recover(address)
+                    # Restart completion starts a 90-second grace window. Do not perform
+                    # an immediate post-restart mlp-worker check.
+                    result["push_health"] = {}
+                    result["push_checked_ts"] = time.time()
             return result
 
         def done(result: dict[str, Any]) -> None:
@@ -5015,6 +5412,8 @@ class CloudPhoneGUI:
                 self._health_online[profile_id] = False
                 self._last_push_health.pop(profile_id, None)
                 self._push_health_fail_count[profile_id] = 0
+                self._push_health_fail_kind.pop(profile_id, None)
+                self._push_health_grace_until.pop(profile_id, None)
                 cfg.last_run_id = 0
                 cfg.last_run_status = "-"
                 cfg.last_device = ""
@@ -5039,8 +5438,11 @@ class CloudPhoneGUI:
                 cfg.health_last_status = "启动中" if status in ("queued", "in_progress") else "未检测"
                 cfg.health_last_reason = ""
                 self._last_health.pop(profile_id, None)
-                self._last_push_health[profile_id] = time.time()
+                now_grace = time.time()
+                self._last_push_health[profile_id] = now_grace
                 self._push_health_fail_count[profile_id] = 0
+                self._push_health_fail_kind.pop(profile_id, None)
+                self._push_health_grace_until[profile_id] = now_grace + 90.0
                 self._health_online[profile_id] = False
                 self._health_bootstrap_done.pop(profile_id, None)
             cfg.last_run_id = rid
@@ -5061,6 +5463,7 @@ class CloudPhoneGUI:
             self._health_online[profile_id] = adb_online
             if not adb_online:
                 self._push_health_fail_count[profile_id] = 0
+                self._push_health_fail_kind.pop(profile_id, None)
 
             if ip:
                 cfg.last_device = f"{ip}:5555"
@@ -5137,8 +5540,11 @@ class CloudPhoneGUI:
             if bootstrap_key:
                 # One initialization attempt per ADB-online generation.
                 self._health_bootstrap_done[profile_id] = bootstrap_key
-                self._last_push_health[profile_id] = time.time()
+                bootstrap_now = time.time()
+                self._last_push_health[profile_id] = bootstrap_now
                 self._push_health_fail_count[profile_id] = 0
+                self._push_health_fail_kind.pop(profile_id, None)
+                self._push_health_grace_until[profile_id] = bootstrap_now + 90.0
                 try:
                     self._append_health_log(cfg, "bootstrap", bootstrap)
                 except Exception as exc:
@@ -5153,8 +5559,11 @@ class CloudPhoneGUI:
                     self.log(f"{cfg.phone_name} · 上线初始化完成")
 
             if pre_recovery_health:
-                self._last_push_health[profile_id] = time.time()
+                recovery_now = time.time()
+                self._last_push_health[profile_id] = recovery_now
                 self._push_health_fail_count[profile_id] = 0
+                self._push_health_fail_kind.pop(profile_id, None)
+                self._push_health_grace_until[profile_id] = recovery_now + 90.0
                 try:
                     self._append_health_log(cfg, "check", pre_recovery_health)
                     self._append_health_log(cfg, "recovery", health_recovery)
@@ -5175,41 +5584,86 @@ class CloudPhoneGUI:
                 self._last_push_health[profile_id] = push_checked_ts
                 if pre_push_health:
                     self._push_health_fail_count[profile_id] = 0
+                    self._push_health_fail_kind.pop(profile_id, None)
                     pre_status = str(pre_push_health.get("status") or "UNKNOWN")
+                    immediate = bool(pre_push_health.get("immediate_recovery", False))
+                    threshold = 1 if immediate else 2
+                    trigger_streak = 1 if immediate else 2
+                    restarted = bool(push_recovery.get("restarted", False))
+                    if restarted:
+                        self._push_health_grace_until[profile_id] = push_checked_ts + 90.0
+
+                    final_status = (
+                        "BICOIN_RECOVERED · 90秒 grace"
+                        if bool(push_recovery.get("ok", False))
+                        else "BICOIN_RESTARTING · 恢复部分失败"
+                    )
                     try:
                         self._append_health_log(
                             cfg,
                             "push_check",
-                            {**pre_push_health, "streak": 2, "threshold": 2},
+                            {**pre_push_health, "streak": trigger_streak, "threshold": threshold},
+                        )
+                        self._append_health_log(
+                            cfg,
+                            "push_check",
+                            {
+                                "status": "BICOIN_RESTARTING",
+                                "streak": trigger_streak,
+                                "threshold": threshold,
+                                "detail": f"trigger={pre_status}; force-stop + monkey full launch",
+                            },
                         )
                         self._append_health_log(
                             cfg,
                             "push_recovery",
-                            {**push_recovery, "trigger": pre_status, "final_status": "等待60秒复检"},
+                            {**push_recovery, "trigger": pre_status, "final_status": final_status},
                         )
+                        if bool(push_recovery.get("ok", False)):
+                            self._append_health_log(
+                                cfg,
+                                "push_check",
+                                {
+                                    "status": "BICOIN_RECOVERED",
+                                    "streak": 0,
+                                    "threshold": 2,
+                                    "detail": "force-stop + monkey + wait 8s + HOME; startup grace=90s",
+                                },
+                            )
                     except Exception as exc:
                         self.log(f"{cfg.phone_name}: Push 健康日志写入失败 · {exc}")
+
                     recovery_errors = [str(item) for item in (push_recovery.get("errors") or []) if str(item).strip()]
+                    trigger_text = (
+                        f"主进程死亡（{pre_status}）"
+                        if immediate
+                        else f"连续 2 次异常（{pre_status}）"
+                    )
                     if recovery_errors:
+                        suffix = " · 已进入 90 秒 grace" if restarted else ""
                         self.log(
-                            f"{cfg.phone_name} · BiCoin Push 连续 2 次异常（{pre_status}），"
-                            f"自动重启 BiCoin 部分失败 · {'；'.join(recovery_errors)} · 60 秒后再检查"
+                            f"{cfg.phone_name} · BiCoin Push {trigger_text}，完整恢复部分失败 · "
+                            f"{'；'.join(recovery_errors)}{suffix}"
                         )
                     else:
                         self.log(
-                            f"{cfg.phone_name} · BiCoin Push 连续 2 次异常（{pre_status}），"
-                            "已自动重启 BiCoin → HOME · 等待 60 秒后再检查"
+                            f"{cfg.phone_name} · BiCoin Push {trigger_text}，"
+                            "已 force-stop → 2秒 → monkey 完整启动 → 8秒 → HOME · 进入 90 秒 grace"
                         )
                 elif push_health:
-                    if not bool(push_health.get("countable", False)):
+                    if not bool(push_health.get("countable", False)) or bool(push_health.get("ok", False)):
                         streak = 0
                         self._push_health_fail_count[profile_id] = 0
-                    elif bool(push_health.get("ok", False)):
-                        streak = 0
-                        self._push_health_fail_count[profile_id] = 0
+                        self._push_health_fail_kind.pop(profile_id, None)
                     else:
-                        streak = min(2, push_streak_before + 1)
+                        effective_before = int(push_health.get("streak_before") or push_streak_before)
+                        streak = min(2, effective_before + 1)
                         self._push_health_fail_count[profile_id] = streak
+                        issue_kind = str(push_health.get("issue_kind") or "")
+                        if issue_kind:
+                            self._push_health_fail_kind[profile_id] = issue_kind
+                        else:
+                            self._push_health_fail_kind.pop(profile_id, None)
                     try:
                         self._append_health_log(
                             cfg,
@@ -5705,13 +6159,15 @@ class CloudPhoneGUI:
                 "• 仅当预设 App 主进程不存在时启动 BiCoin / Monitor\n"
                 "• 最后回 HOME，不 force-stop、不划掉后台\n\n"
                 "每 1 分钟 BiCoin Push 检查:\n"
-                "• 主进程 com.temperaturecoin 必须存在\n"
-                "• :watch 进程必须存在\n"
-                "• M-PL-MP-PUSH_SD 线程必须存在\n"
-                "• Push TCP socket 必须为 ESTABLISHED\n"
-                "• 连续 2 次不是 BICOIN_PUSH_OK 才重启 BiCoin\n"
-                "• 重启顺序: am kill BiCoin → 等 2 秒 → 启动 WelcomActivity → 等 3 秒 → HOME\n"
-                "• ADB 自身检查失败不计入这 2 次；重启完成回 HOME 后等待 60 秒再做下一次 Push 检查\n\n"
+                "• ADB 必须为 device；ADB_OFFLINE 只记录，不重启 BiCoin\n"
+                "• 主进程 com.temperaturecoin、:watch 进程必须存在\n"
+                "• 主进程线程中真正的 Fly/MobPush MCL TCP 读线程 mlp-worker 必须存在\n"
+                "• 动态读取 BiCoin UID 及 /proc/net/tcp + tcp6；TCP 状态和 CLOSE_WAIT 只做诊断，不作为单独健康结论\n"
+                "• 不固定 Push IP/端口，也不再用 ESTABLISHED/keepalive 判断 BICOIN_PUSH_OK\n"
+                "• 主进程死亡 BICOIN_MAIN_DEAD 可立即完整恢复；watch/mlp 异常采用连续 2 次保守确认\n"
+                "• mlp-worker 第一次缺失=MISSING_1，连续第二次=MISSING_2；伴随 CLOSE_WAIT 记录 MCL_SUSPECTED_DEAD，但仍需连续 2 次\n"
+                "• Watchdog 启动、ADB 重新上线或 BiCoin 重启后进入 90 秒 BICOIN_STARTUP_GRACE，grace 内不因 mlp-worker 暂未创建而重启\n"
+                "• Push 恢复顺序: force-stop BiCoin → 等 2 秒 → monkey 完整启动 → 等 8 秒 → HOME\n\n"
                 "每 5 分钟健康检查:\n"
                 "• ADB get-state 必须是 device\n"
                 "• 预设 + 自定义 App 主进程必须存在\n"
@@ -5743,9 +6199,13 @@ class CloudPhoneGUI:
             self._last_health.pop(cfg.profile_id, None)
             self._last_push_health.pop(cfg.profile_id, None)
             self._push_health_fail_count[cfg.profile_id] = 0
+            self._push_health_fail_kind.pop(cfg.profile_id, None)
             if cfg.health_monitor_enabled:
+                self._push_health_grace_until[cfg.profile_id] = time.time() + 90.0
                 self._health_bootstrap_done.pop(cfg.profile_id, None)
                 self._health_online[cfg.profile_id] = False
+            else:
+                self._push_health_grace_until.pop(cfg.profile_id, None)
             self.store.upsert(cfg)
             extra = f" + {len(custom)}个自定义App" if custom else ""
             v_health_status.set(f"已保存 · 2个预设{extra} · Push每1分钟 / 综合每5分钟")
