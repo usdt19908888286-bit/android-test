@@ -92,7 +92,7 @@ jobs:
             -camera-back none
             -camera-front none
           script: |
-            set -euo pipefail
+            set -eu
 
             echo 'FRESH_DIRECT_AVD_BOOT_WAIT'
             adb wait-for-device
