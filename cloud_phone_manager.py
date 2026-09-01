@@ -1493,8 +1493,22 @@ class CloudPhoneGUI:
         head = ttk.Frame(card)
         head.pack(fill="x")
         ttk.Label(head, textvariable=vars_["run"], font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Button(head, text="⚙", width=3, command=lambda pid=cfg.profile_id: self.open_settings(pid)).pack(side="right")
-        ttk.Button(head, text="↻", width=3, command=lambda pid=cfg.profile_id: self.refresh_profile(pid)).pack(side="right", padx=(0, 4))
+        ttk.Button(
+            head,
+            text="⚡ 自动化",
+            command=lambda pid=cfg.profile_id: self.open_adb_tasks(pid),
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            head,
+            text="⚙ 普通设置",
+            command=lambda pid=cfg.profile_id: self.open_settings(pid),
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            head,
+            text="↻",
+            width=3,
+            command=lambda pid=cfg.profile_id: self.refresh_profile(pid),
+        ).pack(side="right", padx=(0, 2))
 
         progress = ttk.Frame(card)
         progress.columnconfigure(0, weight=1)
@@ -1523,53 +1537,15 @@ class CloudPhoneGUI:
         status_item(2, "当前 App", vars_["app"])
         status_item(3, "资源", vars_["server"])
 
-        primary = ttk.Frame(card)
-        primary.pack(fill="x", pady=(3, 0))
-        ttk.Button(primary, text="▶ 启动", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=(0, 5))
-        ttk.Button(primary, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(primary, text="备份", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(primary, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(primary, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(primary, text="停止", command=lambda pid=cfg.profile_id: self.cancel_profile(pid)).pack(side="left", padx=5)
-
-        details = ttk.Frame(card)
-        details_visible = tk.BooleanVar(value=False)
-        more_text = tk.StringVar(value="更多 ▾")
-
-        def toggle_details() -> None:
-            if details_visible.get():
-                details.pack_forget()
-                details_visible.set(False)
-                more_text.set("更多 ▾")
-            else:
-                details.pack(fill="x", pady=(9, 0))
-                details_visible.set(True)
-                more_text.set("收起 ▴")
-
-        ttk.Button(primary, textvariable=more_text, command=toggle_details).pack(side="right")
-
-        ttk.Separator(details, orient="horizontal").pack(fill="x", pady=(0, 8))
-        meta = ttk.Frame(details)
-        meta.pack(fill="x")
-        meta.columnconfigure(0, weight=2)
-        meta.columnconfigure(1, weight=2)
-
-        def detail_item(col: int, title: str, variable: tk.StringVar) -> None:
-            box = ttk.Frame(meta, padding=(5, 2))
-            box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0))
-            ttk.Label(box, text=title, font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            ttk.Label(box, textvariable=variable, justify="left", wraplength=500).pack(anchor="w", pady=(2, 0))
-
-        detail_item(0, "仓库", vars_["repo"])
-        detail_item(1, "自动换机", vars_["rotation"])
-
-        secondary = ttk.Frame(details)
-        secondary.pack(fill="x", pady=(8, 0))
-        ttk.Button(secondary, text="恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=(0, 5))
-        ttk.Button(secondary, text="立即换机", command=lambda pid=cfg.profile_id: self.rotate_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(secondary, text="APK 安装命令", command=lambda pid=cfg.profile_id: self.apk_command_profile(pid)).pack(side="left", padx=5)
-        ttk.Button(secondary, text="ADB 任务", command=lambda pid=cfg.profile_id: self.open_adb_tasks(pid)).pack(side="left", padx=5)
-        ttk.Button(secondary, text="刷新状态", command=lambda pid=cfg.profile_id: self.refresh_profile(pid)).pack(side="right", padx=(5, 0))
+        actions = ttk.Frame(card)
+        actions.pack(fill="x", pady=(3, 0))
+        ttk.Button(actions, text="▶ 启动新机", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=(0, 5))
+        ttk.Button(actions, text="↺ 恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="备份", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(actions, text="停止", command=lambda pid=cfg.profile_id: self.cancel_profile(pid)).pack(side="right", padx=(5, 0))
 
     def _initial_run_text(self, cfg: AppConfig) -> str:
         if cfg.last_run_id:
@@ -2014,7 +1990,7 @@ class CloudPhoneGUI:
             draft = AppConfig(repo=base_repo, phone_name=f"BICOIN-{len(self.store.profiles)+1:03d}", phone_id=f"{len(self.store.profiles)+1:03d}")
 
         win = tk.Toplevel(self.root)
-        win.title("手机设置" if original else "添加手机")
+        win.title("普通设置" if original else "添加手机")
         win.geometry("880x760")
         win.minsize(780, 620)
         win.transient(self.root)
@@ -2379,7 +2355,7 @@ class CloudPhoneGUI:
         ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         rotation = ttk.LabelFrame(body, text="定时自动换机", padding=10)
-        rotation.pack(fill="x", pady=(10, 0))
+        # 自动换机已经统一迁移到“自动化”入口；普通设置保留变量以兼容旧配置，但不再重复显示。
         rotation.columnconfigure(0, weight=1)
         ttk.Checkbutton(rotation, text="启用定时自动换机", variable=v_rotate).grid(row=0, column=0, sticky="w")
 
@@ -2506,34 +2482,18 @@ class CloudPhoneGUI:
                 if not re.fullmatch(r"[A-Za-z0-9._+() -]+", model):
                     raise ValueError("Build.MODEL 含不支持的字符")
 
-            clean_rules: list[str] = []
-            for raw_rule in rotation_rules:
-                rule = str(raw_rule).strip().lower()
-                if re.fullmatch(r"time:(?:[01]\d|2[0-3]):[0-5]\d", rule):
-                    if rule not in clean_rules:
-                        clean_rules.append(rule)
-                    continue
-                match = re.fullmatch(r"hours:(\d{1,3})", rule)
-                if match and 1 <= int(match.group(1)) <= 168:
-                    normalized = f"hours:{int(match.group(1))}"
-                    if normalized not in clean_rules:
-                        clean_rules.append(normalized)
-                    continue
-                raise ValueError(f"无效换机规则: {raw_rule}")
-            if bool(v_rotate.get()) and not clean_rules:
-                raise ValueError("启用自动换机时至少添加一条换机规则")
+            # 自动化配置由“自动化”窗口独立维护。普通设置保存时读取最新值并原样保留，
+            # 防止两个窗口同时打开时把刚修改的换机规则覆盖回旧状态。
+            live_automation = self.store.get(draft.profile_id) if original else None
+            automation_source = live_automation or draft
 
             for other in self.store.profiles:
                 if other.profile_id != draft.profile_id and other.repo.lower() == repo.lower() and other.phone_id == phone_id:
                     raise ValueError(f"同一个仓库内 Phone ID {phone_id} 已经存在")
 
             identity_changed = (draft.repo.lower(), draft.phone_id) != (repo.lower(), phone_id)
-            if identity_changed and draft.rotation_phase:
+            if identity_changed and automation_source.rotation_phase:
                 raise ValueError("当前正在自动换机，完成后再修改仓库或 Phone ID")
-            schedule_changed = (
-                draft.auto_rotate != bool(v_rotate.get())
-                or list(draft.rotate_rules or []) != clean_rules
-            )
 
             draft.repo = repo
             draft.branch = branch
@@ -2559,18 +2519,17 @@ class CloudPhoneGUI:
                 draft.refresh_seconds = max(3, int(v_interval.get()))
             except Exception:
                 draft.refresh_seconds = 8
-            draft.auto_rotate = bool(v_rotate.get())
-            draft.rotate_rules = clean_rules
-            # Keep old fields in sync so older configuration files/versions can still read the first rule.
-            if clean_rules:
-                first_rule = clean_rules[0]
-                if first_rule.startswith("time:"):
-                    draft.rotate_mode = "daily"
-                    draft.rotate_daily_time = first_rule.split(":", 1)[1]
-                else:
-                    draft.rotate_mode = "interval"
-                    match = re.fullmatch(r"hours:(\d{1,3})", first_rule)
-                    draft.rotate_interval_hours = int(match.group(1)) if match else 4
+            draft.auto_rotate = bool(automation_source.auto_rotate)
+            draft.rotate_rules = list(automation_source.rotate_rules or [])
+            draft.rotate_mode = automation_source.rotate_mode
+            draft.rotate_daily_time = automation_source.rotate_daily_time
+            draft.rotate_interval_hours = automation_source.rotate_interval_hours
+            draft.rotate_next_ts = automation_source.rotate_next_ts
+            draft.rotate_last_ts = automation_source.rotate_last_ts
+            draft.rotation_phase = automation_source.rotation_phase
+            draft.rotation_run_id = automation_source.rotation_run_id
+            draft.rotation_started_ts = automation_source.rotation_started_ts
+            draft.rotation_last_error = automation_source.rotation_last_error
             draft.package_history = [package] + [x for x in draft.package_history if x != package]
             draft.package_history = draft.package_history[:40]
 
@@ -2586,10 +2545,6 @@ class CloudPhoneGUI:
                 draft.rotate_last_ts = 0.0
                 draft.rotate_next_ts = 0.0
 
-            if not draft.auto_rotate:
-                draft.rotate_next_ts = 0.0
-            elif schedule_changed or not draft.rotate_next_ts or draft.rotate_next_ts <= time.time():
-                draft.rotate_next_ts = self._next_rotation_ts(draft)
             return draft
 
         def check_repo() -> None:
@@ -3366,24 +3321,183 @@ class CloudPhoneGUI:
             return
 
         dlg = tk.Toplevel(self.root)
-        dlg.title(f"ADB 自动任务 · {cfg.phone_name}")
-        dlg.geometry("940x620")
-        dlg.minsize(820, 520)
+        dlg.title(f"自动化 · {cfg.phone_name}")
+        dlg.geometry("1020x760")
+        dlg.minsize(900, 650)
         dlg.transient(self.root)
 
         outer = ttk.Frame(dlg, padding=14)
         outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=2)
-        outer.columnconfigure(1, weight=3)
-        outer.rowconfigure(1, weight=1)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
 
         ttk.Label(
             outer,
-            text="支持立即执行、每次新云机启动后、每天固定时间、每 N 小时。{device} 自动替换当前 ADB 地址，{package} 自动替换当前选择的 App 包名。启动任务严格按列表从上到下串行执行。",
-            wraplength=880,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            text="自动化只管理两类规则：自动换机，以及 ADB 自动任务。普通手机参数请到“普通设置”。",
+            wraplength=960,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
-        left = ttk.LabelFrame(outer, text="任务列表", padding=8)
+        # ------------------------- 自动换机 -------------------------
+        rotation = ttk.LabelFrame(outer, text="自动换机", padding=10)
+        rotation.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        rotation.columnconfigure(0, weight=1)
+
+        v_rotate = tk.BooleanVar(value=cfg.auto_rotate)
+        rotation_rules = list(cfg.rotate_rules or [])
+        v_rule_type = tk.StringVar(value="每天时间点")
+        v_rule_value = tk.StringVar(value="04:00")
+        v_rotate_status = tk.StringVar(value=self._rotation_text(cfg))
+
+        top_rotate = ttk.Frame(rotation)
+        top_rotate.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(top_rotate, text="启用定时自动换机", variable=v_rotate).pack(side="left")
+        ttk.Label(top_rotate, textvariable=v_rotate_status).pack(side="left", padx=(16, 0))
+        ttk.Button(
+            top_rotate,
+            text="立即换机",
+            command=lambda pid=profile_id: self.rotate_profile(pid),
+        ).pack(side="right")
+
+        rules_row = ttk.Frame(rotation)
+        rules_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        rules_row.columnconfigure(0, weight=1)
+        rules_list = tk.Listbox(rules_row, height=3, exportselection=False)
+        rules_list.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
+
+        edit_rule = ttk.Frame(rules_row)
+        edit_rule.grid(row=0, column=1, sticky="nw")
+        type_combo = ttk.Combobox(
+            edit_rule,
+            textvariable=v_rule_type,
+            values=["每天时间点", "每 N 小时"],
+            state="readonly",
+            width=13,
+        )
+        type_combo.pack(side="left")
+        ttk.Entry(edit_rule, textvariable=v_rule_value, width=10).pack(side="left", padx=(6, 0))
+        ttk.Button(edit_rule, text="＋ 添加", command=lambda: add_rotation_rule()).pack(side="left", padx=(6, 0))
+        ttk.Button(edit_rule, text="删除选中", command=lambda: remove_rotation_rule()).pack(side="left", padx=(6, 0))
+
+        rotate_actions = ttk.Frame(rules_row)
+        rotate_actions.grid(row=1, column=1, sticky="ne", pady=(8, 0))
+        ttk.Button(rotate_actions, text="保存自动换机", command=lambda: save_rotation()).pack(side="right")
+
+        def rotation_rule_label(rule: str) -> str:
+            if rule.startswith("time:"):
+                return f"每天 {rule.split(':', 1)[1]}"
+            match = re.fullmatch(r"hours:(\d{1,3})", rule)
+            return f"每 {int(match.group(1))} 小时" if match else rule
+
+        def render_rotation_rules() -> None:
+            rules_list.delete(0, "end")
+            for item in rotation_rules:
+                rules_list.insert("end", rotation_rule_label(item))
+            preview = AppConfig.from_dict(cfg.to_dict())
+            preview.auto_rotate = bool(v_rotate.get())
+            preview.rotate_rules = list(rotation_rules)
+            preview.rotate_next_ts = (
+                self._next_rotation_ts(preview)
+                if preview.auto_rotate and preview.rotate_rules
+                else 0.0
+            )
+            v_rotate_status.set(self._rotation_text(preview))
+
+        def rotation_type_changed(_event=None) -> None:
+            v_rule_value.set("04:00" if v_rule_type.get() == "每天时间点" else "4")
+
+        def add_rotation_rule() -> None:
+            value = v_rule_value.get().strip()
+            if v_rule_type.get() == "每天时间点":
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                    messagebox.showerror(APP_NAME, "时间格式必须是 HH:MM，例如 04:30", parent=dlg)
+                    return
+                rule = f"time:{value}"
+            else:
+                try:
+                    hours = int(value)
+                except Exception:
+                    messagebox.showerror(APP_NAME, "间隔小时必须是 1 到 168 的整数", parent=dlg)
+                    return
+                if not 1 <= hours <= 168:
+                    messagebox.showerror(APP_NAME, "间隔小时必须是 1 到 168", parent=dlg)
+                    return
+                rule = f"hours:{hours}"
+            if rule not in rotation_rules:
+                rotation_rules.append(rule)
+            render_rotation_rules()
+
+        def remove_rotation_rule() -> None:
+            selected = rules_list.curselection()
+            if not selected:
+                return
+            rotation_rules.pop(int(selected[0]))
+            render_rotation_rules()
+
+        def normalized_rotation_rules() -> list[str]:
+            clean: list[str] = []
+            for raw in rotation_rules:
+                rule = str(raw).strip().lower()
+                if re.fullmatch(r"time:(?:[01]\d|2[0-3]):[0-5]\d", rule):
+                    if rule not in clean:
+                        clean.append(rule)
+                    continue
+                match = re.fullmatch(r"hours:(\d{1,3})", rule)
+                if match and 1 <= int(match.group(1)) <= 168:
+                    normalized = f"hours:{int(match.group(1))}"
+                    if normalized not in clean:
+                        clean.append(normalized)
+                    continue
+                raise ValueError(f"无效换机规则: {raw}")
+            return clean
+
+        def save_rotation() -> None:
+            try:
+                clean = normalized_rotation_rules()
+                enabled = bool(v_rotate.get())
+                if enabled and not clean:
+                    raise ValueError("启用自动换机时至少添加一条规则")
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=dlg)
+                return
+
+            changed = cfg.auto_rotate != enabled or list(cfg.rotate_rules or []) != clean
+            cfg.auto_rotate = enabled
+            cfg.rotate_rules = clean
+            if clean:
+                first = clean[0]
+                if first.startswith("time:"):
+                    cfg.rotate_mode = "daily"
+                    cfg.rotate_daily_time = first.split(":", 1)[1]
+                else:
+                    cfg.rotate_mode = "interval"
+                    match = re.fullmatch(r"hours:(\d{1,3})", first)
+                    cfg.rotate_interval_hours = int(match.group(1)) if match else 4
+            if not enabled:
+                cfg.rotate_next_ts = 0.0
+            elif changed or not cfg.rotate_next_ts or cfg.rotate_next_ts <= time.time():
+                cfg.rotate_next_ts = self._next_rotation_ts(cfg)
+            self.store.upsert(cfg)
+            self._set_card(profile_id, "rotation", self._rotation_text(cfg))
+            v_rotate_status.set(self._rotation_text(cfg))
+            self.log(f"{cfg.phone_name}: 自动换机设置已保存")
+
+        type_combo.bind("<<ComboboxSelected>>", rotation_type_changed)
+        render_rotation_rules()
+
+        # ------------------------- ADB 自动任务 -------------------------
+        adb_box = ttk.LabelFrame(outer, text="ADB 自动任务", padding=10)
+        adb_box.grid(row=2, column=0, sticky="nsew")
+        adb_box.columnconfigure(0, weight=2)
+        adb_box.columnconfigure(1, weight=3)
+        adb_box.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            adb_box,
+            text="支持每次云机启动后、每天固定时间、每 N 小时。{device} 自动替换当前 ADB 地址，{package} 自动替换当前选择的 App 包名。启动任务按列表顺序串行执行。",
+            wraplength=940,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        left = ttk.Frame(adb_box)
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
@@ -3393,7 +3507,7 @@ class CloudPhoneGUI:
         task_scroll.grid(row=0, column=1, sticky="ns")
         task_list.configure(yscrollcommand=task_scroll.set)
 
-        right = ttk.LabelFrame(outer, text="任务设置", padding=10)
+        right = ttk.Frame(adb_box)
         right.grid(row=1, column=1, sticky="nsew")
         right.columnconfigure(1, weight=1)
 
@@ -3407,12 +3521,11 @@ class CloudPhoneGUI:
         ttk.Label(right, text="任务名").grid(row=0, column=0, sticky="w")
         ttk.Entry(right, textvariable=v_name).grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Label(right, text="ADB 命令").grid(row=1, column=0, sticky="nw", pady=(10, 0))
-        command_entry = ttk.Entry(right, textvariable=v_command)
-        command_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(10, 0))
+        ttk.Entry(right, textvariable=v_command).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(10, 0))
         ttk.Label(
             right,
             text="示例：adb -s {device} shell dumpsys deviceidle whitelist +{package}",
-            wraplength=500,
+            wraplength=520,
         ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
         ttk.Label(right, text="触发方式").grid(row=3, column=0, sticky="w", pady=(12, 0))
         trigger_combo = ttk.Combobox(
@@ -3423,10 +3536,9 @@ class CloudPhoneGUI:
         )
         trigger_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(12, 0))
         ttk.Label(right, text="时间 / 小时").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        value_entry = ttk.Entry(right, textvariable=v_value)
-        value_entry.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Entry(right, textvariable=v_value).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
         ttk.Checkbutton(right, text="启用自动执行", variable=v_enabled).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(right, textvariable=v_status, wraplength=500).grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        ttk.Label(right, textvariable=v_status, wraplength=520).grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
         tasks = cfg.adb_tasks
 
@@ -3504,10 +3616,7 @@ class CloudPhoneGUI:
             task["trigger"] = trigger
             task["value"] = value
             task["enabled"] = bool(v_enabled.get())
-            if trigger in ("daily", "interval"):
-                task["next_ts"] = self._adb_task_next_ts(task)
-            else:
-                task["next_ts"] = 0.0
+            task["next_ts"] = self._adb_task_next_ts(task) if trigger in ("daily", "interval") else 0.0
             self.store.upsert(cfg)
             render_tasks(str(task.get("id")))
             v_status.set("任务已保存")
@@ -3563,13 +3672,16 @@ class CloudPhoneGUI:
         task_list.bind("<<ListboxSelect>>", load_selected)
         trigger_combo.bind("<<ComboboxSelected>>", trigger_changed)
 
-        bottom = ttk.Frame(outer)
-        bottom.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        bottom = ttk.Frame(adb_box)
+        bottom.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Button(bottom, text="＋ 新增任务", command=add_task).pack(side="left")
         ttk.Button(bottom, text="删除选中", command=delete_task).pack(side="left", padx=6)
         ttk.Button(bottom, text="保存任务", command=save_current).pack(side="right", padx=(6, 0))
         ttk.Button(bottom, text="立即执行", command=run_now).pack(side="right")
-        ttk.Button(bottom, text="关闭", command=dlg.destroy).pack(side="right", padx=6)
+
+        close_row = ttk.Frame(outer)
+        close_row.grid(row=3, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(close_row, text="关闭", command=dlg.destroy).pack(side="right")
 
         render_tasks()
         if not tasks:
