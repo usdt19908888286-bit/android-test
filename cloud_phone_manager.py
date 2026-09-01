@@ -732,6 +732,15 @@ class LocalTools:
         return ""
 
     def _find_adb(self) -> str:
+        local_appdata = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        app_dir = Path(__file__).resolve().parent
+        preferred = [
+            app_dir / "platform-tools" / "adb.exe",
+            local_appdata / "CloudAndroidManager" / "platform-tools" / "adb.exe",
+        ]
+        for item in preferred:
+            if item.is_file():
+                return str(item)
         return self._which_or_glob(
             "adb",
             [
@@ -740,6 +749,63 @@ class LocalTools:
                 r"%USERPROFILE%\AppData\Local\Microsoft\WinGet\Packages\Genymobile.scrcpy_*\**\adb.exe",
             ],
         )
+
+    @staticmethod
+    def _managed_adb_path() -> Path:
+        local_appdata = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        return local_appdata / "CloudAndroidManager" / "platform-tools" / "adb.exe"
+
+    def ensure_managed_adb(self) -> tuple[bool, str]:
+        """Prepare a program-owned Google Platform Tools copy under LocalAppData."""
+        if os.name != "nt":
+            self.adb = self._find_adb()
+            return (bool(self.adb), self.adb or "当前系统未找到 adb")
+
+        target = self._managed_adb_path()
+        if target.is_file():
+            self.adb = str(target)
+            return True, str(target)
+
+        base = target.parent.parent
+        base.mkdir(parents=True, exist_ok=True)
+        archive = base / "platform-tools-latest-windows.zip"
+        staging = base / (".platform-tools-" + uuid.uuid4().hex)
+        url = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+        previous_adb = self.adb
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "CloudAndroidManager/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as resp, archive.open("wb") as out:
+                shutil.copyfileobj(resp, out)
+            if archive.stat().st_size < 1_000_000:
+                raise RuntimeError("Google Platform Tools 下载文件异常")
+
+            staging.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(archive, "r") as zf:
+                zf.extractall(staging)
+            source = staging / "platform-tools"
+            source_adb = source / "adb.exe"
+            if not source_adb.is_file():
+                raise RuntimeError("Platform Tools 压缩包中未找到 adb.exe")
+
+            if target.parent.exists():
+                shutil.rmtree(target.parent, ignore_errors=True)
+            shutil.move(str(source), str(target.parent))
+            if not target.is_file():
+                raise RuntimeError("ADB 安装完成但目标文件不存在")
+            self.adb = str(target)
+            return True, str(target)
+        except Exception as exc:
+            # Existing Android Studio/scrcpy ADB remains usable as a fallback.
+            if previous_adb and Path(previous_adb).is_file():
+                self.adb = previous_adb
+                return True, f"程序自有 ADB 准备失败，暂用现有 ADB：{previous_adb}；原因：{exc}"
+            return False, f"自动准备 Google Platform Tools 失败：{exc}"
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            try:
+                archive.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _find_scrcpy(self) -> str:
         return self._which_or_glob(
@@ -982,7 +1048,11 @@ class LocalTools:
             raise ValueError("ADB 命令缺少参数")
 
         top = tokens[0].lower()
-        if top in {"install", "install-multiple", "install-multi-package", "push", "pull", "root", "unroot", "remount", "sync", "reboot", "backup", "restore", "forward", "reverse", "tcpip"}:
+        if top in {
+            "install", "install-multiple", "install-multi-package", "push", "pull",
+            "root", "unroot", "remount", "sync", "reboot", "backup", "restore",
+            "forward", "reverse", "tcpip",
+        }:
             raise ValueError(f"该 ADB 操作不允许自动执行: {top}")
         if top in ("get-state", "wait-for-device"):
             return tokens, rendered
@@ -1002,8 +1072,17 @@ class LocalTools:
             }:
                 raise ValueError("自动任务中的 pm 只允许查询类命令")
         if program == "cmd":
-            if len(tokens) < 3 or tokens[2].lower() != "deviceidle":
-                raise ValueError("自动任务中的 cmd 目前只允许 cmd deviceidle")
+            if len(tokens) < 3:
+                raise ValueError("cmd 后缺少服务名")
+            service = tokens[2].lower()
+            if service == "deviceidle":
+                if len(tokens) < 4 or tokens[3].lower() not in {"disable", "enable", "whitelist"}:
+                    raise ValueError("cmd deviceidle 只允许 disable / enable / whitelist")
+            elif service == "notification":
+                if len(tokens) < 4 or tokens[3].lower() not in {"allow_listener", "disallow_listener"}:
+                    raise ValueError("cmd notification 只允许 allow_listener / disallow_listener")
+            else:
+                raise ValueError("自动任务中的 cmd 目前只允许 deviceidle / notification")
         if program == "settings":
             if len(tokens) < 3 or tokens[2].lower() not in {"get", "put", "delete", "list"}:
                 raise ValueError("settings 只允许 get / put / delete / list")
@@ -1694,7 +1773,7 @@ class CloudPhoneGUI:
         return '"' + value.replace('"', '') + '"'
 
     def _build_apk_install_command(self, cfg: AppConfig) -> str:
-        adb = self.tools.adb or "adb"
+        adb = self.tools.adb or str(self.tools._managed_adb_path())
         device = (cfg.last_device or "").strip() or "<ADB地址>"
         apk = (cfg.local_apk_path or "").strip() or "<APK路径>"
         template = (cfg.manual_install_command or "").strip()
@@ -1706,6 +1785,13 @@ class CloudPhoneGUI:
         q_adb = self._quote_cmd_arg(adb)
         q_device = self._quote_cmd_arg(device)
         q_apk = self._quote_cmd_arg(apk)
+        if os.name == "nt":
+            # Windows PowerShell 5.1 treats a quoted executable path as a string.
+            # The call operator (&) is required; && is not available in PS 5.1.
+            return (
+                f"& {q_adb} connect {q_device}; "
+                f"if ($LASTEXITCODE -eq 0) {{ & {q_adb} -s {q_device} install -r -g {q_apk} }}"
+            )
         return f"{q_adb} connect {q_device} && {q_adb} -s {q_device} install -r -g {q_apk}"
 
     def _refresh_tailscale_global_status(self) -> None:
@@ -2942,7 +3028,12 @@ class CloudPhoneGUI:
         self.bg(f"ADB任务 {cfg.phone_name} · {name}", work, done, failed)
 
     def _run_startup_adb_tasks(self, cfg: AppConfig, run_id: int) -> None:
+        sequence_key = f"{cfg.profile_id}:startup-sequence:{run_id}"
+        if sequence_key in self._adb_task_running or not cfg.last_device:
+            return
+
         now = time.time()
+        pending: list[dict[str, Any]] = []
         for task in list(cfg.adb_tasks or []):
             if not bool(task.get("enabled", True)):
                 continue
@@ -2952,7 +3043,50 @@ class CloudPhoneGUI:
                 continue
             if now - float(task.get("last_ts") or 0.0) < 30:
                 continue
-            self._run_adb_task(cfg, task, "startup")
+            pending.append(task)
+        if not pending:
+            return
+
+        self._adb_task_running.add(sequence_key)
+        device = cfg.last_device
+        package = cfg.package_name
+
+        def work() -> list[tuple[str, bool, str, float]]:
+            results: list[tuple[str, bool, str, float]] = []
+            # The list order is the execution order. Keep startup commands serial so
+            # power/permission setup finishes before app launch and HOME navigation.
+            for task in pending:
+                task_id = str(task.get("id") or "")
+                command = str(task.get("command") or "").strip()
+                ok, detail = self.tools.run_safe_adb_command(device, command, package)
+                results.append((task_id, ok, detail, time.time()))
+                time.sleep(0.6)
+            return results
+
+        def done(results: list[tuple[str, bool, str, float]]) -> None:
+            self._adb_task_running.discard(sequence_key)
+            by_id = {str(task.get("id") or ""): task for task in cfg.adb_tasks or []}
+            for task_id, ok, detail, finished_ts in results:
+                task = by_id.get(task_id)
+                if not task:
+                    continue
+                task["last_ts"] = finished_ts
+                if ok:
+                    task["last_run_id"] = int(run_id)
+                compact = str(detail or "").replace("\r", " ").replace("\n", " · ")
+                if len(compact) > 360:
+                    compact = compact[:357] + "..."
+                self.log(
+                    f"{cfg.phone_name} · 启动ADB[{task.get('name','ADB 任务')}] "
+                    f"{'成功' if ok else '失败'} · {compact}"
+                )
+            self.store.upsert(cfg)
+
+        def failed(err: str) -> None:
+            self._adb_task_running.discard(sequence_key)
+            self.log(f"{cfg.phone_name} · 启动 ADB 任务序列异常: {err}")
+
+        self.bg(f"启动ADB序列 {cfg.phone_name}", work, done, failed)
 
     def open_adb_tasks(self, profile_id: str) -> None:
         cfg = self.store.get(profile_id)
@@ -2973,7 +3107,7 @@ class CloudPhoneGUI:
 
         ttk.Label(
             outer,
-            text="支持立即执行、每次新云机启动后、每天固定时间、每 N 小时。{device} 自动替换当前 ADB 地址，{package} 自动替换当前选择的 App 包名。",
+            text="支持立即执行、每次新云机启动后、每天固定时间、每 N 小时。{device} 自动替换当前 ADB 地址，{package} 自动替换当前选择的 App 包名。启动任务严格按列表从上到下串行执行。",
             wraplength=880,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
@@ -3240,32 +3374,67 @@ class CloudPhoneGUI:
                 return
             cfg.local_apk_path = selected
             self.store.upsert(cfg)
-        command = self._build_apk_install_command(cfg)
 
-        dlg = tk.Toplevel(self.root)
-        dlg.title(f"APK 安装命令 · {cfg.phone_name}")
-        dlg.geometry("820x300")
-        dlg.minsize(700, 260)
-        dlg.transient(self.root)
-        frame = ttk.Frame(dlg, padding=14)
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(0, weight=1)
-        ttk.Label(frame, text=f"APK: {cfg.local_apk_path}", wraplength=760).grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, text=f"ADB: {cfg.last_device or '尚未发现，命令中使用 <ADB地址> 占位'}", wraplength=760).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(frame, text="复制下面的命令到你自己的终端执行；程序不会自动执行安装。", wraplength=760).grid(row=2, column=0, sticky="w", pady=(10, 4))
-        command_box = tk.Text(frame, height=5, wrap="word")
-        command_box.grid(row=3, column=0, sticky="nsew")
-        frame.rowconfigure(3, weight=1)
-        command_box.insert("1.0", command)
-        command_box.configure(state="disabled")
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=0, sticky="e", pady=(10, 0))
-        ttk.Button(buttons, text="关闭", command=dlg.destroy).pack(side="right")
-        ttk.Button(
-            buttons,
-            text="复制安装命令",
-            command=lambda: self._copy_to_clipboard(command),
-        ).pack(side="right", padx=(0, 8))
+        def show_command_dialog() -> None:
+            command = self._build_apk_install_command(cfg)
+            dlg = tk.Toplevel(self.root)
+            dlg.title(f"APK 安装命令 · {cfg.phone_name}")
+            dlg.geometry("860x320")
+            dlg.minsize(720, 280)
+            dlg.transient(self.root)
+            frame = ttk.Frame(dlg, padding=14)
+            frame.pack(fill="both", expand=True)
+            frame.columnconfigure(0, weight=1)
+            ttk.Label(frame, text=f"APK: {cfg.local_apk_path}", wraplength=800).grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                frame,
+                text=f"程序 ADB: {self.tools.adb or self.tools._managed_adb_path()}",
+                wraplength=800,
+            ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+            ttk.Label(
+                frame,
+                text=(
+                    "下面是 Windows PowerShell 命令，可直接粘贴执行。带引号的 exe 路径前已经自动加 &；"
+                    "兼容 Windows PowerShell 5.1，不使用 &&。"
+                ),
+                wraplength=800,
+            ).grid(row=2, column=0, sticky="w", pady=(10, 4))
+            command_box = tk.Text(frame, height=6, wrap="word")
+            command_box.grid(row=3, column=0, sticky="nsew")
+            frame.rowconfigure(3, weight=1)
+            command_box.insert("1.0", command)
+            command_box.configure(state="disabled")
+            buttons = ttk.Frame(frame)
+            buttons.grid(row=4, column=0, sticky="e", pady=(10, 0))
+            ttk.Button(buttons, text="关闭", command=dlg.destroy).pack(side="right")
+            ttk.Button(
+                buttons,
+                text="复制 PowerShell 安装命令",
+                command=lambda: self._copy_to_clipboard(command),
+            ).pack(side="right", padx=(0, 8))
+
+        managed_adb = self.tools._managed_adb_path()
+        if managed_adb.is_file():
+            self.tools.adb = str(managed_adb)
+            show_command_dialog()
+            return
+
+        self.log("正在准备程序自有 Google Platform Tools / adb.exe…")
+
+        def adb_ready(result: tuple[bool, str]) -> None:
+            ok, detail = result
+            if not ok:
+                messagebox.showerror(APP_NAME, detail, parent=self.root)
+                return
+            self.log(f"ADB 已准备：{detail}")
+            show_command_dialog()
+
+        self.bg(
+            "准备程序自有 ADB",
+            self.tools.ensure_managed_adb,
+            adb_ready,
+            lambda err: messagebox.showerror(APP_NAME, f"准备 ADB 失败：{err}", parent=self.root),
+        )
 
     def open_scrcpy_profile(self, profile_id: str) -> None:
         cfg = self.store.get(profile_id)
