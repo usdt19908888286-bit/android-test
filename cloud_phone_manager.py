@@ -324,6 +324,57 @@ class GlobalSecretStore:
         else:
             self._write_raw(payload)
 
+    def load_github_profile(self, profile_id: str) -> dict[str, str]:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            return {"account": "", "token": ""}
+        payload = self._read_raw()
+        raw_profiles = payload.get("github_profiles")
+        if not isinstance(raw_profiles, dict):
+            return {"account": "", "token": ""}
+        item = raw_profiles.get(profile_id)
+        if not isinstance(item, dict):
+            return {"account": "", "token": ""}
+        account = str(item.get("account") or "").strip()
+        try:
+            token = self._unprotect(str(item.get("token") or ""))
+        except Exception:
+            token = ""
+        return {"account": account, "token": token}
+
+    def save_github_profile(self, profile_id: str, account: str, token: str) -> None:
+        profile_id = str(profile_id or "").strip()
+        account = str(account or "").strip()
+        token = str(token or "").strip()
+        if not profile_id or not account or not token:
+            raise ValueError("独立 GitHub 授权信息不完整")
+        payload = self._read_raw()
+        raw_profiles = payload.get("github_profiles")
+        profiles = dict(raw_profiles) if isinstance(raw_profiles, dict) else {}
+        profiles[profile_id] = {
+            "account": account,
+            "token": self._protect(token),
+        }
+        payload["github_profiles"] = profiles
+        self._write_raw(payload)
+
+    def clear_github_profile(self, profile_id: str) -> None:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            return
+        payload = self._read_raw()
+        raw_profiles = payload.get("github_profiles")
+        profiles = dict(raw_profiles) if isinstance(raw_profiles, dict) else {}
+        profiles.pop(profile_id, None)
+        if profiles:
+            payload["github_profiles"] = profiles
+        else:
+            payload.pop("github_profiles", None)
+        if len(payload) <= 1:
+            self.clear()
+        else:
+            self._write_raw(payload)
+
     def clear(self) -> None:
         try:
             self.path.unlink(missing_ok=True)
@@ -534,6 +585,8 @@ class AppConfig:
     branch: str = "main"
     phone_id: str = "001"
     phone_name: str = "BICOIN-001"
+    github_independent: bool = False
+    github_account: str = ""
     apk_url: str = DEFAULT_APK_URL
     package_name: str = DEFAULT_PACKAGE
     local_apk_path: str = ""
@@ -709,6 +762,8 @@ class AppConfig:
             cfg.health_last_ts = max(0.0, float(cfg.health_last_ts or 0.0))
         except Exception:
             cfg.health_last_ts = 0.0
+        cfg.github_independent = bool(cfg.github_independent)
+        cfg.github_account = str(cfg.github_account or "").strip()
         return cfg
 
     def to_dict(self) -> dict[str, Any]:
@@ -2172,6 +2227,93 @@ class LocalTools:
         except Exception as exc:
             return False, str(exc)
 
+    def github_login_isolated(self) -> tuple[bool, str, str, str]:
+        """Authorize one phone in an isolated gh config and return its account/token."""
+        installed_now = False
+        if not self.gh:
+            ok, detail = self.ensure_github_cli()
+            if not ok:
+                return False, detail, "", ""
+            installed_now = True
+
+        helper_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CloudAndroidManager"
+        login_dir = helper_root / ("gh-profile-login-" + uuid.uuid4().hex)
+        try:
+            helper_root.mkdir(parents=True, exist_ok=True)
+            login_dir.mkdir(parents=True, exist_ok=True)
+            helper = helper_root / "no_browser.cmd"
+            helper.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env.pop("GH_TOKEN", None)
+            env.pop("GITHUB_TOKEN", None)
+            env["GH_CONFIG_DIR"] = str(login_dir)
+            env["GH_BROWSER"] = f'cmd.exe /d /c "{helper}"'
+
+            cp = subprocess.run(
+                [
+                    self.gh,
+                    "auth",
+                    "login",
+                    "--hostname",
+                    "github.com",
+                    "--git-protocol",
+                    "https",
+                    "--scopes",
+                    "repo,workflow",
+                    "--web",
+                    "--clipboard",
+                    "--insecure-storage",
+                ],
+                input="\n",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            account_cp = subprocess.run(
+                [self.gh, "api", "user", "--jq", ".login"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            token_cp = subprocess.run(
+                [self.gh, "auth", "token", "--hostname", "github.com"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            account = account_cp.stdout.strip() if account_cp.returncode == 0 else ""
+            token = token_cp.stdout.strip() if token_cp.returncode == 0 else ""
+            scopes = self.github_token_scopes(token) if token else set()
+            if cp.returncode == 0 and account and token and "workflow" in scopes:
+                prefix = "GitHub CLI 已自动安装；" if installed_now else ""
+                return True, prefix + f"已登录 @{account}", account, token
+            if account and token:
+                return False, "GitHub 授权不完整，请再次完成授权", "", ""
+            detail = (cp.stderr or cp.stdout or "").strip()
+            return False, detail or "GitHub 授权未完成或已取消", "", ""
+        except subprocess.TimeoutExpired:
+            return False, "GitHub 授权超时", "", ""
+        except Exception as exc:
+            return False, str(exc), "", ""
+        finally:
+            try:
+                shutil.rmtree(login_dir, ignore_errors=True)
+            except Exception:
+                pass
+
     def github_logout(self) -> tuple[bool, str]:
         if not self.gh:
             return False, "未找到 GitHub CLI (gh.exe)"
@@ -2843,8 +2985,27 @@ class CloudPhoneGUI:
         self.var_token.set(token)
         return token
 
+    def _token_for(self, cfg: AppConfig, required: bool = True) -> str:
+        if bool(getattr(cfg, "github_independent", False)):
+            saved = self.global_secrets.load_github_profile(cfg.profile_id)
+            token = str(saved.get("token") or "").strip()
+            if token:
+                return token
+            if required:
+                raise RuntimeError(f"{cfg.phone_name} 已启用独立 GitHub 授权，请先在普通设置中完成授权登录")
+            return ""
+        if required:
+            return self._token()
+        return self.var_token.get().strip() or self.tools.github_auth_token()
+
+    def _github_account_for(self, cfg: AppConfig) -> str:
+        if bool(getattr(cfg, "github_independent", False)):
+            saved = self.global_secrets.load_github_profile(cfg.profile_id)
+            return str(saved.get("account") or getattr(cfg, "github_account", "") or "").strip()
+        return self.tools.github_account()
+
     def api_for(self, cfg: AppConfig) -> GitHubAPI:
-        return GitHubAPI(cfg.repo, self._token())
+        return GitHubAPI(cfg.repo, self._token_for(cfg))
 
     def refresh_github_auth(self) -> None:
         if self._github_auth_checking:
@@ -3334,6 +3495,15 @@ class CloudPhoneGUI:
         v_device_native = tk.StringVar(value=draft.device_native_resolution)
         v_auto = tk.BooleanVar(value=draft.auto_refresh)
         v_interval = tk.IntVar(value=draft.refresh_seconds)
+        v_github_independent = tk.BooleanVar(value=bool(draft.github_independent))
+        saved_profile_auth = self.global_secrets.load_github_profile(draft.profile_id)
+        v_github_profile_status = tk.StringVar(
+            value=(
+                f"已登录 @{saved_profile_auth.get('account')}"
+                if saved_profile_auth.get("account") and saved_profile_auth.get("token")
+                else "尚未授权"
+            )
+        )
         v_rotate = tk.BooleanVar(value=draft.auto_rotate)
         rotation_rules = list(draft.rotate_rules or [])
         v_rule_type = tk.StringVar(value="每天时间点")
@@ -3370,16 +3540,41 @@ class CloudPhoneGUI:
         repo_combo = ttk.Combobox(repo_box, textvariable=v_repo, values=self.repo_cache)
         repo_combo.grid(row=0, column=1, sticky="ew", padx=6)
 
+        def settings_token(required: bool = True) -> str:
+            if bool(v_github_independent.get()):
+                auth = self.global_secrets.load_github_profile(draft.profile_id)
+                token = str(auth.get("token") or "").strip()
+                if token:
+                    return token
+                if required:
+                    raise RuntimeError("请先完成这台手机的独立 GitHub 授权登录")
+                return ""
+            if required:
+                return self._token()
+            return self.var_token.get().strip() or self.tools.github_auth_token()
+
         def load_repos() -> None:
+            try:
+                token = settings_token()
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=win)
+                return
+
             def done(items: list[str]) -> None:
                 self.repo_cache = items
                 repo_combo["values"] = items
                 v_repo_status.set(f"已读取 {len(items)} 个仓库")
-            self.bg("读取 GitHub 仓库", self._fetch_repositories, done, lambda e: v_repo_status.set(e))
+
+            self.bg(
+                "读取 GitHub 仓库",
+                lambda: GitHubAPI("placeholder/repository", token).user_repos(),
+                done,
+                lambda err: v_repo_status.set(err),
+            )
 
         def create_repo_dialog() -> None:
             try:
-                token = self._token()
+                token = settings_token()
             except Exception as exc:
                 messagebox.showerror(APP_NAME, str(exc), parent=win)
                 return
@@ -3504,7 +3699,7 @@ class CloudPhoneGUI:
                 messagebox.showerror(APP_NAME, "输入的仓库名不一致，已取消删除。", parent=win)
                 return
             try:
-                token = self._token()
+                token = settings_token()
             except Exception as exc:
                 messagebox.showerror(APP_NAME, str(exc), parent=win)
                 return
@@ -3531,12 +3726,69 @@ class CloudPhoneGUI:
 
             self.bg("删除 GitHub 仓库", work, done, lambda err: v_repo_status.set(f"删除失败：{err}"))
 
+        def toggle_github_auth_controls() -> None:
+            if v_github_independent.get():
+                independent_auth_frame.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+                auth = self.global_secrets.load_github_profile(draft.profile_id)
+                if auth.get("account") and auth.get("token"):
+                    v_github_profile_status.set(f"已登录 @{auth.get('account')}")
+                else:
+                    v_github_profile_status.set("尚未授权")
+            else:
+                independent_auth_frame.grid_remove()
+
+        def login_independent_github() -> None:
+            v_github_independent.set(True)
+            toggle_github_auth_controls()
+            self._show_github_login_dialog()
+            dialog_status = getattr(self, "_github_login_status_var", None)
+            if dialog_status:
+                dialog_status.set(f"正在为 {draft.phone_name} 准备独立 GitHub 授权")
+            v_github_profile_status.set("正在授权…")
+
+            def done(result: tuple[bool, str, str, str]) -> None:
+                ok, detail, account, token = result
+                self.log(f"{draft.phone_name}: 独立 GitHub 登录 · {detail}")
+                status_var = getattr(self, "_github_login_status_var", None)
+                if status_var:
+                    status_var.set("授权完成" if ok else detail)
+                try:
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                if not ok:
+                    v_github_profile_status.set(detail)
+                    return
+                self.global_secrets.save_github_profile(draft.profile_id, account, token)
+                draft.github_account = account
+                v_github_profile_status.set(f"已登录 @{account}")
+                v_repo_status.set(f"此手机将使用独立 GitHub 账号 @{account}")
+                load_repos()
+
+            self.bg("手机独立 GitHub 授权", self.tools.github_login_isolated, done)
+
         ttk.Button(repo_box, text="读取我的仓库", command=load_repos).grid(row=0, column=2, padx=(5, 2))
         ttk.Button(repo_box, text="＋ 创建仓库", command=create_repo_dialog).grid(row=0, column=3, padx=2)
         ttk.Button(repo_box, text="删除仓库", command=delete_selected_repo).grid(row=0, column=4, padx=(2, 5))
         ttk.Label(repo_box, text="分支").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(repo_box, textvariable=v_branch).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=800).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        auth_selector = ttk.Frame(repo_box)
+        auth_selector.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(
+            auth_selector,
+            text="独立 GitHub 授权",
+            variable=v_github_independent,
+            command=toggle_github_auth_controls,
+        ).pack(side="left")
+        ttk.Label(auth_selector, text="不勾选时使用全局 GitHub 账号").pack(side="left", padx=(12, 0))
+        independent_auth_frame = ttk.Frame(repo_box)
+        ttk.Label(independent_auth_frame, textvariable=v_github_profile_status).pack(side="left")
+        ttk.Button(independent_auth_frame, text="GitHub 授权登录", command=login_independent_github).pack(
+            side="left", padx=(12, 0)
+        )
+        toggle_github_auth_controls()
+        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=800).grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         identity = ttk.LabelFrame(body, text="手机身份 / App", padding=10)
         identity.pack(fill="x", pady=(10, 0))
@@ -3836,6 +4088,16 @@ class CloudPhoneGUI:
                 draft.refresh_seconds = max(3, int(v_interval.get()))
             except Exception:
                 draft.refresh_seconds = 8
+            draft.github_independent = bool(v_github_independent.get())
+            if draft.github_independent:
+                profile_auth = self.global_secrets.load_github_profile(draft.profile_id)
+                profile_account = str(profile_auth.get("account") or draft.github_account or "").strip()
+                profile_token = str(profile_auth.get("token") or "").strip()
+                if not profile_account or not profile_token:
+                    raise ValueError("已勾选独立 GitHub 授权，请先点击“GitHub 授权登录”完成这台手机的授权")
+                draft.github_account = profile_account
+            else:
+                draft.github_account = ""
             draft.auto_rotate = bool(automation_source.auto_rotate)
             draft.rotate_rules = list(automation_source.rotate_rules or [])
             draft.rotate_mode = automation_source.rotate_mode
@@ -3894,6 +4156,7 @@ class CloudPhoneGUI:
                 return
             if not messagebox.askyesno(APP_NAME, f"删除手机配置“{original.phone_name}”？\n不会删除 GitHub 上已有的备份。"):
                 return
+            self.global_secrets.clear_github_profile(original.profile_id)
             self.store.remove(original.profile_id)
             self._render_cards()
             self.log(f"已删除手机配置: {original.phone_name}")
@@ -3910,9 +4173,9 @@ class CloudPhoneGUI:
 
     # ------------------------- repository / workflow -------------------------
     def _prepare_repository(self, cfg: AppConfig) -> list[str]:
-        token = self._token()
+        token = self._token_for(cfg)
         api = GitHubAPI(cfg.repo, token)
-        account = self.tools.github_account() or "当前账号"
+        account = self._github_account_for(cfg) or "当前账号"
         scopes = self.tools.github_token_scopes(token)
 
         # All permission mechanics stay behind the login button. By the time a
@@ -4210,7 +4473,7 @@ class CloudPhoneGUI:
             rid = int(run["id"])
             names = api.repo_secret_names()
             if names is not None and "AVD_BACKUP_KEY" not in names:
-                ok, detail = self.tools.set_github_secret(cfg.repo, self._token(), "AVD_BACKUP_KEY")
+                ok, detail = self.tools.set_github_secret(cfg.repo, self._token_for(cfg), "AVD_BACKUP_KEY")
                 if not ok:
                     raise RuntimeError(detail)
             issue = api.request_backup(cfg.phone_id, rid)
@@ -4252,7 +4515,7 @@ class CloudPhoneGUI:
                 rid = int(run["id"])
                 names = api.repo_secret_names()
                 if names is not None and "AVD_BACKUP_KEY" not in names:
-                    ok, detail = self.tools.set_github_secret(cfg.repo, self._token(), "AVD_BACKUP_KEY")
+                    ok, detail = self.tools.set_github_secret(cfg.repo, self._token_for(cfg), "AVD_BACKUP_KEY")
                     if not ok:
                         raise RuntimeError(detail)
                 issue = api.request_backup(cfg.phone_id, rid)
@@ -5526,17 +5789,22 @@ class CloudPhoneGUI:
         now = time.time()
         store_changed = False
 
-        # Validate GitHub authorization periodically. A confirmed invalid token is
-        # alerted immediately and then at most once per hour while it stays invalid.
+        # Validate the global GitHub authorization periodically. Phones that opt
+        # into independent authorization use their own DPAPI-backed token below.
         if (
             not self._github_auth_checking
             and now - self._github_auth_last_check >= self._github_auth_check_interval
         ):
             self.refresh_github_auth()
-        has_github = bool(self.var_token.get().strip())
+        global_has_github = bool(self.var_token.get().strip())
 
         for cfg in list(self.store.profiles):
             refresh_requested = False
+            profile_has_github = (
+                bool(self._token_for(cfg, required=False))
+                if cfg.github_independent
+                else global_has_github
+            )
 
             # Normal status monitoring remains independent for every phone.
             if cfg.auto_refresh:
@@ -5579,7 +5847,7 @@ class CloudPhoneGUI:
             # disables the schedule; otherwise an old phone could be backed up and
             # never have its replacement started.
             if cfg.rotation_phase == "waiting_backup":
-                if has_github:
+                if profile_has_github:
                     self._poll_rotation(cfg)
                 continue
 
@@ -5590,7 +5858,7 @@ class CloudPhoneGUI:
                 self._set_card(cfg.profile_id, "rotation", self._rotation_text(cfg))
                 store_changed = True
                 continue
-            if now >= cfg.rotate_next_ts and has_github:
+            if now >= cfg.rotate_next_ts and profile_has_github:
                 self.rotate_profile(cfg.profile_id, automatic=True)
 
         if store_changed:
