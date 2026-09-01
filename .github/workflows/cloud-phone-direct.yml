@@ -61,7 +61,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           test -e /dev/kvm
           sudo apt-get update -qq
-          sudo apt-get install -y xvfb netcat-openbsd curl unzip
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0
           Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
 
