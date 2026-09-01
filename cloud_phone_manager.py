@@ -267,9 +267,14 @@ class LocalTools:
         )
 
     def _find_gh(self) -> str:
+        local_bin = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CloudAndroidManager" / "bin"
         return self._which_or_glob(
             "gh",
-            [r"C:\Program Files\GitHub CLI\gh.exe"],
+            [
+                r"C:\Program Files\GitHub CLI\gh.exe",
+                r"%LOCALAPPDATA%\Programs\GitHub CLI\gh.exe",
+                str(local_bin / "**" / "gh.exe"),
+            ],
         )
 
     @staticmethod
@@ -482,6 +487,94 @@ class LocalTools:
             pass
         return ""
 
+    def ensure_github_cli(self) -> tuple[bool, str]:
+        """Ensure GitHub CLI exists. Prefer winget; fall back to official portable ZIP."""
+        self.gh = self._find_gh()
+        if self.gh:
+            return True, self.gh
+        if os.name != "nt":
+            return False, "未找到 GitHub CLI；当前自动安装仅支持 Windows"
+
+        winget = shutil.which("winget")
+        if winget:
+            try:
+                cp = subprocess.run(
+                    [
+                        winget,
+                        "install",
+                        "--id",
+                        "GitHub.cli",
+                        "-e",
+                        "--accept-package-agreements",
+                        "--accept-source-agreements",
+                        "--silent",
+                        "--disable-interactivity",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=300,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                self.gh = self._find_gh()
+                if self.gh:
+                    return True, "GitHub CLI 已通过 winget 自动安装"
+                winget_detail = (cp.stdout + "\n" + cp.stderr).strip()
+            except Exception as exc:
+                winget_detail = str(exc)
+        else:
+            winget_detail = "系统未找到 winget"
+
+        # Portable fallback: download the official GitHub CLI ZIP into the user's LocalAppData.
+        try:
+            api_req = urllib.request.Request(
+                "https://api.github.com/repos/cli/cli/releases/latest",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "cloud-android-manager/2.0",
+                },
+            )
+            with urllib.request.urlopen(api_req, timeout=30) as resp:
+                release = json.loads(resp.read().decode("utf-8"))
+
+            machine = (os.environ.get("PROCESSOR_ARCHITECTURE") or "AMD64").upper()
+            arch = "arm64" if "ARM64" in machine else "amd64"
+            suffix = f"windows_{arch}.zip"
+            asset_url = ""
+            asset_name = ""
+            for asset in release.get("assets", []):
+                name = str(asset.get("name") or "")
+                if name.lower().endswith(suffix):
+                    asset_url = str(asset.get("browser_download_url") or "")
+                    asset_name = name
+                    break
+            if not asset_url:
+                return False, f"winget 安装失败，且未找到官方 {suffix} 便携包：{winget_detail}"
+
+            base = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CloudAndroidManager" / "bin"
+            base.mkdir(parents=True, exist_ok=True)
+            zip_path = base / asset_name
+            dl_req = urllib.request.Request(
+                asset_url,
+                headers={"User-Agent": "cloud-android-manager/2.0"},
+            )
+            with urllib.request.urlopen(dl_req, timeout=120) as resp, zip_path.open("wb") as fh:
+                shutil.copyfileobj(resp, fh)
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(base)
+            try:
+                zip_path.unlink()
+            except OSError:
+                pass
+
+            self.gh = self._find_gh()
+            if self.gh:
+                return True, "GitHub CLI 已从 GitHub 官方 Release 自动安装为便携版"
+            return False, f"GitHub CLI 下载完成但未找到 gh.exe；winget 信息：{winget_detail}"
+        except Exception as exc:
+            return False, f"GitHub CLI 自动安装失败：{exc}；winget 信息：{winget_detail}"
+
     def github_account(self) -> str:
         if not self.gh:
             return ""
@@ -489,8 +582,12 @@ class LocalTools:
         return out.strip() if code == 0 else ""
 
     def github_login(self) -> tuple[bool, str]:
+        installed_now = False
         if not self.gh:
-            return False, "未找到 GitHub CLI (gh.exe)"
+            ok, detail = self.ensure_github_cli()
+            if not ok:
+                return False, detail
+            installed_now = True
         try:
             flags = 0x00000010 if os.name == "nt" else 0
             cp = subprocess.run(
@@ -508,7 +605,10 @@ class LocalTools:
                 creationflags=flags,
             )
             account = self.github_account()
-            return cp.returncode == 0 and bool(account), account or "GitHub 授权未完成"
+            if cp.returncode == 0 and account:
+                prefix = "GitHub CLI 已自动安装；" if installed_now else ""
+                return True, prefix + f"已登录 @{account}"
+            return False, "GitHub 授权未完成"
         except subprocess.TimeoutExpired:
             return False, "GitHub 授权超时"
         except Exception as exc:
@@ -524,7 +624,9 @@ class LocalTools:
 
     def set_github_secret(self, repo: str, token: str, name: str = "AVD_BACKUP_KEY") -> tuple[bool, str]:
         if not self.gh:
-            return False, "未找到 GitHub CLI (gh.exe)"
+            ok, detail = self.ensure_github_cli()
+            if not ok:
+                return False, detail
         key = secrets.token_urlsafe(64)
         env = os.environ.copy()
         env["GH_TOKEN"] = token
@@ -912,19 +1014,25 @@ class CloudPhoneGUI:
         self.log(f"已记住包名: {pkg}")
 
     def refresh_github_auth(self) -> None:
-        def work() -> tuple[str, str]:
-            account = self.tools.github_account()
+        def work() -> tuple[str, str, bool]:
+            has_cli = bool(self.tools._find_gh())
+            if has_cli:
+                self.tools.gh = self.tools._find_gh()
+            account = self.tools.github_account() if has_cli else ""
             token = self.tools.github_auth_token() if account else ""
-            return account, token
+            return account, token, has_cli
 
-        def done(result: tuple[str, str]) -> None:
-            account, token = result
+        def done(result: tuple[str, str, bool]) -> None:
+            account, token, has_cli = result
             if account and token:
                 self.var_token.set(token)
                 self.var_github_status.set(f"GitHub: 已登录 @{account}")
             else:
                 self.var_token.set("")
-                self.var_github_status.set("GitHub: 未登录")
+                if has_cli:
+                    self.var_github_status.set("GitHub: 未登录")
+                else:
+                    self.var_github_status.set("GitHub: 未安装 CLI（授权时自动安装）")
 
         self.bg("检查 GitHub 登录", work, done)
 
