@@ -316,6 +316,7 @@ class AppConfig:
     health_monitor_enabled: bool = True
     health_check_seconds: int = 30
     health_require_app: bool = True
+    health_packages: list[str] = field(default_factory=list)
     health_fail_threshold: int = 3
     health_fail_count: int = 0
     health_last_status: str = "未检测"
@@ -420,6 +421,15 @@ class AppConfig:
                 }
             )
         cfg.adb_tasks = clean_tasks
+        raw_health_packages = cfg.health_packages if isinstance(cfg.health_packages, list) else []
+        clean_health_packages: list[str] = []
+        for raw_pkg in raw_health_packages:
+            pkg = str(raw_pkg or "").strip()
+            if PKG_RE.match(pkg) and pkg not in clean_health_packages:
+                clean_health_packages.append(pkg)
+        if not clean_health_packages and PKG_RE.match(cfg.package_name):
+            clean_health_packages = [cfg.package_name]
+        cfg.health_packages = clean_health_packages
         try:
             cfg.health_check_seconds = max(10, min(600, int(cfg.health_check_seconds)))
         except Exception:
@@ -1057,6 +1067,34 @@ class LocalTools:
         if code != 0:
             return []
         return sorted(x.removeprefix("package:").strip() for x in out.splitlines() if x.strip())
+
+    def package_states(self, address: str, packages: list[str]) -> dict[str, str]:
+        clean: list[str] = []
+        for raw in packages:
+            pkg = str(raw or "").strip()
+            if PKG_RE.match(pkg) and pkg not in clean:
+                clean.append(pkg)
+        if not clean:
+            return {}
+        ok, _ = self.adb_connect(address)
+        if not ok:
+            return {pkg: "ADB不可用" for pkg in clean}
+        code, out, _ = self.adb_cmd(address, ["shell", "pm", "list", "packages", "-3"], timeout=20)
+        installed = set()
+        if code == 0:
+            installed = {
+                line.removeprefix("package:").strip()
+                for line in out.splitlines()
+                if line.strip()
+            }
+        states: dict[str, str] = {}
+        for pkg in clean:
+            if pkg not in installed:
+                states[pkg] = "未安装"
+                continue
+            pcode, pout, _ = self.adb_cmd(address, ["shell", "pidof", pkg], timeout=10)
+            states[pkg] = "运行中" if pcode == 0 and pout.strip() else "已安装/未运行"
+        return states
 
     def start_package(self, address: str, package: str) -> tuple[bool, str]:
         if not PKG_RE.match(package):
@@ -3107,7 +3145,14 @@ class CloudPhoneGUI:
         def work() -> dict[str, Any]:
             api = self.api_for(cfg)
             run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
-            result: dict[str, Any] = {"run": run, "ip": "", "host": "", "health": {}, "runner": {}}
+            result: dict[str, Any] = {
+                "run": run,
+                "ip": "",
+                "host": "",
+                "health": {},
+                "runner": {},
+                "health_apps": {},
+            }
             if not run:
                 return result
             rid = int(run["id"])
@@ -3119,6 +3164,9 @@ class CloudPhoneGUI:
                 address = f"{ip}:5555"
                 if self.tools.port_open(ip, 5555, 1.2):
                     result["health"] = self.tools.device_health(address, cfg.package_name)
+                    if cfg.health_monitor_enabled and cfg.health_require_app:
+                        targets = list(cfg.health_packages or [cfg.package_name])
+                        result["health_apps"] = self.tools.package_states(address, targets)
             return result
 
         def done(result: dict[str, Any]) -> None:
@@ -3134,7 +3182,7 @@ class CloudPhoneGUI:
                 self._set_card(profile_id, "server", "云 CPU - · 内存 -\nQEMU CPU - · RAM -")
                 self._set_card(profile_id, "android", "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n未检测")
-                self._update_health_state(cfg, "", {}, {})
+                self._update_health_state(cfg, "", {}, {}, {})
                 self.store.save()
                 return
 
@@ -3147,6 +3195,7 @@ class CloudPhoneGUI:
             host = str(result.get("host") or "")
             health = result.get("health") or {}
             runner = result.get("runner") or {}
+            health_apps = result.get("health_apps") or {}
 
             if ip:
                 cfg.last_device = f"{ip}:5555"
@@ -3205,7 +3254,8 @@ class CloudPhoneGUI:
             else:
                 self._set_card(profile_id, "android", "等待 Android / ADB 就绪" if status == "in_progress" else "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n等待检测" if status == "in_progress" else "未运行")
-            self._update_health_state(cfg, status, health, runner)
+
+            self._update_health_state(cfg, status, health, runner, health_apps)
             if status == "in_progress" and cfg.health_monitor_enabled:
                 if cfg.health_last_status == "健康":
                     health_label = "健康"
@@ -3233,6 +3283,7 @@ class CloudPhoneGUI:
         run_status: str,
         health: dict[str, Any],
         runner: dict[str, Any],
+        app_states: dict[str, str],
     ) -> None:
         if not cfg.health_monitor_enabled:
             return
@@ -3258,15 +3309,10 @@ class CloudPhoneGUI:
 
         boot = str(health.get("boot") or "")
         adb = str(health.get("adb") or "")
-        app_state = str(health.get("app") or "")
         runner_ready = any(
             str(runner.get(key) or "-") != "-"
             for key in ("host_cpu", "host_mem", "qemu")
         )
-
-        # Do not classify the normal boot window as a failure. Once a phone has
-        # previously reached a healthy state, losing ADB/boot becomes a system
-        # health failure instead of another "starting" state.
         system_ready = boot == "1" and adb == "已连接"
         if not system_ready and cfg.health_last_status not in ("健康", "警告", "异常"):
             cfg.health_last_status = "启动中"
@@ -3278,14 +3324,25 @@ class CloudPhoneGUI:
             reasons.append("Android/ADB 不可用")
         elif not runner_ready:
             reasons.append("Runner 状态服务不可用")
-        elif cfg.health_require_app and app_state != "运行中":
-            reasons.append(f"App {app_state or '状态未知'}")
+        elif cfg.health_require_app:
+            targets = list(cfg.health_packages or [cfg.package_name])
+            bad_apps: list[str] = []
+            for pkg in targets:
+                state = str(app_states.get(pkg) or "状态未知")
+                if state != "运行中":
+                    bad_apps.append(f"{pkg}={state}")
+            if bad_apps:
+                reasons.append("App异常: " + ", ".join(bad_apps))
 
         if not reasons:
             was_bad = cfg.health_last_status in ("警告", "异常")
             cfg.health_fail_count = 0
             cfg.health_last_status = "健康"
-            cfg.health_last_reason = "Android / ADB / App 正常" if cfg.health_require_app else "Android / ADB 正常"
+            if cfg.health_require_app:
+                count = len(cfg.health_packages or [cfg.package_name])
+                cfg.health_last_reason = f"Android / ADB / {count}个App 正常"
+            else:
+                cfg.health_last_reason = "Android / ADB 正常"
             if was_bad:
                 self.log(f"{cfg.phone_name} · 健康监控：已恢复正常")
             return
@@ -3477,14 +3534,14 @@ class CloudPhoneGUI:
 
         dlg = tk.Toplevel(self.root)
         dlg.title(f"自动化 · {cfg.phone_name}")
-        dlg.geometry("1000x760")
-        dlg.minsize(900, 660)
+        dlg.geometry("1000x650")
+        dlg.minsize(900, 590)
         dlg.transient(self.root)
 
         outer = ttk.Frame(dlg, padding=12)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=1)
+        outer.rowconfigure(3, weight=0)
 
         # ------------------------- 自动换机 -------------------------
         rotation = ttk.LabelFrame(outer, text="自动换机", padding=9)
@@ -3624,27 +3681,93 @@ class CloudPhoneGUI:
         # ------------------------- 健康监控 -------------------------
         health_box = ttk.LabelFrame(outer, text="健康监控", padding=9)
         health_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        health_box.columnconfigure(8, weight=1)
+        health_box.columnconfigure(10, weight=1)
 
         v_health_enabled = tk.BooleanVar(value=cfg.health_monitor_enabled)
         v_health_interval = tk.IntVar(value=cfg.health_check_seconds)
         v_health_require_app = tk.BooleanVar(value=cfg.health_require_app)
         v_health_threshold = tk.IntVar(value=cfg.health_fail_threshold)
+        selected_health_packages = list(cfg.health_packages or [cfg.package_name])
+        v_health_targets = tk.StringVar()
         v_health_status = tk.StringVar(
             value=f"{cfg.health_last_status}"
             + (f" · {cfg.health_last_reason}" if cfg.health_last_reason else "")
         )
 
+        def update_health_targets_text() -> None:
+            if not v_health_require_app.get():
+                v_health_targets.set("仅系统")
+            elif not selected_health_packages:
+                v_health_targets.set("未选择 App")
+            elif len(selected_health_packages) == 1:
+                v_health_targets.set(selected_health_packages[0])
+            else:
+                v_health_targets.set(f"{len(selected_health_packages)} 个 App")
+
         ttk.Checkbutton(health_box, text="启用", variable=v_health_enabled).grid(row=0, column=0, sticky="w")
         ttk.Label(health_box, text="每").grid(row=0, column=1, sticky="e", padx=(10, 3))
-        ttk.Spinbox(health_box, from_=10, to=600, textvariable=v_health_interval, width=6).grid(row=0, column=2, sticky="w")
-        ttk.Label(health_box, text="秒检查").grid(row=0, column=3, sticky="w", padx=(3, 10))
-        ttk.Checkbutton(health_box, text="检查当前 App", variable=v_health_require_app).grid(row=0, column=4, sticky="w")
-        ttk.Label(health_box, text="连续").grid(row=0, column=5, sticky="e", padx=(10, 3))
-        ttk.Spinbox(health_box, from_=1, to=20, textvariable=v_health_threshold, width=4).grid(row=0, column=6, sticky="w")
-        ttk.Label(health_box, text="次异常后报警").grid(row=0, column=7, sticky="w", padx=(3, 10))
-        ttk.Label(health_box, textvariable=v_health_status).grid(row=0, column=8, sticky="w")
-        ttk.Button(health_box, text="保存", command=lambda: save_health_monitor()).grid(row=0, column=9, sticky="e", padx=(8, 0))
+        ttk.Spinbox(health_box, from_=10, to=600, textvariable=v_health_interval, width=5).grid(row=0, column=2, sticky="w")
+        ttk.Label(health_box, text="秒").grid(row=0, column=3, sticky="w", padx=(3, 10))
+        ttk.Checkbutton(health_box, text="检查 App", variable=v_health_require_app, command=update_health_targets_text).grid(row=0, column=4, sticky="w")
+        ttk.Label(health_box, text="监控:").grid(row=0, column=5, sticky="e", padx=(10, 3))
+        ttk.Label(health_box, textvariable=v_health_targets).grid(row=0, column=6, sticky="w")
+        ttk.Button(health_box, text="选择 App", command=lambda: select_health_apps()).grid(row=0, column=7, sticky="w", padx=(6, 10))
+        ttk.Label(health_box, text="连续").grid(row=0, column=8, sticky="e")
+        ttk.Spinbox(health_box, from_=1, to=20, textvariable=v_health_threshold, width=4).grid(row=0, column=9, sticky="w", padx=(3, 3))
+        ttk.Label(health_box, text="次报警").grid(row=0, column=10, sticky="w")
+        ttk.Button(health_box, text="保存", command=lambda: save_health_monitor()).grid(row=0, column=11, sticky="e", padx=(8, 0))
+        ttk.Label(health_box, textvariable=v_health_status).grid(row=1, column=0, columnspan=12, sticky="w", pady=(6, 0))
+
+        def select_health_apps() -> None:
+            if not cfg.last_device:
+                messagebox.showinfo(APP_NAME, "这台手机还没有可用的 ADB 地址，手机启动后再读取已安装 App。", parent=dlg)
+                return
+            v_health_status.set("正在读取已安装 App…")
+
+            def loaded(packages: list[str]) -> None:
+                if not packages:
+                    v_health_status.set("没有读取到第三方 App")
+                    return
+                chooser = tk.Toplevel(dlg)
+                chooser.title("选择健康监控 App")
+                chooser.geometry("560x420")
+                chooser.minsize(460, 340)
+                chooser.transient(dlg)
+
+                body = ttk.Frame(chooser, padding=10)
+                body.pack(fill="both", expand=True)
+                body.columnconfigure(0, weight=1)
+                body.rowconfigure(1, weight=1)
+                ttk.Label(body, text="可多选。健康监控会要求所选 App 都保持运行。", wraplength=520).grid(row=0, column=0, sticky="w", pady=(0, 7))
+                app_list = tk.Listbox(body, selectmode="extended", exportselection=False)
+                app_list.grid(row=1, column=0, sticky="nsew")
+                scroll = ttk.Scrollbar(body, orient="vertical", command=app_list.yview)
+                scroll.grid(row=1, column=1, sticky="ns")
+                app_list.configure(yscrollcommand=scroll.set)
+                for idx, pkg in enumerate(packages):
+                    app_list.insert("end", pkg)
+                    if pkg in selected_health_packages:
+                        app_list.selection_set(idx)
+
+                actions = ttk.Frame(body)
+                actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
+
+                def apply_selection() -> None:
+                    selected = [packages[int(i)] for i in app_list.curselection()]
+                    selected_health_packages[:] = selected
+                    update_health_targets_text()
+                    v_health_status.set(f"已选择 {len(selected)} 个 App，点“保存”生效")
+                    chooser.destroy()
+
+                ttk.Button(actions, text="取消", command=chooser.destroy).pack(side="right")
+                ttk.Button(actions, text="确定", command=apply_selection).pack(side="right", padx=(0, 6))
+
+            self.bg(
+                f"读取健康监控App {cfg.phone_name}",
+                lambda: self.tools.list_third_party_packages(cfg.last_device),
+                loaded,
+                lambda err: v_health_status.set(f"读取 App 失败：{err}"),
+            )
 
         def save_health_monitor() -> None:
             try:
@@ -3653,9 +3776,13 @@ class CloudPhoneGUI:
             except Exception:
                 messagebox.showerror(APP_NAME, "健康检查间隔或异常次数格式无效", parent=dlg)
                 return
+            if v_health_require_app.get() and not selected_health_packages:
+                messagebox.showerror(APP_NAME, "启用 App 健康检查时至少选择一个 App。", parent=dlg)
+                return
             cfg.health_monitor_enabled = bool(v_health_enabled.get())
             cfg.health_check_seconds = interval
             cfg.health_require_app = bool(v_health_require_app.get())
+            cfg.health_packages = list(selected_health_packages)
             cfg.health_fail_threshold = threshold
             cfg.health_fail_count = 0
             cfg.health_last_ts = 0.0
@@ -3663,17 +3790,17 @@ class CloudPhoneGUI:
             cfg.health_last_reason = ""
             self._last_health.pop(cfg.profile_id, None)
             self.store.upsert(cfg)
-            v_health_status.set(
-                f"已保存 · 每 {interval} 秒 · "
-                + ("检测 App" if cfg.health_require_app else "仅系统")
-            )
+            app_text = f"{len(cfg.health_packages)}个App" if cfg.health_require_app else "仅系统"
+            v_health_status.set(f"已保存 · 每 {interval} 秒 · {app_text}")
             self.log(f"{cfg.phone_name}: 健康监控设置已保存")
+
+        update_health_targets_text()
 
         # ------------------------- 统一自定义脚本 -------------------------
         script_box = ttk.LabelFrame(outer, text="启动 / 定时脚本", padding=9)
-        script_box.grid(row=3, column=0, sticky="nsew")
+        script_box.grid(row=3, column=0, sticky="ew")
         script_box.columnconfigure(0, weight=1)
-        script_box.rowconfigure(1, weight=1)
+        script_box.rowconfigure(1, weight=0)
 
         tasks = list(cfg.adb_tasks or [])
         first_task = tasks[0] if tasks else {}
@@ -3718,8 +3845,8 @@ class CloudPhoneGUI:
         ttk.Spinbox(options, from_=0, to=60, textvariable=v_script_gap, width=5).grid(row=0, column=8, sticky="w", padx=(4, 3))
         ttk.Label(options, text="秒").grid(row=0, column=9, sticky="w")
 
-        script_text = tk.Text(script_box, height=14, wrap="none")
-        script_text.grid(row=1, column=0, sticky="nsew")
+        script_text = tk.Text(script_box, height=8, wrap="none")
+        script_text.grid(row=1, column=0, sticky="ew")
         if tasks:
             script_text.insert("1.0", "\n".join(str(task.get("command") or "") for task in tasks))
 
