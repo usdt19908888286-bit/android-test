@@ -157,6 +157,14 @@ class GitHubAPI:
         except zipfile.BadZipFile:
             return data.decode("utf-8", errors="replace")
 
+    def repo_secret_exists(self, name: str) -> Optional[bool]:
+        try:
+            data = self._request("GET", "/actions/secrets?per_page=100") or {}
+            return any(item.get("name") == name for item in data.get("secrets", []))
+        except RuntimeError:
+            # Some fine-grained tokens can dispatch workflows but cannot list secret metadata.
+            return None
+
     def open_issues(self) -> list[dict[str, Any]]:
         data = self._request("GET", "/issues?state=open&per_page=100") or []
         return [x for x in data if "pull_request" not in x]
@@ -762,10 +770,23 @@ class CloudPhoneGUI:
             api = self.api()
             wf = self.var_create_wf.get().strip()
             inputs = {"phone_id": self._phone_id(), "apk_url": self.var_apk.get().strip() or DEFAULT_APK_URL}
+            notes = []
             if "managed" in wf.lower():
                 inputs["mode"] = "new"
+                exists = api.repo_secret_exists("AVD_BACKUP_KEY")
+                if exists is False:
+                    ok, detail = self.tools.set_github_secret(
+                        self.var_repo.get().strip(), self.var_token.get().strip()
+                    )
+                    if ok:
+                        notes.append("备份密钥已自动初始化")
+                    else:
+                        notes.append(f"备份密钥自动初始化失败（新机仍继续创建）: {detail}")
+                elif exists is None:
+                    notes.append("无法读取 Secret 元数据；新机继续创建，备份前请确认密钥已初始化")
             api.dispatch(wf, self.var_branch.get().strip() or "main", inputs)
-            return "GitHub workflow 已触发"
+            suffix = ("；" + "；".join(notes)) if notes else ""
+            return "GitHub workflow 已触发" + suffix
         self.bg("创建新手机", work, lambda v: (self.log(v), self.root.after(1500, self.refresh_run)))
 
     def restore_phone(self) -> None:

@@ -56,10 +56,13 @@ jobs:
             ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
           esac
           [ -n "${APK_URL:-}" ] || { echo '::error::apk_url is empty'; exit 1; }
-          [ -n "${AVD_BACKUP_KEY:-}" ] || {
-            echo '::error::AVD_BACKUP_KEY repository secret is required. Initialize it once from Cloud Android Manager.'
+          if [ "${{ inputs.mode }}" = 'restore' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then
+            echo '::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.'
             exit 1
-          }
+          fi
+          if [ -z "${AVD_BACKUP_KEY:-}" ]; then
+            echo '::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.'
+          fi
           echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"
 
       - name: Join Tailscale
@@ -299,11 +302,15 @@ jobs:
                 TARGET_RUN=$(jq -r '.run_id // 0' <<<"$CMD_JSON" 2>/dev/null || true)
                 TARGET_PHONE=$(jq -r '.phone_id // ""' <<<"$CMD_JSON" 2>/dev/null || true)
                 if [ "$CMD" = 'backup' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then
-                  echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"
-                  printf '%s' "$ISSUE_NO" >/tmp/managed-backup-issue-number
-                  touch /tmp/managed-backup-requested
-                  adb shell sync || true
-                  exit 0
+                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then
+                    echo 'BACKUP_REQUEST_REJECTED_NO_KEY'
+                  else
+                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"
+                    printf '%s' "$ISSUE_NO" >/tmp/managed-backup-issue-number
+                    touch /tmp/managed-backup-requested
+                    adb shell sync || true
+                    exit 0
+                  fi
                 fi
               fi
             fi
@@ -311,9 +318,13 @@ jobs:
           done
 
           # End-of-life safety backup when the 5-hour session naturally expires.
-          echo 'SESSION_TIMEOUT_AUTO_BACKUP'
-          touch /tmp/managed-backup-requested
-          adb shell sync || true
+          if [ -n "${AVD_BACKUP_KEY:-}" ]; then
+            echo 'SESSION_TIMEOUT_AUTO_BACKUP'
+            touch /tmp/managed-backup-requested
+            adb shell sync || true
+          else
+            echo 'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY'
+          fi
           SCRIPT
           chmod +x /tmp/managed-phone.sh
           bash -n /tmp/managed-phone.sh
