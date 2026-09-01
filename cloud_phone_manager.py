@@ -1465,46 +1465,85 @@ class CloudPhoneGUI:
 
         card = ttk.LabelFrame(
             self.cards_inner,
-            text=f"{cfg.phone_name}    ·    Phone ID {cfg.phone_id}",
-            padding=12,
+            text=f"{cfg.phone_name}   ·   ID {cfg.phone_id}",
+            padding=(12, 9),
         )
-        card.pack(fill="x", padx=3, pady=6)
+        card.pack(fill="x", padx=3, pady=5)
 
+        # Header: only the state and the two controls people need constantly.
         head = ttk.Frame(card)
         head.pack(fill="x")
-        ttk.Label(head, textvariable=vars_["repo"]).pack(side="left")
-        ttk.Label(head, textvariable=vars_["run"], font=("Segoe UI", 10, "bold")).pack(side="left", padx=(22, 0))
-        ttk.Label(head, textvariable=vars_["rotation"]).pack(side="left", padx=(18, 0))
-        ttk.Button(head, text="⚙ 设置", command=lambda pid=cfg.profile_id: self.open_settings(pid)).pack(side="right")
+        ttk.Label(head, textvariable=vars_["run"], font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Button(head, text="⚙", width=3, command=lambda pid=cfg.profile_id: self.open_settings(pid)).pack(side="right")
+        ttk.Button(head, text="↻", width=3, command=lambda pid=cfg.profile_id: self.refresh_profile(pid)).pack(side="right", padx=(0, 4))
 
-        metrics = ttk.Frame(card)
-        metrics.pack(fill="x", pady=(10, 8))
-        for i in range(4):
-            metrics.columnconfigure(i, weight=1, uniform="metric")
+        # Compact status strip. Avoid nested LabelFrames: borders around every metric
+        # made the dashboard look like a monitoring console instead of a phone manager.
+        status = ttk.Frame(card)
+        status.pack(fill="x", pady=(9, 7))
+        for i in range(3):
+            status.columnconfigure(i, weight=1, uniform="phone_status")
 
-        def metric(col: int, title: str, variable: tk.StringVar) -> None:
-            box = ttk.LabelFrame(metrics, text=title, padding=(9, 8))
-            box.grid(row=0, column=col, sticky="nsew", padx=3)
-            ttk.Label(box, textvariable=variable, justify="left", wraplength=260).pack(anchor="w")
+        def status_item(col: int, title: str, variable: tk.StringVar) -> None:
+            box = ttk.Frame(status, padding=(7, 3))
+            box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0))
+            ttk.Label(box, text=title, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+            ttk.Label(box, textvariable=variable, justify="left", wraplength=330).pack(anchor="w", pady=(2, 0))
 
-        metric(0, "云机 / ADB", vars_["adb"])
-        metric(1, "云服务器", vars_["server"])
-        metric(2, "Android", vars_["android"])
-        metric(3, "App", vars_["app"])
+        status_item(0, "连接", vars_["adb"])
+        status_item(1, "Android", vars_["android"])
+        status_item(2, "当前 App", vars_["app"])
 
-        actions = ttk.Frame(card)
-        actions.pack(fill="x", pady=(2, 0))
-        ttk.Button(actions, text="新建 / 启动", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="备份当前手机", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="立即换机", command=lambda pid=cfg.profile_id: self.rotate_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=(12, 3))
-        ttk.Button(actions, text="APK 安装命令", command=lambda pid=cfg.profile_id: self.apk_command_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="ADB 任务", command=lambda pid=cfg.profile_id: self.open_adb_tasks(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=3)
-        ttk.Button(actions, text="刷新", command=lambda pid=cfg.profile_id: self.refresh_profile(pid)).pack(side="right", padx=3)
-        ttk.Button(actions, text="停止云机", command=lambda pid=cfg.profile_id: self.cancel_profile(pid)).pack(side="right", padx=3)
+        # Primary actions: six only. Everything else is deliberately hidden by default.
+        primary = ttk.Frame(card)
+        primary.pack(fill="x", pady=(3, 0))
+        ttk.Button(primary, text="▶ 启动", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=(0, 5))
+        ttk.Button(primary, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(primary, text="备份", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(primary, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(primary, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(primary, text="停止", command=lambda pid=cfg.profile_id: self.cancel_profile(pid)).pack(side="left", padx=5)
+
+        details = ttk.Frame(card)
+        details_visible = tk.BooleanVar(value=False)
+        more_text = tk.StringVar(value="更多 ▾")
+
+        def toggle_details() -> None:
+            if details_visible.get():
+                details.pack_forget()
+                details_visible.set(False)
+                more_text.set("更多 ▾")
+            else:
+                details.pack(fill="x", pady=(9, 0))
+                details_visible.set(True)
+                more_text.set("收起 ▴")
+
+        ttk.Button(primary, textvariable=more_text, command=toggle_details).pack(side="right")
+
+        ttk.Separator(details, orient="horizontal").pack(fill="x", pady=(0, 8))
+        meta = ttk.Frame(details)
+        meta.pack(fill="x")
+        meta.columnconfigure(0, weight=2)
+        meta.columnconfigure(1, weight=1)
+        meta.columnconfigure(2, weight=2)
+
+        def detail_item(col: int, title: str, variable: tk.StringVar) -> None:
+            box = ttk.Frame(meta, padding=(5, 2))
+            box.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0))
+            ttk.Label(box, text=title, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+            ttk.Label(box, textvariable=variable, justify="left", wraplength=360).pack(anchor="w", pady=(2, 0))
+
+        detail_item(0, "仓库", vars_["repo"])
+        detail_item(1, "云服务器", vars_["server"])
+        detail_item(2, "自动换机", vars_["rotation"])
+
+        secondary = ttk.Frame(details)
+        secondary.pack(fill="x", pady=(8, 0))
+        ttk.Button(secondary, text="恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=(0, 5))
+        ttk.Button(secondary, text="立即换机", command=lambda pid=cfg.profile_id: self.rotate_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(secondary, text="APK 安装命令", command=lambda pid=cfg.profile_id: self.apk_command_profile(pid)).pack(side="left", padx=5)
+        ttk.Button(secondary, text="ADB 任务", command=lambda pid=cfg.profile_id: self.open_adb_tasks(pid)).pack(side="left", padx=5)
+        ttk.Button(secondary, text="刷新状态", command=lambda pid=cfg.profile_id: self.refresh_profile(pid)).pack(side="right", padx=(5, 0))
 
     def _initial_run_text(self, cfg: AppConfig) -> str:
         if cfg.last_run_id:
