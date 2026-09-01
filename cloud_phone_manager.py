@@ -72,6 +72,20 @@ class AppConfig:
     auto_refresh: bool = True
     refresh_seconds: int = 8
 
+    # Automatic phone rotation. The GUI requests a cold full-AVD backup from
+    # the old Runner, waits until GitHub confirms the backup was saved, then
+    # starts a fresh Runner in restore mode with the same phone_id.
+    auto_rotate: bool = False
+    rotate_mode: str = "interval"  # interval | daily
+    rotate_interval_hours: int = 4
+    rotate_daily_time: str = "04:00"
+    rotate_next_ts: float = 0.0
+    rotate_last_ts: float = 0.0
+    rotation_phase: str = ""  # "" | waiting_backup
+    rotation_run_id: int = 0
+    rotation_started_ts: float = 0.0
+    rotation_last_error: str = ""
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
         cfg = cls()
@@ -88,6 +102,14 @@ class AppConfig:
             cfg.package_history.insert(0, cfg.package_name)
         if DEFAULT_PACKAGE not in cfg.package_history:
             cfg.package_history.append(DEFAULT_PACKAGE)
+        if cfg.rotate_mode not in ("interval", "daily"):
+            cfg.rotate_mode = "interval"
+        try:
+            cfg.rotate_interval_hours = max(1, int(cfg.rotate_interval_hours))
+        except Exception:
+            cfg.rotate_interval_hours = 4
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(cfg.rotate_daily_time)):
+            cfg.rotate_daily_time = "04:00"
         return cfg
 
     def to_dict(self) -> dict[str, Any]:
@@ -862,6 +884,8 @@ class CloudPhoneGUI:
         self._closing = False
         self._refreshing: set[str] = set()
         self._last_auto: dict[str, float] = {}
+        self._last_rotation_poll: dict[str, float] = {}
+        self._rotating: set[str] = set()
         self.card_vars: dict[str, dict[str, tk.StringVar]] = {}
         self.repo_cache: list[str] = []
 
@@ -937,6 +961,7 @@ class CloudPhoneGUI:
     def _build_phone_card(self, cfg: AppConfig) -> None:
         vars_ = {
             "run": tk.StringVar(value=self._initial_run_text(cfg)),
+            "rotation": tk.StringVar(value=self._rotation_text(cfg)),
             "adb": tk.StringVar(value=cfg.last_device or "未发现 ADB 地址"),
             "server": tk.StringVar(value="CPU -\n内存 -"),
             "android": tk.StringVar(value="等待检测"),
@@ -956,6 +981,7 @@ class CloudPhoneGUI:
         head.pack(fill="x")
         ttk.Label(head, textvariable=vars_["repo"]).pack(side="left")
         ttk.Label(head, textvariable=vars_["run"], font=("Segoe UI", 10, "bold")).pack(side="left", padx=(22, 0))
+        ttk.Label(head, textvariable=vars_["rotation"]).pack(side="left", padx=(18, 0))
         ttk.Button(head, text="⚙ 设置", command=lambda pid=cfg.profile_id: self.open_settings(pid)).pack(side="right")
 
         metrics = ttk.Frame(card)
@@ -978,6 +1004,7 @@ class CloudPhoneGUI:
         ttk.Button(actions, text="新建 / 启动", command=lambda pid=cfg.profile_id: self.start_profile(pid)).pack(side="left", padx=3)
         ttk.Button(actions, text="恢复备份", command=lambda pid=cfg.profile_id: self.restore_profile(pid)).pack(side="left", padx=3)
         ttk.Button(actions, text="备份当前手机", command=lambda pid=cfg.profile_id: self.backup_profile(pid)).pack(side="left", padx=3)
+        ttk.Button(actions, text="立即换机", command=lambda pid=cfg.profile_id: self.rotate_profile(pid)).pack(side="left", padx=3)
         ttk.Button(actions, text="打开 scrcpy", command=lambda pid=cfg.profile_id: self.open_scrcpy_profile(pid)).pack(side="left", padx=(12, 3))
         ttk.Button(actions, text="启动 App", command=lambda pid=cfg.profile_id: self.start_app_profile(pid)).pack(side="left", padx=3)
         ttk.Button(actions, text="关闭 App", command=lambda pid=cfg.profile_id: self.stop_app_profile(pid)).pack(side="left", padx=3)
@@ -988,6 +1015,45 @@ class CloudPhoneGUI:
         if cfg.last_run_id:
             return f"Run {cfg.last_run_id} · {cfg.last_run_status}"
         return "未启动"
+
+    @staticmethod
+    def _format_local_ts(value: float) -> str:
+        if not value:
+            return "-"
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+
+    def _next_rotation_ts(self, cfg: AppConfig, now_ts: Optional[float] = None) -> float:
+        now_ts = float(now_ts or time.time())
+        if cfg.rotate_mode == "daily":
+            match = re.fullmatch(r"(\d{2}):(\d{2})", cfg.rotate_daily_time or "")
+            hour = int(match.group(1)) if match else 4
+            minute = int(match.group(2)) if match else 0
+            now_local = dt.datetime.fromtimestamp(now_ts)
+            target = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target.timestamp() <= now_ts + 1:
+                target += dt.timedelta(days=1)
+            return target.timestamp()
+        hours = max(1, int(cfg.rotate_interval_hours or 1))
+        return now_ts + hours * 3600
+
+    def _rotation_text(self, cfg: AppConfig) -> str:
+        if cfg.rotation_phase == "waiting_backup" and cfg.rotation_run_id:
+            return f"换机中 · 等待旧 Run {cfg.rotation_run_id} 备份完成"
+        if cfg.auto_rotate:
+            if not cfg.rotate_next_ts:
+                return "自动换机已开启 · 等待计算时间"
+            if cfg.rotate_mode == "daily":
+                rule = f"每天 {cfg.rotate_daily_time}"
+            else:
+                rule = f"每 {cfg.rotate_interval_hours} 小时"
+            return f"自动换机 · {rule} · 下次 {self._format_local_ts(cfg.rotate_next_ts)}"
+        if cfg.rotation_last_error:
+            return f"自动换机关闭 · 上次错误: {cfg.rotation_last_error[:70]}"
+        return "自动换机关闭"
+
+    def _reschedule_rotation(self, cfg: AppConfig, now_ts: Optional[float] = None) -> None:
+        cfg.rotate_next_ts = self._next_rotation_ts(cfg, now_ts) if cfg.auto_rotate else 0.0
+        self._set_card(cfg.profile_id, "rotation", self._rotation_text(cfg))
 
     def _set_card(self, profile_id: str, key: str, value: str) -> None:
         vars_ = self.card_vars.get(profile_id)
@@ -1189,8 +1255,8 @@ class CloudPhoneGUI:
 
         win = tk.Toplevel(self.root)
         win.title("手机设置" if original else "添加手机")
-        win.geometry("820x650")
-        win.minsize(760, 600)
+        win.geometry("840x760")
+        win.minsize(780, 700)
         win.transient(self.root)
 
         v_repo = tk.StringVar(value=draft.repo)
@@ -1207,7 +1273,12 @@ class CloudPhoneGUI:
         v_ram = tk.StringVar(value=draft.ram_mb)
         v_auto = tk.BooleanVar(value=draft.auto_refresh)
         v_interval = tk.IntVar(value=draft.refresh_seconds)
+        v_rotate = tk.BooleanVar(value=draft.auto_rotate)
+        v_rotate_mode = tk.StringVar(value="每天指定时间" if draft.rotate_mode == "daily" else "每 N 小时")
+        v_rotate_hours = tk.IntVar(value=max(1, int(draft.rotate_interval_hours or 4)))
+        v_rotate_time = tk.StringVar(value=draft.rotate_daily_time or "04:00")
         v_repo_status = tk.StringVar(value="内置工作流将在启动/恢复前自动同步到目标仓库")
+        v_rotate_status = tk.StringVar(value=self._rotation_text(draft))
 
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
@@ -1229,7 +1300,7 @@ class CloudPhoneGUI:
         ttk.Button(repo_box, text="读取我的仓库", command=load_repos).grid(row=0, column=2, padx=5)
         ttk.Label(repo_box, text="分支").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(repo_box, textvariable=v_branch).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=720).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(repo_box, textvariable=v_repo_status, wraplength=740).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         identity = ttk.LabelFrame(body, text="手机身份 / App", padding=10)
         identity.pack(fill="x", pady=(10, 0))
@@ -1274,6 +1345,29 @@ class CloudPhoneGUI:
         ttk.Spinbox(spec, from_=3, to=120, textvariable=v_interval, width=7).grid(row=2, column=1, sticky="w", pady=(8, 0))
         ttk.Label(spec, text="秒").grid(row=2, column=1, sticky="e", pady=(8, 0))
 
+        rotation = ttk.LabelFrame(body, text="定时自动换机", padding=10)
+        rotation.pack(fill="x", pady=(10, 0))
+        rotation.columnconfigure(5, weight=1)
+        ttk.Checkbutton(rotation, text="启用定时自动换机", variable=v_rotate).grid(row=0, column=0, sticky="w")
+        ttk.Label(rotation, text="方式").grid(row=0, column=1, sticky="e", padx=(14, 4))
+        ttk.Combobox(
+            rotation,
+            textvariable=v_rotate_mode,
+            values=["每 N 小时", "每天指定时间"],
+            state="readonly",
+            width=14,
+        ).grid(row=0, column=2, sticky="w")
+        ttk.Label(rotation, text="间隔小时").grid(row=0, column=3, sticky="e", padx=(14, 4))
+        ttk.Spinbox(rotation, from_=1, to=168, textvariable=v_rotate_hours, width=7).grid(row=0, column=4, sticky="w")
+        ttk.Label(rotation, text="每天时间").grid(row=0, column=5, sticky="e", padx=(14, 4))
+        ttk.Entry(rotation, textvariable=v_rotate_time, width=8).grid(row=0, column=6, sticky="w")
+        ttk.Label(
+            rotation,
+            text="执行顺序：备份旧机 → 等 GitHub 确认完整 AVD 已保存 → 用最新备份恢复新 Runner → 旧 Runner 结束。",
+            wraplength=760,
+        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(8, 2))
+        ttk.Label(rotation, textvariable=v_rotate_status, wraplength=760).grid(row=2, column=0, columnspan=7, sticky="w", pady=(2, 0))
+
         note = ttk.LabelFrame(body, text="仓库部署", padding=10)
         note.pack(fill="x", pady=(10, 0))
         ttk.Label(
@@ -1284,7 +1378,7 @@ class CloudPhoneGUI:
                 "注意：新仓库仍需存在 TS_API_CLIENT_ID 和 TS_API_CLIENT_SECRET 两个 Tailscale GitHub Secrets；"
                 "程序不会读取或复制其他仓库里的 secret 明文。"
             ),
-            wraplength=750,
+            wraplength=760,
             justify="left",
         ).pack(anchor="w")
 
@@ -1306,11 +1400,30 @@ class CloudPhoneGUI:
                 raise ValueError("CPU 核数必须是正整数")
             if not v_ram.get().strip().isdigit() or int(v_ram.get()) < 1024:
                 raise ValueError("内存至少 1024 MB")
+
+            rotate_mode = "daily" if v_rotate_mode.get() == "每天指定时间" else "interval"
+            try:
+                rotate_hours = max(1, int(v_rotate_hours.get()))
+            except Exception as exc:
+                raise ValueError("换机间隔小时必须是正整数") from exc
+            rotate_time = v_rotate_time.get().strip()
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", rotate_time):
+                raise ValueError("每天换机时间格式必须是 HH:MM，例如 04:30")
+
             for other in self.store.profiles:
                 if other.profile_id != draft.profile_id and other.repo.lower() == repo.lower() and other.phone_id == phone_id:
                     raise ValueError(f"同一个仓库内 Phone ID {phone_id} 已经存在")
 
             identity_changed = (draft.repo.lower(), draft.phone_id) != (repo.lower(), phone_id)
+            if identity_changed and draft.rotation_phase:
+                raise ValueError("当前正在自动换机，完成后再修改仓库或 Phone ID")
+            schedule_changed = (
+                draft.auto_rotate != bool(v_rotate.get())
+                or draft.rotate_mode != rotate_mode
+                or int(draft.rotate_interval_hours or 0) != rotate_hours
+                or draft.rotate_daily_time != rotate_time
+            )
+
             draft.repo = repo
             draft.branch = branch
             draft.phone_id = phone_id
@@ -1328,13 +1441,29 @@ class CloudPhoneGUI:
                 draft.refresh_seconds = max(3, int(v_interval.get()))
             except Exception:
                 draft.refresh_seconds = 8
+            draft.auto_rotate = bool(v_rotate.get())
+            draft.rotate_mode = rotate_mode
+            draft.rotate_interval_hours = rotate_hours
+            draft.rotate_daily_time = rotate_time
             draft.package_history = [package] + [x for x in draft.package_history if x != package]
             draft.package_history = draft.package_history[:40]
+
             if identity_changed:
                 draft.last_device = ""
                 draft.last_node = ""
                 draft.last_run_id = 0
                 draft.last_run_status = "-"
+                draft.rotation_phase = ""
+                draft.rotation_run_id = 0
+                draft.rotation_started_ts = 0.0
+                draft.rotation_last_error = ""
+                draft.rotate_last_ts = 0.0
+                draft.rotate_next_ts = 0.0
+
+            if not draft.auto_rotate:
+                draft.rotate_next_ts = 0.0
+            elif schedule_changed or not draft.rotate_next_ts or draft.rotate_next_ts <= time.time():
+                draft.rotate_next_ts = self._next_rotation_ts(draft)
             return draft
 
         def check_repo() -> None:
@@ -1484,6 +1613,171 @@ class CloudPhoneGUI:
             lambda err: self._set_card(profile_id, "run", f"备份失败：{err}"),
         )
 
+    def rotate_profile(self, profile_id: str, automatic: bool = False) -> None:
+        cfg = self.store.get(profile_id)
+        if not cfg:
+            return
+        if cfg.rotation_phase or profile_id in self._rotating:
+            if not automatic:
+                messagebox.showinfo(APP_NAME, "这台手机已经在换机流程中。")
+            return
+
+        self._rotating.add(profile_id)
+        self._set_card(profile_id, "rotation", "正在开始换机…")
+        self._set_card(profile_id, "run", "换机：正在检查旧手机…")
+
+        def work() -> dict[str, Any]:
+            self._prepare_repository(cfg)
+            api = self.api_for(cfg)
+            run = api.latest_phone_run(cfg.phone_name, cfg.phone_id, cfg.branch)
+            if run and str(run.get("status")) == "in_progress":
+                rid = int(run["id"])
+                names = api.repo_secret_names()
+                if names is not None and "AVD_BACKUP_KEY" not in names:
+                    ok, detail = self.tools.set_github_secret(cfg.repo, self._token(), "AVD_BACKUP_KEY")
+                    if not ok:
+                        raise RuntimeError(detail)
+                issue = api.request_backup(cfg.phone_id, rid)
+                return {
+                    "state": "waiting_backup",
+                    "run_id": rid,
+                    "issue": int(issue.get("number") or 0),
+                }
+
+            # If the old phone is already offline, restore directly from the latest
+            # encrypted cache. This also covers the natural 5-hour auto-backup case.
+            api.dispatch(
+                Path(BUILTIN_WORKFLOW_PATH).name,
+                cfg.branch,
+                self._workflow_inputs(cfg, "restore"),
+            )
+            return {"state": "restore_dispatched", "run_id": 0, "issue": 0}
+
+        def done(result: dict[str, Any]) -> None:
+            self._rotating.discard(profile_id)
+            cfg.rotation_last_error = ""
+            now_ts = time.time()
+            if result.get("state") == "waiting_backup":
+                cfg.rotation_phase = "waiting_backup"
+                cfg.rotation_run_id = int(result.get("run_id") or 0)
+                cfg.rotation_started_ts = now_ts
+                issue_no = int(result.get("issue") or 0)
+                self._set_card(
+                    profile_id,
+                    "rotation",
+                    f"换机中 · 旧 Run {cfg.rotation_run_id} 正在备份 · Issue #{issue_no}",
+                )
+                self._set_card(profile_id, "run", f"换机：等待旧 Run {cfg.rotation_run_id} 完成备份")
+                self.log(
+                    f"{cfg.phone_name}: 换机已开始，先完整备份旧 Run {cfg.rotation_run_id}，备份成功后自动恢复新 Runner"
+                )
+            else:
+                cfg.rotation_phase = ""
+                cfg.rotation_run_id = 0
+                cfg.rotation_started_ts = 0.0
+                cfg.rotate_last_ts = now_ts
+                self._reschedule_rotation(cfg, now_ts)
+                self._set_card(profile_id, "run", "换机：旧机已离线，已直接从最新备份启动新 Runner")
+                self.log(f"{cfg.phone_name}: 旧机已离线，已直接触发最新备份恢复")
+                self.root.after(2200, lambda: self.refresh_profile(profile_id))
+            self.store.save()
+
+        def failed(err: str) -> None:
+            self._rotating.discard(profile_id)
+            cfg.rotation_last_error = err
+            if cfg.auto_rotate:
+                cfg.rotate_next_ts = time.time() + 1800
+            self.store.save()
+            self._set_card(profile_id, "rotation", self._rotation_text(cfg))
+            self._set_card(profile_id, "run", f"换机启动失败：{err}")
+
+        self.bg(
+            f"{cfg.phone_name} {'自动' if automatic else '立即'}换机",
+            work,
+            done,
+            failed,
+        )
+
+    def _poll_rotation(self, cfg: AppConfig) -> None:
+        profile_id = cfg.profile_id
+        if cfg.rotation_phase != "waiting_backup" or not cfg.rotation_run_id:
+            return
+        if profile_id in self._rotating:
+            return
+
+        now_ts = time.time()
+        last = self._last_rotation_poll.get(profile_id, 0.0)
+        if now_ts - last < 12:
+            return
+        self._last_rotation_poll[profile_id] = now_ts
+        self._rotating.add(profile_id)
+
+        old_run_id = cfg.rotation_run_id
+
+        def work() -> dict[str, Any]:
+            api = self.api_for(cfg)
+            run = api.run(old_run_id)
+            status = str(run.get("status") or "")
+            conclusion = str(run.get("conclusion") or "")
+            if status != "completed":
+                return {"state": "waiting", "status": status}
+            if conclusion != "success":
+                return {"state": "failed", "error": f"旧 Run {old_run_id} 备份流程结束为 {conclusion or 'unknown'}"}
+
+            logs = api.run_logs_text(old_run_id)
+            if "MANAGED_BACKUP_SAVED" not in logs:
+                return {"state": "failed", "error": f"旧 Run {old_run_id} 已结束，但日志未确认 MANAGED_BACKUP_SAVED"}
+
+            api.dispatch(
+                Path(BUILTIN_WORKFLOW_PATH).name,
+                cfg.branch,
+                self._workflow_inputs(cfg, "restore"),
+            )
+            return {"state": "restored"}
+
+        def done(result: dict[str, Any]) -> None:
+            self._rotating.discard(profile_id)
+            state = str(result.get("state") or "")
+            if state == "waiting":
+                self._set_card(profile_id, "rotation", f"换机中 · 等待旧 Run {old_run_id} 保存完整备份")
+                return
+
+            if state == "failed":
+                cfg.rotation_phase = ""
+                cfg.rotation_run_id = 0
+                cfg.rotation_started_ts = 0.0
+                cfg.rotation_last_error = str(result.get("error") or "换机失败")
+                if cfg.auto_rotate:
+                    cfg.rotate_next_ts = time.time() + 1800
+                self.store.save()
+                self._set_card(profile_id, "rotation", self._rotation_text(cfg))
+                self._set_card(profile_id, "run", f"换机失败：{cfg.rotation_last_error}")
+                self.log(f"{cfg.phone_name}: {cfg.rotation_last_error}")
+                return
+
+            now_done = time.time()
+            cfg.rotation_phase = ""
+            cfg.rotation_run_id = 0
+            cfg.rotation_started_ts = 0.0
+            cfg.rotation_last_error = ""
+            cfg.rotate_last_ts = now_done
+            self._reschedule_rotation(cfg, now_done)
+            self.store.save()
+            self._set_card(profile_id, "rotation", self._rotation_text(cfg))
+            self._set_card(profile_id, "run", "旧机备份成功 · 新 Runner 已从备份启动")
+            self.log(f"{cfg.phone_name}: 旧机完整备份已保存，新的 Runner 已从该备份恢复启动")
+            self.root.after(2200, lambda: self.refresh_profile(profile_id))
+
+        def failed(err: str) -> None:
+            # Keep waiting_backup state on transient GitHub/network failures. The
+            # next scheduler poll will retry instead of losing the in-flight rotation.
+            self._rotating.discard(profile_id)
+            cfg.rotation_last_error = err
+            self.store.save()
+            self._set_card(profile_id, "rotation", f"换机中 · 查询暂时失败，稍后重试：{err[:80]}")
+
+        self.bg(f"检查 {cfg.phone_name} 换机备份", work, done, failed)
+
     def cancel_profile(self, profile_id: str) -> None:
         cfg = self.store.get(profile_id)
         if not cfg:
@@ -1628,13 +1922,37 @@ class CloudPhoneGUI:
         if self._closing:
             return
         now = time.time()
+        store_changed = False
+        has_github = bool(self.var_token.get().strip() or self.tools.github_auth_token())
+
         for cfg in list(self.store.profiles):
-            if not cfg.auto_refresh:
+            # Normal status monitoring remains independent for every phone.
+            if cfg.auto_refresh:
+                last = self._last_auto.get(cfg.profile_id, 0.0)
+                if now - last >= max(3, cfg.refresh_seconds):
+                    self._last_auto[cfg.profile_id] = now
+                    self.refresh_profile(cfg.profile_id, quiet=True)
+
+            # A rotation already in progress must be resumed even if the user later
+            # disables the schedule; otherwise an old phone could be backed up and
+            # never have its replacement started.
+            if cfg.rotation_phase == "waiting_backup":
+                if has_github:
+                    self._poll_rotation(cfg)
                 continue
-            last = self._last_auto.get(cfg.profile_id, 0.0)
-            if now - last >= max(3, cfg.refresh_seconds):
-                self._last_auto[cfg.profile_id] = now
-                self.refresh_profile(cfg.profile_id, quiet=True)
+
+            if not cfg.auto_rotate:
+                continue
+            if not cfg.rotate_next_ts:
+                cfg.rotate_next_ts = self._next_rotation_ts(cfg, now)
+                self._set_card(cfg.profile_id, "rotation", self._rotation_text(cfg))
+                store_changed = True
+                continue
+            if now >= cfg.rotate_next_ts and has_github:
+                self.rotate_profile(cfg.profile_id, automatic=True)
+
+        if store_changed:
+            self.store.save()
         self.root.after(2000, self._auto_tick)
 
     # ------------------------- local App/scrcpy actions -------------------------
