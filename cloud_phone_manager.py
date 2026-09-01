@@ -37,6 +37,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "Cloud Android Manager"
 CONFIG_PATH = Path.home() / ".cloud_android_manager.json"
+GLOBAL_SECRET_PATH = Path.home() / ".cloud_android_manager_secrets.json"
 DEFAULT_PACKAGE = "com.temperaturecoin"
 DEFAULT_APK_URL = (
     "https://github.com/usdt19908888286-bit/android-test/releases/download/"
@@ -134,6 +135,132 @@ REAL_DEVICE_CATALOG: list[dict[str, str]] = [{'name': 'Samsung Galaxy S25 Ultra 
   'brand': 'OnePlus',
   'model': 'CPH2449',
   'resolution': '1440x3216'}]
+
+class GlobalSecretStore:
+    """Persist global credentials with Windows DPAPI (current-user scope)."""
+
+    def __init__(self, path: Path = GLOBAL_SECRET_PATH):
+        self.path = Path(path)
+
+    @staticmethod
+    def _protect(value: str) -> str:
+        if os.name != "nt":
+            raise RuntimeError("全局 Secret 安全保存目前仅支持 Windows DPAPI")
+        if not value:
+            return ""
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        raw = value.encode("utf-8")
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        in_blob = DATA_BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
+        out_blob = DATA_BLOB()
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(in_blob),
+            "Cloud Android Manager",
+            None,
+            None,
+            None,
+            0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+            ctypes.byref(out_blob),
+        )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "Windows DPAPI 加密失败")
+        try:
+            encrypted = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            return base64.b64encode(encrypted).decode("ascii")
+        finally:
+            if out_blob.pbData:
+                kernel32.LocalFree(out_blob.pbData)
+
+    @staticmethod
+    def _unprotect(value: str) -> str:
+        if not value:
+            return ""
+        if os.name != "nt":
+            return ""
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        encrypted = base64.b64decode(value.encode("ascii"), validate=True)
+        buf = ctypes.create_string_buffer(encrypted, len(encrypted))
+        in_blob = DATA_BLOB(len(encrypted), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
+        out_blob = DATA_BLOB()
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(in_blob),
+            None,
+            None,
+            None,
+            None,
+            0x01,
+            ctypes.byref(out_blob),
+        )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "Windows DPAPI 解密失败")
+        try:
+            plain = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            return plain.decode("utf-8")
+        finally:
+            if out_blob.pbData:
+                kernel32.LocalFree(out_blob.pbData)
+
+    def load(self) -> tuple[str, str]:
+        try:
+            if not self.path.is_file():
+                return "", ""
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            client_id = self._unprotect(str(data.get("ts_api_client_id") or ""))
+            client_secret = self._unprotect(str(data.get("ts_api_client_secret") or ""))
+            return client_id, client_secret
+        except Exception:
+            return "", ""
+
+    def save(self, client_id: str, client_secret: str) -> None:
+        client_id = str(client_id or "").strip()
+        client_secret = str(client_secret or "").strip()
+        if not client_id or not client_secret:
+            raise ValueError("TS_API_CLIENT_ID 和 TS_API_CLIENT_SECRET 都不能为空")
+        payload = {
+            "version": 1,
+            "ts_api_client_id": self._protect(client_id),
+            "ts_api_client_secret": self._protect(client_secret),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
+        try:
+            os.chmod(self.path, 0o600)
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except TypeError:
+            if self.path.exists():
+                self.path.unlink()
+
+    def configured(self) -> bool:
+        client_id, client_secret = self.load()
+        return bool(client_id and client_secret)
+
 
 @dataclass
 class AppConfig:
@@ -1080,18 +1207,26 @@ class LocalTools:
         )
         return code == 0, out or err or "已退出 GitHub"
 
-    def set_github_secret(self, repo: str, token: str, name: str = "AVD_BACKUP_KEY") -> tuple[bool, str]:
+    def set_github_secret(
+        self,
+        repo: str,
+        token: str,
+        name: str = "AVD_BACKUP_KEY",
+        value: Optional[str] = None,
+    ) -> tuple[bool, str]:
         if not self.gh:
             ok, detail = self.ensure_github_cli()
             if not ok:
                 return False, detail
-        key = secrets.token_urlsafe(64)
+        secret_value = value if value is not None else secrets.token_urlsafe(64)
+        if not secret_value:
+            return False, f"{name} 的值为空"
         env = os.environ.copy()
         env["GH_TOKEN"] = token
         try:
             cp = subprocess.run(
                 [self.gh, "secret", "set", name, "-R", repo],
-                input=key,
+                input=secret_value,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1152,6 +1287,7 @@ class CloudPhoneGUI:
 
         self.store = ProfileStore.load()
         self.tools = LocalTools()
+        self.global_secrets = GlobalSecretStore()
         self.q: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._closing = False
         self._refreshing: set[str] = set()
@@ -1165,6 +1301,9 @@ class CloudPhoneGUI:
         env_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
         self.var_token = tk.StringVar(value=env_token or self.tools.github_auth_token())
         self.var_github_status = tk.StringVar(value="GitHub: 正在检查登录状态…")
+        self.var_tailscale_status = tk.StringVar(
+            value="Tailscale: 全局已配置" if self.global_secrets.configured() else "Tailscale: 全局未配置"
+        )
 
         self._build_ui()
         self._render_cards()
@@ -1186,6 +1325,8 @@ class CloudPhoneGUI:
         ttk.Label(top, textvariable=self.var_github_status).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="GitHub 授权登录", command=self.github_login).pack(side="left", padx=3)
         ttk.Button(top, text="刷新登录", command=self.refresh_github_auth).pack(side="left", padx=3)
+        ttk.Label(top, textvariable=self.var_tailscale_status).pack(side="left", padx=(12, 4))
+        ttk.Button(top, text="⚙ 全局设置", command=self.open_global_settings).pack(side="left", padx=3)
         ttk.Button(top, text="刷新全部", command=self.refresh_all).pack(side="right", padx=3)
         ttk.Button(top, text="＋ 添加手机", command=lambda: self.open_settings(None)).pack(side="right", padx=3)
 
@@ -1567,6 +1708,116 @@ class CloudPhoneGUI:
         q_apk = self._quote_cmd_arg(apk)
         return f"{q_adb} connect {q_device} && {q_adb} -s {q_device} install -r -g {q_apk}"
 
+    def _refresh_tailscale_global_status(self) -> None:
+        self.var_tailscale_status.set(
+            "Tailscale: 全局已配置" if self.global_secrets.configured() else "Tailscale: 全局未配置"
+        )
+
+    def open_global_settings(self) -> None:
+        client_id, client_secret = self.global_secrets.load()
+        win = tk.Toplevel(self.root)
+        win.title("全局设置")
+        win.geometry("620x330")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        v_client_id = tk.StringVar(value=client_id)
+        v_client_secret = tk.StringVar(value=client_secret)
+        v_show = tk.BooleanVar(value=False)
+        v_status = tk.StringVar(
+            value="已安全保存，可自动补到新/现有仓库" if client_id and client_secret else "尚未配置 Tailscale OAuth"
+        )
+
+        frame = ttk.Frame(win, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="Tailscale OAuth（全局一次设置）", font=("Segoe UI", 12, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(
+            frame,
+            text="保存后，程序在创建仓库或启动手机前发现仓库缺少 Secret 时，会自动写入。凭据使用 Windows DPAPI 当前用户加密保存。",
+            wraplength=570,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 14))
+
+        ttk.Label(frame, text="TS_API_CLIENT_ID").grid(row=2, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=v_client_id).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0))
+        ttk.Label(frame, text="TS_API_CLIENT_SECRET").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        secret_entry = ttk.Entry(frame, textvariable=v_client_secret, show="•")
+        secret_entry.grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=(10, 0))
+
+        def toggle_secret() -> None:
+            secret_entry.configure(show="" if v_show.get() else "•")
+
+        ttk.Checkbutton(frame, text="显示", variable=v_show, command=toggle_secret).grid(
+            row=3, column=2, sticky="w", padx=(8, 0), pady=(10, 0)
+        )
+        ttk.Label(frame, textvariable=v_status, wraplength=570).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(14, 0)
+        )
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(22, 0))
+
+        def save_global() -> None:
+            try:
+                self.global_secrets.save(v_client_id.get(), v_client_secret.get())
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, f"保存全局 Tailscale 凭据失败：{exc}", parent=win)
+                return
+            self._refresh_tailscale_global_status()
+            self.log("全局 Tailscale OAuth 已使用 Windows DPAPI 安全保存")
+            messagebox.showinfo(
+                APP_NAME,
+                "已保存。以后创建仓库或启动手机时，会自动补齐缺少的 Tailscale GitHub Secrets。",
+                parent=win,
+            )
+            win.destroy()
+
+        def clear_global() -> None:
+            if not messagebox.askyesno(APP_NAME, "清除本机保存的全局 Tailscale 凭据？", parent=win):
+                return
+            self.global_secrets.clear()
+            self._refresh_tailscale_global_status()
+            self.log("已清除本机全局 Tailscale OAuth")
+            win.destroy()
+
+        ttk.Button(buttons, text="清除本机凭据", command=clear_global).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="取消", command=win.destroy).pack(side="right")
+        ttk.Button(buttons, text="保存", command=save_global).pack(side="right", padx=(0, 8))
+        win.bind("<Control-s>", lambda _e: save_global())
+
+    def _sync_tailscale_repo_secrets(
+        self,
+        repo: str,
+        token: str,
+        secret_names: set[str],
+        require_configured: bool = True,
+    ) -> list[str]:
+        names = set(secret_names or set())
+        missing = [x for x in ("TS_API_CLIENT_ID", "TS_API_CLIENT_SECRET") if x not in names]
+        if not missing:
+            return []
+        client_id, client_secret = self.global_secrets.load()
+        if not client_id or not client_secret:
+            message = "目标仓库缺少 GitHub Secrets: " + ", ".join(missing) + "；请先在顶部“全局设置”填写一次 Tailscale OAuth"
+            if require_configured:
+                raise RuntimeError(message)
+            return [message]
+
+        values = {
+            "TS_API_CLIENT_ID": client_id,
+            "TS_API_CLIENT_SECRET": client_secret,
+        }
+        written: list[str] = []
+        for name in missing:
+            ok, detail = self.tools.set_github_secret(repo, token, name, values[name])
+            if not ok:
+                raise RuntimeError(f"自动写入 {name} 失败: {detail}")
+            written.append(name)
+        return ["已从全局设置自动补齐 Tailscale Secrets: " + ", ".join(written)] if written else []
+
     def open_settings(self, profile_id: Optional[str]) -> None:
         original = self.store.get(profile_id) if profile_id else None
         if original:
@@ -1717,9 +1968,14 @@ class CloudPhoneGUI:
                         if "AVD_BACKUP_KEY" not in names:
                             ok, detail = self.tools.set_github_secret(full_name, token, "AVD_BACKUP_KEY")
                             notes.append("已初始化 AVD_BACKUP_KEY" if ok else f"备份密钥稍后初始化: {detail}")
-                        missing_ts = [x for x in ("TS_API_CLIENT_ID", "TS_API_CLIENT_SECRET") if x not in names]
-                        if missing_ts:
-                            notes.append("启动云机前还需配置: " + ", ".join(missing_ts))
+                        notes.extend(
+                            self._sync_tailscale_repo_secrets(
+                                full_name,
+                                token,
+                                names,
+                                require_configured=False,
+                            )
+                        )
                     return full_name, branch, notes
 
                 def done(result: tuple[str, str, list[str]]) -> None:
@@ -2024,8 +2280,8 @@ class CloudPhoneGUI:
             text=(
                 f"工作流已经内置在程序中。目标仓库缺少 {BUILTIN_WORKFLOW_PATH} 时会自动上传，"
                 "版本不同时会自动更新。备份密钥 AVD_BACKUP_KEY 可自动创建。\n"
-                "注意：新仓库仍需存在 TS_API_CLIENT_ID 和 TS_API_CLIENT_SECRET 两个 Tailscale GitHub Secrets；"
-                "程序不会读取或复制其他仓库里的 secret 明文。"
+                "Tailscale OAuth 可以在主界面“全局设置”里只填写一次；程序使用 Windows DPAPI 加密保存在本机，"
+                "以后创建仓库或启动手机时会自动把缺少的 TS_API_CLIENT_ID / TS_API_CLIENT_SECRET 写入目标仓库。"
             ),
             wraplength=760,
             justify="left",
@@ -2196,14 +2452,13 @@ class CloudPhoneGUI:
     # ------------------------- repository / workflow -------------------------
     def _prepare_repository(self, cfg: AppConfig) -> list[str]:
         api = self.api_for(cfg)
+        token = self._token()
         notes = [api.ensure_builtin_workflow(cfg.branch)]
         secret_names = api.repo_secret_names()
         if secret_names is not None:
-            missing_ts = [x for x in ("TS_API_CLIENT_ID", "TS_API_CLIENT_SECRET") if x not in secret_names]
-            if missing_ts:
-                raise RuntimeError("目标仓库缺少 GitHub Secrets: " + ", ".join(missing_ts))
+            notes.extend(self._sync_tailscale_repo_secrets(cfg.repo, token, secret_names, require_configured=True))
             if "AVD_BACKUP_KEY" not in secret_names:
-                ok, detail = self.tools.set_github_secret(cfg.repo, self._token(), "AVD_BACKUP_KEY")
+                ok, detail = self.tools.set_github_secret(cfg.repo, token, "AVD_BACKUP_KEY")
                 if not ok:
                     raise RuntimeError("初始化 AVD_BACKUP_KEY 失败: " + detail)
                 notes.append("已初始化备份加密密钥")
