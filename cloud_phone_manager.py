@@ -353,13 +353,58 @@ class NotificationSender:
 
     @classmethod
     def send_webhook(cls, url: str, payload: dict[str, Any], token: str = "") -> None:
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+        is_wecom = (
+            parsed.hostname or ""
+        ).lower() == "qyapi.weixin.qq.com" and parsed.path.startswith("/cgi-bin/webhook/send")
+
+        if is_wecom:
+            level = str(payload.get("level") or "info").upper()
+            event = str(payload.get("event") or "event")
+            message = str(payload.get("message") or "")
+            lines = [f"[Cloud Android Manager] {level}", message, f"事件: {event}"]
+            phone = payload.get("phone") if isinstance(payload.get("phone"), dict) else {}
+            if phone:
+                phone_name = str(phone.get("name") or "")
+                phone_id = str(phone.get("id") or "")
+                run_id = int(phone.get("run_id") or 0)
+                device = str(phone.get("device") or "")
+                if phone_name or phone_id:
+                    lines.append(f"手机: {phone_name or '-'} / {phone_id or '-'}")
+                if run_id:
+                    lines.append(f"Run: {run_id}")
+                if device:
+                    lines.append(f"ADB: {device}")
+            timestamp = str(payload.get("timestamp") or "")
+            if timestamp:
+                lines.append(f"时间: {timestamp}")
+            content = "\n".join(line for line in lines if line).strip()
+            # WeCom text robots have a small message limit. Truncate by UTF-8 bytes
+            # so a long health reason cannot make an otherwise valid alert fail.
+            raw = content.encode("utf-8")
+            if len(raw) > 1900:
+                content = raw[:1900].decode("utf-8", errors="ignore") + "…"
+            body: dict[str, Any] = {"msgtype": "text", "text": {"content": content}}
+        else:
+            body = payload
+
+        data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=cls._headers(token), method="POST")
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
-                if int(getattr(resp, "status", 200)) >= 400:
-                    raise RuntimeError(f"Webhook HTTP {resp.status}")
-                resp.read(1024)
+                status = int(getattr(resp, "status", 200))
+                raw_body = resp.read(4096)
+                if status >= 400:
+                    raise RuntimeError(f"Webhook HTTP {status}")
+                if is_wecom and raw_body:
+                    try:
+                        result = json.loads(raw_body.decode("utf-8", errors="replace"))
+                    except Exception:
+                        result = {}
+                    if isinstance(result, dict) and int(result.get("errcode") or 0) != 0:
+                        raise RuntimeError(
+                            f"企业微信 Webhook 错误 {result.get('errcode')}: {result.get('errmsg') or 'unknown'}"
+                        )
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             raise RuntimeError(f"Webhook HTTP {exc.code}: {detail}") from exc
@@ -1983,6 +2028,12 @@ class CloudPhoneGUI:
         self._adb_task_running: set[str] = set()
         self._backup_tracking: set[str] = set()
         self._launch_tracking: set[str] = set()
+        self._github_auth_checking = False
+        self._github_auth_last_check = 0.0
+        self._github_auth_last_alert = 0.0
+        self._github_auth_invalid = False
+        self._github_auth_check_interval = 300.0
+        self._github_auth_alert_interval = 3600.0
         self.card_vars: dict[str, dict[str, tk.Variable]] = {}
         self.card_progress_frames: dict[str, ttk.Frame] = {}
         self.card_status_frames: dict[str, ttk.Frame] = {}
@@ -2487,27 +2538,88 @@ class CloudPhoneGUI:
         return GitHubAPI(cfg.repo, self._token())
 
     def refresh_github_auth(self) -> None:
-        def work() -> tuple[str, str, bool]:
-            found = self.tools._find_gh()
-            if found:
-                self.tools.gh = found
-            account = self.tools.github_account() if found else ""
-            token = self.tools.github_auth_token() if account else ""
-            return account, token, bool(found)
+        if self._github_auth_checking:
+            return
+        self._github_auth_checking = True
 
-        def done(result: tuple[str, str, bool]) -> None:
-            account, token, has_cli = result
-            if account and token:
+        def work() -> tuple[str, str, bool, str, str]:
+            found = self.tools._find_gh()
+            if not found:
+                return "", "", False, "missing", "GitHub CLI 未安装"
+            self.tools.gh = found
+            code, out, err = self.tools.run([found, "api", "user", "--jq", ".login"], timeout=15)
+            detail = (err or out or "").strip()
+            if code == 0 and out.strip():
+                account = out.strip()
+                token = self.tools.github_auth_token()
+                if token:
+                    return account, token, True, "valid", ""
+                return account, "", True, "invalid", "GitHub token 不可用"
+
+            low = detail.lower()
+            invalid_markers = (
+                "bad credentials",
+                "http 401",
+                "status code 401",
+                "authentication failed",
+                "requires authentication",
+                "not logged into any github hosts",
+                "authentication token",
+            )
+            state = "invalid" if any(marker in low for marker in invalid_markers) else "network"
+            return "", "", True, state, detail[:300]
+
+        def done(result: tuple[str, str, bool, str, str]) -> None:
+            self._github_auth_checking = False
+            self._github_auth_last_check = time.time()
+            account, token, has_cli, state, detail = result
+            if state == "valid" and account and token:
+                was_invalid = self._github_auth_invalid
+                self._github_auth_invalid = False
+                self._github_auth_last_alert = 0.0
                 self.var_token.set(token)
                 self.var_github_status.set(f"GitHub: 已登录 @{account}")
-            elif has_cli:
+                if was_invalid:
+                    self.log("GitHub 授权已恢复")
+                return
+
+            if state == "invalid":
+                first_failure = not self._github_auth_invalid
+                self._github_auth_invalid = True
                 self.var_token.set("")
-                self.var_github_status.set("GitHub: 未登录")
-            else:
+                self.var_github_status.set("GitHub: 授权已失效")
+                if first_failure:
+                    self.log("GitHub 授权已失效，GitHub 自动化操作将暂停")
+                now = time.time()
+                if now - self._github_auth_last_alert >= self._github_auth_alert_interval:
+                    self._github_auth_last_alert = now
+                    self._emit_notification(
+                        "github_auth_invalid",
+                        None,
+                        "error",
+                        "GitHub 授权已失效，请重新登录。备份、恢复、换机等 GitHub 自动化操作可能不可用。",
+                        {"repeat_minutes": 60},
+                    )
+                    self.log("GitHub 授权失效提醒已发送；持续失效时每 1 小时提醒一次")
+                return
+
+            if not has_cli or state == "missing":
                 self.var_token.set("")
                 self.var_github_status.set("GitHub: CLI 未安装（登录时自动安装）")
+                return
 
-        self.bg("检查 GitHub 登录", work, done)
+            # A network/DNS timeout is not the same as an expired authorization.
+            # Keep the last token and do not generate a false auth-expired alert.
+            self.var_github_status.set("GitHub: 暂时无法验证授权（网络）")
+            if detail and not self.var_token.get().strip():
+                self.var_github_status.set("GitHub: 暂时无法验证授权")
+
+        def failed(err: str) -> None:
+            self._github_auth_checking = False
+            self._github_auth_last_check = time.time()
+            self.var_github_status.set("GitHub: 授权检查失败")
+
+        self.bg("检查 GitHub 登录", work, done, failed)
 
     def _copy_to_clipboard(self, text: str) -> None:
         if not text:
@@ -2721,14 +2833,14 @@ class CloudPhoneGUI:
         v_wss = tk.StringVar(value=str(notify.get("wss_url") or ""))
         v_bearer = tk.StringVar(value=str(notify.get("bearer_token") or ""))
         v_show_bearer = tk.BooleanVar(value=False)
-        v_notify_status = tk.StringVar(value="Webhook / WSS 可同时启用；异常、备份、换机会统一推送 JSON")
+        v_notify_status = tk.StringVar(value="Webhook / WSS 可同时启用；GitHub 授权失效持续时每 1 小时提醒一次")
 
         ttk.Checkbutton(notify_box, text="启用全局通知", variable=v_notify_enabled).grid(
             row=0, column=0, columnspan=3, sticky="w"
         )
         ttk.Label(
             notify_box,
-            text="通知事件不包含 GitHub Token、Tailscale Secret 等敏感值。Webhook 使用 HTTP POST JSON；WSS 建立安全 WebSocket 后发送同一份 JSON。",
+            text="通知事件不包含 GitHub Token、Tailscale Secret 等敏感值。企业微信机器人 Webhook 会自动适配 text 格式；其他 Webhook / WSS 继续发送通用 JSON。",
             wraplength=700,
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 10))
@@ -4885,7 +4997,15 @@ class CloudPhoneGUI:
             return
         now = time.time()
         store_changed = False
-        has_github = bool(self.var_token.get().strip() or self.tools.github_auth_token())
+
+        # Validate GitHub authorization periodically. A confirmed invalid token is
+        # alerted immediately and then at most once per hour while it stays invalid.
+        if (
+            not self._github_auth_checking
+            and now - self._github_auth_last_check >= self._github_auth_check_interval
+        ):
+            self.refresh_github_auth()
+        has_github = bool(self.var_token.get().strip())
 
         for cfg in list(self.store.profiles):
             refresh_requested = False
