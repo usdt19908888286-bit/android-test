@@ -311,6 +311,17 @@ class AppConfig:
     # config files stay forward-compatible when fields are added later.
     adb_tasks: list[dict[str, Any]] = field(default_factory=list)
 
+    # Runtime health monitoring is observation-only. It checks whether the Runner,
+    # Android/ADB and selected App look healthy, then records/logs unhealthy streaks.
+    health_monitor_enabled: bool = True
+    health_check_seconds: int = 30
+    health_require_app: bool = True
+    health_fail_threshold: int = 3
+    health_fail_count: int = 0
+    health_last_status: str = "未检测"
+    health_last_reason: str = ""
+    health_last_ts: float = 0.0
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
         cfg = cls()
@@ -369,7 +380,7 @@ class AppConfig:
             if not command:
                 continue
             trigger = str(raw_task.get("trigger") or "startup").strip().lower()
-            if trigger not in ("startup", "daily", "interval"):
+            if trigger not in ("startup", "daily", "interval", "interval_minutes"):
                 trigger = "startup"
             value = str(raw_task.get("value") or "").strip()
             if trigger == "daily" and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
@@ -379,6 +390,19 @@ class AppConfig:
                     value = str(max(1, min(168, int(value or "4"))))
                 except Exception:
                     value = "4"
+            if trigger == "interval_minutes":
+                try:
+                    value = str(max(1, min(10080, int(value or "30"))))
+                except Exception:
+                    value = "30"
+            try:
+                delay_before = max(0, min(600, int(raw_task.get("delay_before") or 0)))
+            except Exception:
+                delay_before = 0
+            try:
+                delay_after = max(0, min(60, int(raw_task.get("delay_after") or 0)))
+            except Exception:
+                delay_after = 0
             clean_tasks.append(
                 {
                     "id": str(raw_task.get("id") or uuid.uuid4().hex),
@@ -390,9 +414,30 @@ class AppConfig:
                     "next_ts": float(raw_task.get("next_ts") or 0.0),
                     "last_ts": float(raw_task.get("last_ts") or 0.0),
                     "last_run_id": int(raw_task.get("last_run_id") or 0),
+                    "group": str(raw_task.get("group") or ""),
+                    "delay_before": delay_before,
+                    "delay_after": delay_after,
                 }
             )
         cfg.adb_tasks = clean_tasks
+        try:
+            cfg.health_check_seconds = max(10, min(600, int(cfg.health_check_seconds)))
+        except Exception:
+            cfg.health_check_seconds = 30
+        try:
+            cfg.health_fail_threshold = max(1, min(20, int(cfg.health_fail_threshold)))
+        except Exception:
+            cfg.health_fail_threshold = 3
+        try:
+            cfg.health_fail_count = max(0, int(cfg.health_fail_count))
+        except Exception:
+            cfg.health_fail_count = 0
+        cfg.health_last_status = str(cfg.health_last_status or "未检测")
+        cfg.health_last_reason = str(cfg.health_last_reason or "")
+        try:
+            cfg.health_last_ts = max(0.0, float(cfg.health_last_ts or 0.0))
+        except Exception:
+            cfg.health_last_ts = 0.0
         return cfg
 
     def to_dict(self) -> dict[str, Any]:
@@ -1382,6 +1427,7 @@ class CloudPhoneGUI:
         self._closing = False
         self._refreshing: set[str] = set()
         self._last_auto: dict[str, float] = {}
+        self._last_health: dict[str, float] = {}
         self._last_rotation_poll: dict[str, float] = {}
         self._rotating: set[str] = set()
         self._adb_task_running: set[str] = set()
@@ -1390,7 +1436,6 @@ class CloudPhoneGUI:
         self.card_vars: dict[str, dict[str, tk.Variable]] = {}
         self.card_progress_frames: dict[str, ttk.Frame] = {}
         self.card_status_frames: dict[str, ttk.Frame] = {}
-        self.repo_cache: list[str] = []
         self.repo_cache: list[str] = []
 
         env_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
@@ -3089,6 +3134,7 @@ class CloudPhoneGUI:
                 self._set_card(profile_id, "server", "云 CPU - · 内存 -\nQEMU CPU - · RAM -")
                 self._set_card(profile_id, "android", "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n未检测")
+                self._update_health_state(cfg, "", {}, {})
                 self.store.save()
                 return
 
@@ -3159,6 +3205,15 @@ class CloudPhoneGUI:
             else:
                 self._set_card(profile_id, "android", "等待 Android / ADB 就绪" if status == "in_progress" else "未运行")
                 self._set_card(profile_id, "app", f"{cfg.package_name}\n等待检测" if status == "in_progress" else "未运行")
+            self._update_health_state(cfg, status, health, runner)
+            if status == "in_progress" and cfg.health_monitor_enabled:
+                if cfg.health_last_status == "健康":
+                    health_label = "健康"
+                elif cfg.health_last_status in ("警告", "异常"):
+                    health_label = f"{cfg.health_last_status} {cfg.health_fail_count}/{cfg.health_fail_threshold}"
+                else:
+                    health_label = cfg.health_last_status
+                self._set_card(profile_id, "run", f"{state} · Run {rid} · {health_label}")
 
             if status == "in_progress" and boot == "1" and adb == "已连接":
                 self._run_startup_adb_tasks(cfg, rid)
@@ -3172,6 +3227,81 @@ class CloudPhoneGUI:
 
         self.bg(f"刷新 {cfg.phone_name}", work, done, failed)
 
+    def _update_health_state(
+        self,
+        cfg: AppConfig,
+        run_status: str,
+        health: dict[str, Any],
+        runner: dict[str, Any],
+    ) -> None:
+        if not cfg.health_monitor_enabled:
+            return
+
+        now = time.time()
+        interval = max(10, int(cfg.health_check_seconds or 30))
+        if (
+            run_status == "in_progress"
+            and cfg.health_last_status in ("健康", "警告", "异常")
+            and cfg.health_last_ts
+            and now - cfg.health_last_ts < interval
+        ):
+            return
+
+        cfg.health_last_ts = now
+        self._last_health[cfg.profile_id] = now
+
+        if run_status != "in_progress":
+            cfg.health_fail_count = 0
+            cfg.health_last_status = "未运行"
+            cfg.health_last_reason = ""
+            return
+
+        boot = str(health.get("boot") or "")
+        adb = str(health.get("adb") or "")
+        app_state = str(health.get("app") or "")
+        runner_ready = any(
+            str(runner.get(key) or "-") != "-"
+            for key in ("host_cpu", "host_mem", "qemu")
+        )
+
+        # Do not classify the normal boot window as a failure. Once a phone has
+        # previously reached a healthy state, losing ADB/boot becomes a system
+        # health failure instead of another "starting" state.
+        system_ready = boot == "1" and adb == "已连接"
+        if not system_ready and cfg.health_last_status not in ("健康", "警告", "异常"):
+            cfg.health_last_status = "启动中"
+            cfg.health_last_reason = "等待 Android / ADB 就绪"
+            return
+
+        reasons: list[str] = []
+        if not system_ready:
+            reasons.append("Android/ADB 不可用")
+        elif not runner_ready:
+            reasons.append("Runner 状态服务不可用")
+        elif cfg.health_require_app and app_state != "运行中":
+            reasons.append(f"App {app_state or '状态未知'}")
+
+        if not reasons:
+            was_bad = cfg.health_last_status in ("警告", "异常")
+            cfg.health_fail_count = 0
+            cfg.health_last_status = "健康"
+            cfg.health_last_reason = "Android / ADB / App 正常" if cfg.health_require_app else "Android / ADB 正常"
+            if was_bad:
+                self.log(f"{cfg.phone_name} · 健康监控：已恢复正常")
+            return
+
+        cfg.health_fail_count = int(cfg.health_fail_count or 0) + 1
+        reason = "；".join(reasons)
+        cfg.health_last_reason = reason
+        threshold = max(1, int(cfg.health_fail_threshold or 3))
+        previous = cfg.health_last_status
+        cfg.health_last_status = "异常" if cfg.health_fail_count >= threshold else "警告"
+        if cfg.health_fail_count == 1 or (cfg.health_last_status == "异常" and previous != "异常"):
+            self.log(
+                f"{cfg.phone_name} · 健康监控：{cfg.health_last_status} "
+                f"({cfg.health_fail_count}/{threshold}) · {reason}"
+            )
+
     def refresh_all(self) -> None:
         for cfg in list(self.store.profiles):
             self.refresh_profile(cfg.profile_id)
@@ -3182,6 +3312,8 @@ class CloudPhoneGUI:
         value = str(task.get("value") or "")
         if trigger == "daily":
             return f"每天 {value or '04:00'}"
+        if trigger == "interval_minutes":
+            return f"每 {value or '30'} 分钟"
         if trigger == "interval":
             return f"每 {value or '4'} 小时"
         return "每次云机启动后"
@@ -3199,6 +3331,18 @@ class CloudPhoneGUI:
             if target.timestamp() <= now_ts:
                 target += dt.timedelta(days=1)
             return target.timestamp()
+        if trigger == "interval_minutes":
+            try:
+                minutes = max(1, min(10080, int(task.get("value") or 30)))
+            except Exception:
+                minutes = 30
+            base = float(task.get("last_ts") or 0.0)
+            if base <= 0 or base > now_ts:
+                base = now_ts
+            candidate = base + minutes * 60
+            if candidate <= now_ts:
+                candidate = now_ts + minutes * 60
+            return candidate
         if trigger == "interval":
             try:
                 hours = max(1, min(168, int(task.get("value") or 4)))
@@ -3236,7 +3380,7 @@ class CloudPhoneGUI:
             task["last_ts"] = now
             if reason == "startup" and ok:
                 task["last_run_id"] = int(cfg.last_run_id or 0)
-            if reason != "manual" and str(task.get("trigger")) in ("daily", "interval"):
+            if reason != "manual" and str(task.get("trigger")) in ("daily", "interval", "interval_minutes"):
                 task["next_ts"] = self._adb_task_next_ts(task, now) if ok else now + 300
             self.store.upsert(cfg)
             compact = str(detail or "").replace("\r", " ").replace("\n", " · ")
@@ -3247,7 +3391,7 @@ class CloudPhoneGUI:
         def failed(err: str) -> None:
             self._adb_task_running.discard(key)
             task["last_ts"] = time.time()
-            if reason != "manual" and str(task.get("trigger")) in ("daily", "interval"):
+            if reason != "manual" and str(task.get("trigger")) in ("daily", "interval", "interval_minutes"):
                 task["next_ts"] = time.time() + 300
             self.store.upsert(cfg)
             self.log(f"{cfg.phone_name} · ADB任务[{name}] 执行异常: {err}")
@@ -3280,14 +3424,25 @@ class CloudPhoneGUI:
 
         def work() -> list[tuple[str, bool, str, float]]:
             results: list[tuple[str, bool, str, float]] = []
-            # The list order is the execution order. Keep startup commands serial so
-            # power/permission setup finishes before app launch and HOME navigation.
+            # The saved list order is the execution order. Optional delays are
+            # configuration only; every command still goes through the existing
+            # safe ADB parser before it can run.
             for task in pending:
                 task_id = str(task.get("id") or "")
                 command = str(task.get("command") or "").strip()
+                try:
+                    delay_before = max(0, min(600, int(task.get("delay_before") or 0)))
+                except Exception:
+                    delay_before = 0
+                try:
+                    delay_after = max(0, min(60, int(task.get("delay_after") or 0)))
+                except Exception:
+                    delay_after = 0
+                if delay_before:
+                    time.sleep(delay_before)
                 ok, detail = self.tools.run_safe_adb_command(device, command, package)
                 results.append((task_id, ok, detail, time.time()))
-                time.sleep(0.6)
+                time.sleep(delay_after if delay_after else 0.6)
             return results
 
         def done(results: list[tuple[str, bool, str, float]]) -> None:
@@ -3322,25 +3477,19 @@ class CloudPhoneGUI:
 
         dlg = tk.Toplevel(self.root)
         dlg.title(f"自动化 · {cfg.phone_name}")
-        dlg.geometry("1020x760")
-        dlg.minsize(900, 650)
+        dlg.geometry("1000x760")
+        dlg.minsize(900, 660)
         dlg.transient(self.root)
 
-        outer = ttk.Frame(dlg, padding=14)
+        outer = ttk.Frame(dlg, padding=12)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(2, weight=1)
-
-        ttk.Label(
-            outer,
-            text="自动化只管理两类规则：自动换机，以及 ADB 自动任务。普通手机参数请到“普通设置”。",
-            wraplength=960,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        outer.rowconfigure(3, weight=1)
 
         # ------------------------- 自动换机 -------------------------
-        rotation = ttk.LabelFrame(outer, text="自动换机", padding=10)
-        rotation.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        rotation.columnconfigure(0, weight=1)
+        rotation = ttk.LabelFrame(outer, text="自动换机", padding=9)
+        rotation.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        rotation.columnconfigure(1, weight=1)
 
         v_rotate = tk.BooleanVar(value=cfg.auto_rotate)
         rotation_rules = list(cfg.rotate_rules or [])
@@ -3348,39 +3497,29 @@ class CloudPhoneGUI:
         v_rule_value = tk.StringVar(value="04:00")
         v_rotate_status = tk.StringVar(value=self._rotation_text(cfg))
 
-        top_rotate = ttk.Frame(rotation)
-        top_rotate.grid(row=0, column=0, sticky="ew")
-        ttk.Checkbutton(top_rotate, text="启用定时自动换机", variable=v_rotate).pack(side="left")
-        ttk.Label(top_rotate, textvariable=v_rotate_status).pack(side="left", padx=(16, 0))
-        ttk.Button(
-            top_rotate,
-            text="立即换机",
-            command=lambda pid=profile_id: self.rotate_profile(pid),
-        ).pack(side="right")
+        ttk.Checkbutton(rotation, text="启用", variable=v_rotate).grid(row=0, column=0, sticky="w")
+        rules_list = tk.Listbox(rotation, height=2, exportselection=False)
+        rules_list.grid(row=0, column=1, rowspan=2, sticky="ew", padx=8)
 
-        rules_row = ttk.Frame(rotation)
-        rules_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        rules_row.columnconfigure(0, weight=1)
-        rules_list = tk.Listbox(rules_row, height=3, exportselection=False)
-        rules_list.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
-
-        edit_rule = ttk.Frame(rules_row)
-        edit_rule.grid(row=0, column=1, sticky="nw")
+        rule_tools = ttk.Frame(rotation)
+        rule_tools.grid(row=0, column=2, sticky="e")
         type_combo = ttk.Combobox(
-            edit_rule,
+            rule_tools,
             textvariable=v_rule_type,
             values=["每天时间点", "每 N 小时"],
             state="readonly",
-            width=13,
+            width=12,
         )
         type_combo.pack(side="left")
-        ttk.Entry(edit_rule, textvariable=v_rule_value, width=10).pack(side="left", padx=(6, 0))
-        ttk.Button(edit_rule, text="＋ 添加", command=lambda: add_rotation_rule()).pack(side="left", padx=(6, 0))
-        ttk.Button(edit_rule, text="删除选中", command=lambda: remove_rotation_rule()).pack(side="left", padx=(6, 0))
+        ttk.Entry(rule_tools, textvariable=v_rule_value, width=9).pack(side="left", padx=(5, 0))
+        ttk.Button(rule_tools, text="添加", command=lambda: add_rotation_rule()).pack(side="left", padx=(5, 0))
+        ttk.Button(rule_tools, text="删除", command=lambda: remove_rotation_rule()).pack(side="left", padx=(5, 0))
 
-        rotate_actions = ttk.Frame(rules_row)
-        rotate_actions.grid(row=1, column=1, sticky="ne", pady=(8, 0))
-        ttk.Button(rotate_actions, text="保存自动换机", command=lambda: save_rotation()).pack(side="right")
+        rotate_actions = ttk.Frame(rotation)
+        rotate_actions.grid(row=1, column=2, sticky="e", pady=(5, 0))
+        ttk.Button(rotate_actions, text="立即换机", command=lambda pid=profile_id: self.rotate_profile(pid)).pack(side="left")
+        ttk.Button(rotate_actions, text="保存", command=lambda: save_rotation()).pack(side="left", padx=(6, 0))
+        ttk.Label(rotation, textvariable=v_rotate_status).grid(row=1, column=0, sticky="w")
 
         def rotation_rule_label(rule: str) -> str:
             if rule.startswith("time:"):
@@ -3428,10 +3567,9 @@ class CloudPhoneGUI:
 
         def remove_rotation_rule() -> None:
             selected = rules_list.curselection()
-            if not selected:
-                return
-            rotation_rules.pop(int(selected[0]))
-            render_rotation_rules()
+            if selected:
+                rotation_rules.pop(int(selected[0]))
+                render_rotation_rules()
 
         def normalized_rotation_rules() -> list[str]:
             clean: list[str] = []
@@ -3459,7 +3597,6 @@ class CloudPhoneGUI:
             except Exception as exc:
                 messagebox.showerror(APP_NAME, str(exc), parent=dlg)
                 return
-
             changed = cfg.auto_rotate != enabled or list(cfg.rotate_rules or []) != clean
             cfg.auto_rotate = enabled
             cfg.rotate_rules = clean
@@ -3484,71 +3621,129 @@ class CloudPhoneGUI:
         type_combo.bind("<<ComboboxSelected>>", rotation_type_changed)
         render_rotation_rules()
 
-        # ------------------------- ADB 自动任务 -------------------------
-        adb_box = ttk.LabelFrame(outer, text="ADB 自动任务", padding=10)
-        adb_box.grid(row=2, column=0, sticky="nsew")
-        adb_box.columnconfigure(0, weight=2)
-        adb_box.columnconfigure(1, weight=3)
-        adb_box.rowconfigure(1, weight=1)
+        # ------------------------- 健康监控 -------------------------
+        health_box = ttk.LabelFrame(outer, text="健康监控", padding=9)
+        health_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        health_box.columnconfigure(8, weight=1)
 
-        ttk.Label(
-            adb_box,
-            text="支持每次云机启动后、每天固定时间、每 N 小时。{device} 自动替换当前 ADB 地址，{package} 自动替换当前选择的 App 包名。启动任务按列表顺序串行执行。",
-            wraplength=940,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-        left = ttk.Frame(adb_box)
-        left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        left.columnconfigure(0, weight=1)
-        left.rowconfigure(0, weight=1)
-        task_list = tk.Listbox(left, exportselection=False)
-        task_list.grid(row=0, column=0, sticky="nsew")
-        task_scroll = ttk.Scrollbar(left, orient="vertical", command=task_list.yview)
-        task_scroll.grid(row=0, column=1, sticky="ns")
-        task_list.configure(yscrollcommand=task_scroll.set)
-
-        right = ttk.Frame(adb_box)
-        right.grid(row=1, column=1, sticky="nsew")
-        right.columnconfigure(1, weight=1)
-
-        v_name = tk.StringVar(value="App 后台联网白名单")
-        v_command = tk.StringVar(value="adb -s {device} shell dumpsys deviceidle whitelist +{package}")
-        v_trigger = tk.StringVar(value="每次云机启动后")
-        v_value = tk.StringVar(value="")
-        v_enabled = tk.BooleanVar(value=True)
-        v_status = tk.StringVar(value=f"当前 App: {cfg.package_name} · ADB: {cfg.last_device or '未连接'}")
-
-        ttk.Label(right, text="任务名").grid(row=0, column=0, sticky="w")
-        ttk.Entry(right, textvariable=v_name).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ttk.Label(right, text="ADB 命令").grid(row=1, column=0, sticky="nw", pady=(10, 0))
-        ttk.Entry(right, textvariable=v_command).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(10, 0))
-        ttk.Label(
-            right,
-            text="示例：adb -s {device} shell dumpsys deviceidle whitelist +{package}",
-            wraplength=520,
-        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
-        ttk.Label(right, text="触发方式").grid(row=3, column=0, sticky="w", pady=(12, 0))
-        trigger_combo = ttk.Combobox(
-            right,
-            textvariable=v_trigger,
-            values=["每次云机启动后", "每天固定时间", "每 N 小时"],
-            state="readonly",
+        v_health_enabled = tk.BooleanVar(value=cfg.health_monitor_enabled)
+        v_health_interval = tk.IntVar(value=cfg.health_check_seconds)
+        v_health_require_app = tk.BooleanVar(value=cfg.health_require_app)
+        v_health_threshold = tk.IntVar(value=cfg.health_fail_threshold)
+        v_health_status = tk.StringVar(
+            value=f"{cfg.health_last_status}"
+            + (f" · {cfg.health_last_reason}" if cfg.health_last_reason else "")
         )
-        trigger_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(12, 0))
-        ttk.Label(right, text="时间 / 小时").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(right, textvariable=v_value).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
-        ttk.Checkbutton(right, text="启用自动执行", variable=v_enabled).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(right, textvariable=v_status, wraplength=520).grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
-        tasks = cfg.adb_tasks
+        ttk.Checkbutton(health_box, text="启用", variable=v_health_enabled).grid(row=0, column=0, sticky="w")
+        ttk.Label(health_box, text="每").grid(row=0, column=1, sticky="e", padx=(10, 3))
+        ttk.Spinbox(health_box, from_=10, to=600, textvariable=v_health_interval, width=6).grid(row=0, column=2, sticky="w")
+        ttk.Label(health_box, text="秒检查").grid(row=0, column=3, sticky="w", padx=(3, 10))
+        ttk.Checkbutton(health_box, text="检查当前 App", variable=v_health_require_app).grid(row=0, column=4, sticky="w")
+        ttk.Label(health_box, text="连续").grid(row=0, column=5, sticky="e", padx=(10, 3))
+        ttk.Spinbox(health_box, from_=1, to=20, textvariable=v_health_threshold, width=4).grid(row=0, column=6, sticky="w")
+        ttk.Label(health_box, text="次异常后报警").grid(row=0, column=7, sticky="w", padx=(3, 10))
+        ttk.Label(health_box, textvariable=v_health_status).grid(row=0, column=8, sticky="w")
+        ttk.Button(health_box, text="保存", command=lambda: save_health_monitor()).grid(row=0, column=9, sticky="e", padx=(8, 0))
 
-        def trigger_code() -> tuple[str, str]:
-            label = v_trigger.get()
-            value = v_value.get().strip()
+        def save_health_monitor() -> None:
+            try:
+                interval = max(10, min(600, int(v_health_interval.get())))
+                threshold = max(1, min(20, int(v_health_threshold.get())))
+            except Exception:
+                messagebox.showerror(APP_NAME, "健康检查间隔或异常次数格式无效", parent=dlg)
+                return
+            cfg.health_monitor_enabled = bool(v_health_enabled.get())
+            cfg.health_check_seconds = interval
+            cfg.health_require_app = bool(v_health_require_app.get())
+            cfg.health_fail_threshold = threshold
+            cfg.health_fail_count = 0
+            cfg.health_last_ts = 0.0
+            cfg.health_last_status = "未检测" if cfg.health_monitor_enabled else "已关闭"
+            cfg.health_last_reason = ""
+            self._last_health.pop(cfg.profile_id, None)
+            self.store.upsert(cfg)
+            v_health_status.set(
+                f"已保存 · 每 {interval} 秒 · "
+                + ("检测 App" if cfg.health_require_app else "仅系统")
+            )
+            self.log(f"{cfg.phone_name}: 健康监控设置已保存")
+
+        # ------------------------- 统一自定义脚本 -------------------------
+        script_box = ttk.LabelFrame(outer, text="启动 / 定时脚本", padding=9)
+        script_box.grid(row=3, column=0, sticky="nsew")
+        script_box.columnconfigure(0, weight=1)
+        script_box.rowconfigure(1, weight=1)
+
+        tasks = list(cfg.adb_tasks or [])
+        first_task = tasks[0] if tasks else {}
+        triggers = {str(task.get("trigger") or "startup") for task in tasks}
+        common_trigger = next(iter(triggers)) if len(triggers) == 1 else "startup"
+        trigger_label = {
+            "daily": "每天固定时间",
+            "interval": "每 N 小时",
+            "interval_minutes": "每 N 分钟",
+        }.get(common_trigger, "每次云机启动后")
+
+        options = ttk.Frame(script_box)
+        options.grid(row=0, column=0, sticky="ew", pady=(0, 7))
+        options.columnconfigure(9, weight=1)
+        v_script_trigger = tk.StringVar(value=trigger_label)
+        v_script_value = tk.StringVar(value=str(first_task.get("value") or ""))
+        v_script_start_delay = tk.IntVar(value=int(first_task.get("delay_before") or 0))
+        v_script_gap = tk.IntVar(value=int(first_task.get("delay_after") or 1))
+        v_script_status = tk.StringVar(
+            value=(
+                f"已加载 {len(tasks)} 条命令"
+                + (" · 原任务触发方式不同，保存后将统一" if len(triggers) > 1 else "")
+                if tasks else "一行一条命令；空行和 # 注释会忽略"
+            )
+        )
+
+        ttk.Label(options, text="执行").grid(row=0, column=0, sticky="w")
+        script_trigger_combo = ttk.Combobox(
+            options,
+            textvariable=v_script_trigger,
+            values=["每次云机启动后", "每 N 分钟", "每 N 小时", "每天固定时间"],
+            state="readonly",
+            width=14,
+        )
+        script_trigger_combo.grid(row=0, column=1, sticky="w", padx=(4, 10))
+        ttk.Label(options, text="时间/间隔").grid(row=0, column=2, sticky="w")
+        ttk.Entry(options, textvariable=v_script_value, width=10).grid(row=0, column=3, sticky="w", padx=(4, 10))
+        ttk.Label(options, text="启动等待").grid(row=0, column=4, sticky="w")
+        ttk.Spinbox(options, from_=0, to=600, textvariable=v_script_start_delay, width=6).grid(row=0, column=5, sticky="w", padx=(4, 3))
+        ttk.Label(options, text="秒").grid(row=0, column=6, sticky="w", padx=(0, 10))
+        ttk.Label(options, text="命令间隔").grid(row=0, column=7, sticky="w")
+        ttk.Spinbox(options, from_=0, to=60, textvariable=v_script_gap, width=5).grid(row=0, column=8, sticky="w", padx=(4, 3))
+        ttk.Label(options, text="秒").grid(row=0, column=9, sticky="w")
+
+        script_text = tk.Text(script_box, height=14, wrap="none")
+        script_text.grid(row=1, column=0, sticky="nsew")
+        if tasks:
+            script_text.insert("1.0", "\n".join(str(task.get("command") or "") for task in tasks))
+
+        footer = ttk.Frame(script_box)
+        footer.grid(row=2, column=0, sticky="ew", pady=(7, 0))
+        ttk.Label(footer, textvariable=v_script_status).pack(side="left")
+        ttk.Button(footer, text="清空", command=lambda: clear_script()).pack(side="right")
+        ttk.Button(footer, text="保存脚本", command=lambda: save_script()).pack(side="right", padx=(0, 6))
+
+        def parse_script_trigger() -> tuple[str, str]:
+            label = v_script_trigger.get()
+            value = v_script_value.get().strip()
             if label == "每天固定时间":
                 if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
                     raise ValueError("每天固定时间必须是 HH:MM，例如 04:30")
                 return "daily", value
+            if label == "每 N 分钟":
+                try:
+                    minutes = int(value)
+                except Exception as exc:
+                    raise ValueError("分钟必须是 1 到 10080 的整数") from exc
+                if not 1 <= minutes <= 10080:
+                    raise ValueError("分钟必须是 1 到 10080")
+                return "interval_minutes", str(minutes)
             if label == "每 N 小时":
                 try:
                     hours = int(value)
@@ -3559,133 +3754,74 @@ class CloudPhoneGUI:
                 return "interval", str(hours)
             return "startup", ""
 
-        def render_tasks(select_id: str = "") -> None:
-            task_list.delete(0, "end")
-            selected_index = -1
-            for i, task in enumerate(tasks):
-                state = "✓" if bool(task.get("enabled", True)) else "×"
-                next_text = ""
-                if str(task.get("trigger")) in ("daily", "interval") and float(task.get("next_ts") or 0):
-                    next_text = f" · 下次 {self._format_local_ts(float(task.get('next_ts') or 0))}"
-                task_list.insert("end", f"{state} {task.get('name','ADB 任务')} · {self._adb_task_trigger_text(task)}{next_text}")
-                if select_id and str(task.get("id")) == select_id:
-                    selected_index = i
-            if tasks:
-                idx = selected_index if selected_index >= 0 else 0
-                task_list.selection_set(idx)
-                task_list.see(idx)
-                load_selected()
+        def script_trigger_changed(_event=None) -> None:
+            label = v_script_trigger.get()
+            if label == "每天固定时间":
+                v_script_value.set("04:00")
+            elif label == "每 N 分钟":
+                v_script_value.set("30")
+            elif label == "每 N 小时":
+                v_script_value.set("4")
+            else:
+                v_script_value.set("")
 
-        def load_selected(_event=None) -> None:
-            selected = task_list.curselection()
-            if not selected:
+        def save_script() -> None:
+            lines: list[str] = []
+            for raw in script_text.get("1.0", "end").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(line)
+            if not lines:
+                messagebox.showinfo(APP_NAME, "脚本为空；如要删除全部命令请点“清空”。", parent=dlg)
                 return
-            task = tasks[int(selected[0])]
-            v_name.set(str(task.get("name") or "ADB 任务"))
-            v_command.set(str(task.get("command") or ""))
-            trigger = str(task.get("trigger") or "startup")
-            v_trigger.set({"daily": "每天固定时间", "interval": "每 N 小时"}.get(trigger, "每次云机启动后"))
-            v_value.set(str(task.get("value") or ""))
-            v_enabled.set(bool(task.get("enabled", True)))
-            last = float(task.get("last_ts") or 0)
-            v_status.set(
-                f"当前 App: {cfg.package_name} · ADB: {cfg.last_device or '未连接'}"
-                + (f" · 上次执行 {self._format_local_ts(last)}" if last else "")
-            )
-
-        def validate_command(command: str) -> None:
-            probe_address = cfg.last_device or "100.64.0.1:5555"
-            self.tools._safe_adb_args(command, probe_address, cfg.package_name)
-
-        def save_current() -> Optional[dict[str, Any]]:
-            selected = task_list.curselection()
-            if not selected:
-                messagebox.showinfo(APP_NAME, "请先选择一条任务，或点“新增任务”。", parent=dlg)
-                return None
-            task = tasks[int(selected[0])]
-            name = v_name.get().strip() or "ADB 任务"
-            command = v_command.get().strip()
             try:
-                validate_command(command)
-                trigger, value = trigger_code()
+                trigger, value = parse_script_trigger()
+                start_delay = max(0, min(600, int(v_script_start_delay.get())))
+                gap = max(0, min(60, int(v_script_gap.get())))
+                probe_address = cfg.last_device or "100.64.0.1:5555"
+                for line in lines:
+                    self.tools._safe_adb_args(line, probe_address, cfg.package_name)
             except Exception as exc:
-                messagebox.showerror(APP_NAME, str(exc), parent=dlg)
-                return None
-            task["name"] = name
-            task["command"] = command
-            task["trigger"] = trigger
-            task["value"] = value
-            task["enabled"] = bool(v_enabled.get())
-            task["next_ts"] = self._adb_task_next_ts(task) if trigger in ("daily", "interval") else 0.0
+                messagebox.showerror(APP_NAME, f"脚本校验失败：{exc}", parent=dlg)
+                return
+
+            generated: list[dict[str, Any]] = []
+            for index, line in enumerate(lines, start=1):
+                task = {
+                    "id": uuid.uuid4().hex,
+                    "name": f"脚本 {index:02d}",
+                    "command": line,
+                    "trigger": trigger,
+                    "value": value,
+                    "enabled": True,
+                    "next_ts": 0.0,
+                    "last_ts": 0.0,
+                    "last_run_id": 0,
+                    "group": "script",
+                    "delay_before": start_delay if trigger == "startup" and index == 1 else 0,
+                    "delay_after": gap,
+                }
+                if trigger in ("daily", "interval", "interval_minutes"):
+                    task["next_ts"] = self._adb_task_next_ts(task)
+                generated.append(task)
+            cfg.adb_tasks = generated
             self.store.upsert(cfg)
-            render_tasks(str(task.get("id")))
-            v_status.set("任务已保存")
-            return task
+            v_script_status.set(f"已保存 {len(generated)} 条命令 · {self._adb_task_trigger_text(generated[0])}")
+            self.log(f"{cfg.phone_name}: 自动化脚本已保存 {len(generated)} 条")
 
-        def add_task() -> None:
-            task = {
-                "id": uuid.uuid4().hex,
-                "name": "App 后台联网白名单",
-                "command": "adb -s {device} shell dumpsys deviceidle whitelist +{package}",
-                "trigger": "startup",
-                "value": "",
-                "enabled": True,
-                "next_ts": 0.0,
-                "last_ts": 0.0,
-                "last_run_id": 0,
-            }
-            tasks.append(task)
+        def clear_script() -> None:
+            cfg.adb_tasks = []
+            script_text.delete("1.0", "end")
             self.store.upsert(cfg)
-            render_tasks(task["id"])
+            v_script_status.set("脚本已清空")
+            self.log(f"{cfg.phone_name}: 自动化脚本已清空")
 
-        def delete_task() -> None:
-            selected = task_list.curselection()
-            if not selected:
-                return
-            idx = int(selected[0])
-            task = tasks[idx]
-            if not messagebox.askyesno(APP_NAME, f"删除 ADB 任务“{task.get('name','ADB 任务')}”？", parent=dlg):
-                return
-            tasks.pop(idx)
-            self.store.upsert(cfg)
-            render_tasks()
-
-        def run_now() -> None:
-            task = save_current()
-            if not task:
-                return
-            if not cfg.last_device:
-                messagebox.showinfo(APP_NAME, "这台手机还没有可用的 ADB 地址。", parent=dlg)
-                return
-            self._run_adb_task(cfg, task, "manual")
-            v_status.set("已提交立即执行；结果会写入主窗口日志")
-
-        def trigger_changed(_event=None) -> None:
-            label = v_trigger.get()
-            if label == "每天固定时间" and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", v_value.get().strip()):
-                v_value.set("04:00")
-            elif label == "每 N 小时" and not v_value.get().strip().isdigit():
-                v_value.set("4")
-            elif label == "每次云机启动后":
-                v_value.set("")
-
-        task_list.bind("<<ListboxSelect>>", load_selected)
-        trigger_combo.bind("<<ComboboxSelected>>", trigger_changed)
-
-        bottom = ttk.Frame(adb_box)
-        bottom.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        ttk.Button(bottom, text="＋ 新增任务", command=add_task).pack(side="left")
-        ttk.Button(bottom, text="删除选中", command=delete_task).pack(side="left", padx=6)
-        ttk.Button(bottom, text="保存任务", command=save_current).pack(side="right", padx=(6, 0))
-        ttk.Button(bottom, text="立即执行", command=run_now).pack(side="right")
+        script_trigger_combo.bind("<<ComboboxSelected>>", script_trigger_changed)
 
         close_row = ttk.Frame(outer)
-        close_row.grid(row=3, column=0, sticky="e", pady=(10, 0))
+        close_row.grid(row=4, column=0, sticky="e", pady=(8, 0))
         ttk.Button(close_row, text="关闭", command=dlg.destroy).pack(side="right")
-
-        render_tasks()
-        if not tasks:
-            add_task()
 
     def _auto_tick(self) -> None:
         if self._closing:
@@ -3695,12 +3831,26 @@ class CloudPhoneGUI:
         has_github = bool(self.var_token.get().strip() or self.tools.github_auth_token())
 
         for cfg in list(self.store.profiles):
+            refresh_requested = False
+
             # Normal status monitoring remains independent for every phone.
             if cfg.auto_refresh:
                 last = self._last_auto.get(cfg.profile_id, 0.0)
                 if now - last >= max(3, cfg.refresh_seconds):
                     self._last_auto[cfg.profile_id] = now
                     self.refresh_profile(cfg.profile_id, quiet=True)
+                    refresh_requested = True
+
+            # Health monitoring can stay active even when the normal UI refresh is
+            # disabled. It reuses refresh_profile, so there is only one probe path.
+            if cfg.health_monitor_enabled and not refresh_requested:
+                last_health = max(
+                    self._last_health.get(cfg.profile_id, 0.0),
+                    float(cfg.health_last_ts or 0.0),
+                )
+                if now - last_health >= max(10, int(cfg.health_check_seconds or 30)):
+                    self.refresh_profile(cfg.profile_id, quiet=True)
+                    refresh_requested = True
 
             # Timed ADB tasks are local-GUI schedules. If the phone is temporarily
             # offline, retry soon instead of discarding the scheduled occurrence.
@@ -3708,7 +3858,7 @@ class CloudPhoneGUI:
                 if not bool(task.get("enabled", True)):
                     continue
                 trigger = str(task.get("trigger") or "startup")
-                if trigger not in ("daily", "interval"):
+                if trigger not in ("daily", "interval", "interval_minutes"):
                     continue
                 if not float(task.get("next_ts") or 0.0):
                     task["next_ts"] = self._adb_task_next_ts(task, now)
