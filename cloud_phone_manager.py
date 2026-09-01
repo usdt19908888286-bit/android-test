@@ -3931,7 +3931,7 @@ class CloudPhoneGUI:
 
         self._rotating.add(profile_id)
         self._set_card(profile_id, "rotation", "正在开始换机…")
-        self._set_card(profile_id, "run", "换机：关机 / 备份流程准备中…")
+        self._set_card(profile_id, "run", "换机：检查当前运行状态…")
 
         def work() -> dict[str, Any]:
             self._prepare_repository(cfg)
@@ -3951,9 +3951,15 @@ class CloudPhoneGUI:
                     "issue": int(issue.get("number") or 0),
                 }
 
-            # Old Runner is already offline: keep only the newest existing backup,
-            # then restore it. No cache is deleted unless at least one cache exists.
+            # Scheduled time arrived but no phone is running. Keep only the newest
+            # existing backup and boot it directly; do not dispatch a guaranteed-
+            # to-fail restore when this Phone ID has no backup at all.
             cleanup = api.prune_phone_caches(cfg.phone_id, keep_run_id=0, keep=1)
+            kept = [str(item) for item in (cleanup.get("kept") or []) if str(item).strip()]
+            if not kept:
+                raise RuntimeError(
+                    f"Phone ID {cfg.phone_id} 当前没有运行中的手机，也没有可恢复的完整 AVD 备份"
+                )
             api.dispatch(
                 Path(BUILTIN_WORKFLOW_PATH).name,
                 cfg.branch,
@@ -3964,6 +3970,7 @@ class CloudPhoneGUI:
                 "run_id": 0,
                 "issue": 0,
                 "cleanup_deleted": int(cleanup.get("deleted") or 0),
+                "restore_cache": kept[0],
             }
 
         def done(result: dict[str, Any]) -> None:
@@ -4002,14 +4009,23 @@ class CloudPhoneGUI:
                 cfg.rotate_last_ts = now_ts
                 self._reschedule_rotation(cfg, now_ts)
                 deleted = int(result.get("cleanup_deleted") or 0)
-                self._set_card(profile_id, "run", "换机：旧机已离线，已从最新备份启动新 Runner")
-                self.log(f"{cfg.phone_name}: 旧机已离线 · 清理旧备份 {deleted} 个 · 已触发恢复启动")
+                restore_cache = str(result.get("restore_cache") or "")
+                self._set_card(profile_id, "run", "定时到点无运行手机 · 已从最新旧备份启动新 Runner")
+                self.log(
+                    f"{cfg.phone_name}: 到点时无运行手机 · 清理旧备份 {deleted} 个 · "
+                    f"从最新备份恢复启动 · 下一轮 {self._rotation_text(cfg)}"
+                )
                 self._emit_notification(
                     "rotation_restore_dispatched",
                     cfg,
                     "info",
-                    "旧机已离线，已从最新备份触发恢复启动",
-                    {"deleted_old_caches": deleted, "automatic": bool(automatic)},
+                    "到点时无运行手机，已直接从最新旧备份触发恢复启动并继续下一轮定时",
+                    {
+                        "deleted_old_caches": deleted,
+                        "restore_cache": restore_cache,
+                        "automatic": bool(automatic),
+                        "next_rotation_ts": cfg.rotate_next_ts,
+                    },
                 )
                 self.root.after(2200, lambda: self.refresh_profile(profile_id))
             self.store.save()
