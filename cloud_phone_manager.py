@@ -416,6 +416,26 @@ class LocalTools:
         code, out, err = self.adb_cmd(address, ["shell", "am", "force-stop", package])
         return code == 0, (out or err or "已强制停止")
 
+    def github_auth_token(self) -> str:
+        """Read the already-authorized gh token into process memory only."""
+        if not self.gh:
+            return ""
+        try:
+            cp = subprocess.run(
+                [self.gh, "auth", "token"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if cp.returncode == 0:
+                return cp.stdout.strip()
+        except Exception:
+            pass
+        return ""
+
     def set_github_secret(self, repo: str, token: str, name: str = "AVD_BACKUP_KEY") -> tuple[bool, str]:
         if not self.gh:
             return False, "未找到 GitHub CLI (gh.exe)"
@@ -492,7 +512,8 @@ class CloudPhoneGUI:
         self._closing = False
 
         env_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
-        self.var_token = tk.StringVar(value=env_token)
+        session_token = env_token or self.tools.github_auth_token()
+        self.var_token = tk.StringVar(value=session_token)
         self.var_repo = tk.StringVar(value=self.cfg.repo)
         self.var_branch = tk.StringVar(value=self.cfg.branch)
         self.var_phone = tk.StringVar(value=self.cfg.phone_id)
@@ -525,6 +546,7 @@ class CloudPhoneGUI:
         self.log(f"scrcpy: {self.tools.scrcpy or '未找到'}")
         self.log(f"Tailscale: {self.tools.tailscale or '未找到'}")
         self.log(f"GitHub CLI: {self.tools.gh or '未找到（仅影响一键初始化备份密钥）'}")
+        self.log(f"GitHub 登录: {'已自动读取到会话凭证' if self.var_token.get().strip() else '未检测到，请在顶部填写 Token'}")
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=10)
